@@ -1,7 +1,3 @@
-# Fast template for developing a new Rust project
+# Tideloom
 
-Use this repository as a GitHub template to quickly start a new Rust project.
-
-## License
-
-This project is licensed under [Apache License, Version 2.0](LICENSE).
+Runtime for the [Serverless Workflow DSL](https://github.com/serverlessworkflow/specification)
