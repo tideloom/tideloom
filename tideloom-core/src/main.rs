@@ -1,4 +1,5 @@
 use serverless_workflow_core::models::workflow::WorkflowDefinition;
+mod node;
 
 fn main() {
     println!("Hello, world!");
