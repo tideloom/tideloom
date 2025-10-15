@@ -11,34 +11,6 @@ pub trait StepType: Send + Sync {
     async fn execute(&self, ctx: &WorkflowContext, input: Self::Input) -> StepResult<Self::Output>;
 }
 
-/// Execution lifecycle for a step. Transitions are validated via `can_transition`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepStatus {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    Retrying,
-}
-
-impl StepStatus {
-    fn can_transition(self, next: StepStatus) -> bool {
-        matches!(
-            (self, next),
-            (StepStatus::Pending, StepStatus::Running)
-                | (
-                    StepStatus::Running,
-                    StepStatus::Succeeded | StepStatus::Failed
-                )
-                | (StepStatus::Failed, StepStatus::Retrying)
-                | (StepStatus::Retrying, StepStatus::Running)
-        )
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, StepStatus::Succeeded | StepStatus::Failed)
-    }
-}
 
 /// Runtime instance of a step with lifecycle control.
 #[derive(Debug, Clone)]
