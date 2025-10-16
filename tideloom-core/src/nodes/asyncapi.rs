@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 use serverless_workflow_core::models::authentication::AuthenticationPolicyDefinition;
 use serverless_workflow_core::models::task::{CallTaskDefinition, TaskDefinition};
 
-use crate::node::runtime::{StepResult, StepType, WorkflowContext};
+use crate::runtime::{StepResult, Step, WorkflowContext};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsyncApiDocument {
@@ -46,15 +46,15 @@ pub struct AsyncApiConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct AsyncApiStep {
+pub struct AsyncApiNode {
     config: AsyncApiConfig,
 }
 
-impl AsyncApiStep {
+impl AsyncApiNode {
     pub fn try_from_task(task: &TaskDefinition) -> StepResult<Self> {
         match task {
             TaskDefinition::Call(call) => Self::try_from_call(call),
-            _ => Err("AsyncApiStep expects a `call` task definition".into()),
+            _ => Err("AsyncApiNode expects a `call` task definition".into()),
         }
     }
 
@@ -79,107 +79,43 @@ impl AsyncApiStep {
         Ok(Self { config })
     }
 
-    fn build_request(&self, input: &Value) -> StepResult<Value> {
-        let mut request = Map::new();
+    fn build_request(&self, input: &Value) -> reqwest::Request {
+        let mut request = reqwest::Request::new(reqwest::Method::GET, Url::parse("https://example.com").unwrap());
 
-        let operation_ref = resolve_string(&self.config.operation_ref, input);
-        if operation_ref.is_null() {
-            return Err("operationRef resolved to null for asyncapi step".into());
-        }
-        request.insert("operationRef".into(), operation_ref);
-
-        let document_value = resolve_template(&self.config.document.to_value(), input);
-        request.insert("document".into(), document_value);
-
-        if let Some(server) = &self.config.server {
-            let server_value = resolve_string(server, input);
-            if !server_value.is_null() {
-                request.insert("server".into(), server_value);
-            }
-        }
-
-        if let Some(message) = &self.config.message {
-            let payload = resolve_template(&message.payload, input);
-            request.insert("message".into(), json!({ "payload": payload }));
-        }
-
-        let authentication_value =
-            serde_json::to_value(&self.config.authentication).unwrap_or(Value::Null);
-        if !authentication_value.is_null() {
-            let resolved_auth = resolve_template(&authentication_value, input);
-            if !resolved_auth.is_null() {
-                request.insert("authentication".into(), resolved_auth);
-            }
-        }
-
-        Ok(Value::Object(request))
+        request
     }
 }
 
-impl StepType for AsyncApiStep {
+impl TryFrom<&TaskDefinition> for AsyncApiNode {
+    type Error = String;
+
+    fn try_from(task: &TaskDefinition) -> std::result::Result<Self, Self::Error> {
+        Self::try_from_task(task)
+    }
+}
+
+impl TryFrom<&CallTaskDefinition> for AsyncApiNode {
+    type Error = String;
+
+    fn try_from(call: &CallTaskDefinition) -> std::result::Result<Self, Self::Error> {
+        Self::try_from_call(call)
+    }
+}
+
+impl Step for AsyncApiNode {
     type Input = Value;
     type Output = Value;
 
     async fn execute(
         &self,
-        _ctx: &WorkflowContext,
+        ctx: &WorkflowContext,
         input: Self::Input,
     ) -> StepResult<Self::Output> {
-        self.build_request(&input)
+        let req = self.build_request(&input);
+        ctx.http_client.execute(req).await?;
     }
 }
 
-fn resolve_template(template: &Value, context: &Value) -> Value {
-    match template {
-        Value::String(s) => resolve_string(s, context),
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|v| resolve_template(v, context)).collect())
-        }
-        Value::Object(map) => {
-            let mut resolved = Map::new();
-            for (key, value) in map {
-                resolved.insert(key.clone(), resolve_template(value, context));
-            }
-            Value::Object(resolved)
-        }
-        other => other.clone(),
-    }
-}
-
-fn resolve_string(input: &str, context: &Value) -> Value {
-    let trimmed = input.trim();
-    if let Some(expr) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        let expr = expr.trim();
-        resolve_expression(expr, context).unwrap_or(Value::Null)
-    } else {
-        Value::String(input.to_owned())
-    }
-}
-
-fn resolve_expression(expr: &str, context: &Value) -> Option<Value> {
-    if expr.is_empty() {
-        return None;
-    }
-
-    if expr.starts_with('.') {
-        let pointer = build_json_pointer(expr);
-        return context.pointer(&pointer).cloned();
-    }
-
-    None
-}
-
-fn build_json_pointer(expr: &str) -> String {
-    let path = expr.trim_start_matches('.');
-    if path.is_empty() {
-        return String::from("/");
-    }
-    let segments: Vec<String> = path
-        .split('.')
-        .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
-        .collect();
-    format!("/{}", segments.join("/"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -223,7 +159,7 @@ mod tests {
  "#;
 
         let task = load_first_task(yaml);
-        let step = AsyncApiStep::try_from_task(&task).expect("asyncapi step");
+        let step = AsyncApiNode::try_from_task(&task).expect("asyncapi node");
         let ctx = WorkflowContext::default();
         let input = json!({
             "pet": { "id": 42 },

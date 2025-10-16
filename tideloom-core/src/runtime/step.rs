@@ -2,9 +2,41 @@ pub type StepResult<T> = std::result::Result<T, String>;
 
 /// Shared runtime context passed to every step execution.
 #[derive(Debug, Default, Clone)]
-pub struct WorkflowContext {}
+pub struct WorkflowContext {
+    pub http_client: reqwest::Client,
+}
+impl WorkflowContext {
+    pub fn new(http_client: reqwest::Client) -> Self {
+        Self { http_client }
+    }
+}
 
-pub trait StepType: Send + Sync {
+/// Lifecycle state of a workflow step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    Pending,
+    Running,
+    Retrying,
+    Succeeded,
+    Failed,
+}
+
+impl StepStatus {
+    /// Checks whether the transition to the next state is allowed.
+    pub fn can_transition(self, next: StepStatus) -> bool {
+        matches!(
+            (self, next),
+            (StepStatus::Pending, StepStatus::Running)
+                | (StepStatus::Running, StepStatus::Succeeded)
+                | (StepStatus::Running, StepStatus::Failed)
+                | (StepStatus::Running, StepStatus::Retrying)
+                | (StepStatus::Failed, StepStatus::Retrying)
+                | (StepStatus::Retrying, StepStatus::Running)
+        )
+    }
+}
+
+pub trait Step: Send + Sync {
     type Input: Send;
     type Output: Send;
 
@@ -58,7 +90,7 @@ impl StepInstance {
 }
 
 /// Runs a step by enforcing the lifecycle transitions around its execution.
-pub async fn run_step<T: StepType>(
+pub async fn run_step<T: Step>(
     step: &mut StepInstance,
     step_type: &T,
     ctx: &WorkflowContext,
@@ -98,7 +130,7 @@ mod tests {
         }
     }
 
-    impl<F, I, O, Fut, E> StepType for MapStep<F, I, O, Fut, E>
+    impl<F, I, O, Fut, E> Step for MapStep<F, I, O, Fut, E>
     where
         F: Fn(I) -> Fut + Send + Sync,
         Fut: Future<Output = std::result::Result<O, E>> + Send,
