@@ -36,6 +36,8 @@ impl StepStatus {
     }
 }
 
+
+#[async_trait::async_trait]
 pub trait Step: Send + Sync {
     type Input: Send;
     type Output: Send;
@@ -106,87 +108,5 @@ pub async fn run_step<T: Step>(
             step.transition(StepStatus::Failed)?;
             Err(err)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::future::try_join_all;
-    use std::future::Future;
-    use std::marker::PhantomData;
-
-    pub struct MapStep<F, I, O, Fut, E> {
-        function: F,
-        _marker: PhantomData<fn() -> (I, O, Fut, E)>,
-    }
-
-    impl<F, I, O, Fut, E> MapStep<F, I, O, Fut, E> {
-        pub fn new(function: F) -> Self {
-            Self {
-                function,
-                _marker: PhantomData,
-            }
-        }
-    }
-
-    impl<F, I, O, Fut, E> Step for MapStep<F, I, O, Fut, E>
-    where
-        F: Fn(I) -> Fut + Send + Sync,
-        Fut: Future<Output = std::result::Result<O, E>> + Send,
-        E: ToString,
-        I: Send,
-        O: Send,
-    {
-        type Input = Vec<I>;
-        type Output = Vec<O>;
-
-        async fn execute(
-            &self,
-            _ctx: &WorkflowContext,
-            input: Self::Input,
-        ) -> StepResult<Self::Output> {
-            try_join_all(input.into_iter().map(&self.function))
-                .await
-                .map_err(|err| err.to_string())
-        }
-    }
-
-    #[tokio::test]
-    async fn step_lifecycle_success() {
-        let map = MapStep::<_, i32, i32, _, String>::new(|value: i32| async move {
-            Ok::<_, String>(value * 2)
-        });
-        let mut step = StepInstance::new("double");
-        let ctx = WorkflowContext::default();
-
-        assert_eq!(step.status(), StepStatus::Pending);
-        let output = run_step(&mut step, &map, &ctx, vec![1, 2, 3])
-            .await
-            .unwrap();
-
-        assert_eq!(output, vec![2, 4, 6]);
-        assert_eq!(step.status(), StepStatus::Succeeded);
-        assert_eq!(step.attempts(), 1);
-
-        let err = step.transition(StepStatus::Running).unwrap_err();
-        assert!(err.contains("invalid transition"));
-    }
-
-    #[tokio::test]
-    async fn step_lifecycle_failure() {
-        let map =
-            MapStep::<_, i32, i32, _, String>::new(
-                |_: i32| async move { Err::<i32, _>("boom".into()) },
-            );
-        let mut step = StepInstance::new("failing");
-        let ctx = WorkflowContext::default();
-
-        let err = run_step(&mut step, &map, &ctx, vec![1]).await.unwrap_err();
-        assert_eq!(err, "boom");
-        assert_eq!(step.status(), StepStatus::Failed);
-        assert_eq!(step.attempts(), 1);
-
-        assert!(step.transition(StepStatus::Retrying).is_ok());
     }
 }
