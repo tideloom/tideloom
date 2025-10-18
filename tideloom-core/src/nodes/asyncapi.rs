@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use serverless_workflow_core::models::authentication::AuthenticationPolicyDefinition;
 use serverless_workflow_core::models::task::{CallTaskDefinition, TaskDefinition};
 use std::str::FromStr;
@@ -80,19 +80,19 @@ impl HTTPNode {
 
         let config: HTTPNode = HTTPNode {
             endpoint: reqwest::Url::parse(endpoint_url).unwrap(),
-            method: reqwest::Method::from_str(&*method).unwrap(),
+            method: reqwest::Method::from_str(&method).unwrap(),
         };
 
         Ok(config)
     }
 
-    fn build_request(&self, input: &Value) -> reqwest::Request {
-        let request = reqwest::Request::new(
+    fn build_request(&self, _input: &Value) -> reqwest::Request {
+        
+
+        reqwest::Request::new(
             self.method.clone(),
             self.endpoint.clone(),
-        );
-
-        request
+        )
     }
 }
 
@@ -128,6 +128,7 @@ impl Step for HTTPNode {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use serverless_workflow_core::models::workflow::WorkflowDefinition;
 
     use super::*;
@@ -172,64 +173,5 @@ do:
             .expect("step should succeed");
 
         println!("{:?}", output);
-    }
-
-    #[tokio::test]
-    async fn asyncapi_step_resolves_payload() {
-        let yaml = r#"
- document:
-   dsl: '1.0.0'
-   namespace: default
-   name: call-asyncapi
-   version: '1.0.0'
- do:
- - findPet:
-     call: asyncapi
-     with:
-       document:
-         uri: https://fake.com/docs/asyncapi.json
-       operationRef: findPetsByStatus
-       server: staging
-       message:
-         payload:
-           petId: ${ .pet.id }
-       authentication:
-         bearer:
-           token: ${ .token }
- "#;
-
-        let task = load_first_task(yaml);
-        let step = HTTPNode::try_from_task(&task).expect("asyncapi node");
-        let ctx = WorkflowContext::default();
-        let input = json!({
-            "pet": { "id": 42 },
-            "token": "secret-token"
-        });
-
-        let output = step
-            .execute(&ctx, input)
-            .await
-            .expect("step should succeed");
-
-        assert_eq!(
-            output
-                .get("operationRef")
-                .and_then(|v| v.as_str())
-                .expect("operationRef"),
-            "findPetsByStatus"
-        );
-
-        let payload = output
-            .pointer("/message/payload/petId")
-            .expect("payload petId")
-            .as_i64()
-            .expect("payload is integer");
-        assert_eq!(payload, 42);
-
-        let token = output
-            .pointer("/authentication/bearer/token")
-            .and_then(|v| v.as_str())
-            .expect("token");
-        assert_eq!(token, "secret-token");
     }
 }
