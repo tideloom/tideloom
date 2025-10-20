@@ -38,7 +38,7 @@ impl StepStatus {
 
 
 #[async_trait::async_trait]
-pub trait Step: Send + Sync {
+pub trait Task: Send + Sync {
     type Input: Send;
     type Output: Send;
 
@@ -92,7 +92,7 @@ impl StepInstance {
 }
 
 /// Runs a step by enforcing the lifecycle transitions around its execution.
-pub async fn run_step<T: Step>(
+pub async fn run_step<T: Task>(
     step: &mut StepInstance,
     step_type: &T,
     ctx: &WorkflowContext,

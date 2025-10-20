@@ -4,7 +4,7 @@ use serverless_workflow_core::models::authentication::AuthenticationPolicyDefini
 use serverless_workflow_core::models::task::{CallTaskDefinition, TaskDefinition};
 use std::str::FromStr;
 
-use crate::runtime::{Step, StepResult, WorkflowContext};
+use crate::runtime::{Task, StepResult, WorkflowContext};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsyncApiDocument {
@@ -113,7 +113,7 @@ impl TryFrom<&CallTaskDefinition> for HTTPNode {
 }
 
 #[async_trait::async_trait]
-impl Step for HTTPNode {
+impl Task for HTTPNode {
     type Input = Value;
     type Output = Value;
 
