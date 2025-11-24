@@ -1,5 +1,5 @@
-pub mod runtime;
 pub mod nodes;
+pub mod runtime;
 
 use serverless_workflow_core::models::workflow::WorkflowDefinition;
 
@@ -44,9 +44,6 @@ do:
       endpoint: https://petstore.swagger.io/v2/pet/{petId}
         ";
         let workflow = Workflow::from_yaml(yaml);
-        assert_eq!(
-            workflow.definition().document.name,
-            "call-http"
-        );
+        assert_eq!(workflow.definition().document.name, "call-http");
     }
 }

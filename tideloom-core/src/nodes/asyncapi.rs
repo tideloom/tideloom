@@ -1,10 +1,11 @@
+use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use serverless_workflow_core::models::authentication::AuthenticationPolicyDefinition;
 use serverless_workflow_core::models::task::{CallTaskDefinition, TaskDefinition};
 use std::str::FromStr;
 
-use crate::runtime::{Task, StepResult, WorkflowContext};
+use crate::runtime::{StepResult, Task, TaskCtx};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsyncApiDocument {
@@ -15,6 +16,7 @@ pub struct AsyncApiDocument {
 }
 
 impl AsyncApiDocument {
+    #[allow(dead_code)]
     fn to_value(&self) -> Value {
         let mut map = Map::new();
         if let Some(uri) = &self.uri {
@@ -58,9 +60,9 @@ impl HTTPNode {
             TaskDefinition::Call(call) => match call.call.to_lowercase().as_str() {
                 "asyncapi" => Self::try_from_http(call),
                 "http" => Self::try_from_http(call),
-                _ => Err(format!("expected call 'asyncapi', got '{}'", call.call)),
+                _ => bail!("expected call 'asyncapi', got '{}'", call.call),
             },
-            _ => Err("AsyncApiNode expects a `call` task definition".into()),
+            _ => bail!("AsyncApiNode expects a `call` task definition"),
         }
     }
 
@@ -68,36 +70,41 @@ impl HTTPNode {
         let with = call
             .with
             .as_ref()
-            .ok_or_else(|| "asyncapi call requires a `with` block".to_string())?;
+            .context("asyncapi call requires a `with` block")?;
 
         let mut with_map = Map::new();
         for (key, value) in with {
             with_map.insert(key.clone(), value.clone());
         }
 
-        let endpoint_url = with_map.get("endpoint").unwrap().as_str().unwrap();
-        let method = with_map.get("method").unwrap().as_str().unwrap().to_string();
+        let endpoint_url = with_map
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .context("missing or invalid 'endpoint' in asyncapi call")?;
+        let method = with_map
+            .get("method")
+            .and_then(Value::as_str)
+            .context("missing or invalid 'method' in asyncapi call")?;
 
         let config: HTTPNode = HTTPNode {
-            endpoint: reqwest::Url::parse(endpoint_url).unwrap(),
-            method: reqwest::Method::from_str(&method).unwrap(),
+            endpoint: reqwest::Url::parse(endpoint_url).context("invalid endpoint URL")?,
+            method: reqwest::Method::from_str(method).context("invalid http method")?,
         };
 
         Ok(config)
     }
 
-    fn build_request(&self, _input: &Value) -> reqwest::Request {
-        
-
-        reqwest::Request::new(
+    fn build_request(&self, _input: &Value) -> StepResult<reqwest::Request> {
+        // TODO: add body/headers/auth/input templating
+        Ok(reqwest::Request::new(
             self.method.clone(),
             self.endpoint.clone(),
-        )
+        ))
     }
 }
 
 impl TryFrom<&TaskDefinition> for HTTPNode {
-    type Error = String;
+    type Error = anyhow::Error;
 
     fn try_from(task: &TaskDefinition) -> std::result::Result<Self, Self::Error> {
         Self::try_from_task(task)
@@ -105,7 +112,7 @@ impl TryFrom<&TaskDefinition> for HTTPNode {
 }
 
 impl TryFrom<&CallTaskDefinition> for HTTPNode {
-    type Error = String;
+    type Error = anyhow::Error;
 
     fn try_from(call: &CallTaskDefinition) -> std::result::Result<Self, Self::Error> {
         Self::try_from_http(call)
@@ -114,15 +121,16 @@ impl TryFrom<&CallTaskDefinition> for HTTPNode {
 
 #[async_trait::async_trait]
 impl Task for HTTPNode {
-    type Input = Value;
-    type Output = Value;
-
-    async fn execute(&self, ctx: &WorkflowContext, input: Self::Input) -> StepResult<Self::Output> {
-        let req = self.build_request(&input);
-        ctx.http_client.execute(req).await.unwrap();
+    async fn execute(&self, ctx: TaskCtx, input: Value) -> StepResult<Value> {
+        let req = self.build_request(&input)?;
+        ctx.http_client.execute(req).await?;
 
         // TODO: fix me
         Ok(Value::Null)
+    }
+
+    fn name(&self) -> &'static str {
+        "http"
     }
 }
 
@@ -163,14 +171,10 @@ do:
 
         let task = load_first_task(yaml);
         let step = HTTPNode::try_from_task(&task).expect("asyncapi node");
-        let c = WorkflowContext::default();
-        let ctx = WorkflowContext::default();
+        let ctx = TaskCtx::default();
         let input = json!({});
 
-        let output = step
-            .execute(&ctx, input)
-            .await
-            .expect("step should succeed");
+        let output = step.execute(ctx, input).await.expect("step should succeed");
 
         println!("{:?}", output);
     }
