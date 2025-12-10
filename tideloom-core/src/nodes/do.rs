@@ -1,7 +1,6 @@
-use serde_json::Value;
 use serverless_workflow_core::models::task::{DoTaskDefinition, TaskDefinition};
 
-use crate::runtime::{StepResult, Task, TaskCtx, executor::TaskExecutor};
+use crate::runtime::{StepResult, Task, TaskCtx, TaskInput, TaskOutput, executor::TaskExecutor};
 
 #[derive(Debug, Clone)]
 pub struct DoNode {
@@ -22,11 +21,13 @@ impl DoNode {
 
 #[async_trait::async_trait]
 impl Task for DoNode {
-    async fn execute(&self, ctx: TaskCtx, mut input: Value) -> StepResult<Value> {
+    async fn execute(&self, ctx: TaskCtx, input: TaskInput) -> StepResult<TaskOutput> {
+        let mut current = input;
         for task in &self.tasks {
-            input = TaskExecutor::execute(task, &ctx, input).await?;
+            let output = TaskExecutor::execute(task, &ctx, current).await?;
+            current = output.into();
         }
-        Ok(input)
+        Ok(current.into())
     }
 
     fn name(&self) -> &'static str {

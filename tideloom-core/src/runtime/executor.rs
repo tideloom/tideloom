@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::nodes::{call::CallNode, r#do::DoNode, r#for::ForNode};
-use crate::runtime::{StepResult, Task, TaskCtx};
+use crate::runtime::{StepResult, Task, TaskCtx, TaskInput, TaskOutput};
 
 pub struct TaskExecutor;
 
@@ -16,8 +16,8 @@ impl TaskExecutor {
     pub fn execute<'a>(
         task: &'a TaskDefinition,
         ctx: &'a TaskCtx,
-        input: Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult<Value>> + Send + 'a>> {
+        input: TaskInput,
+    ) -> Pin<Box<dyn Future<Output = StepResult<TaskOutput>> + Send + 'a>> {
         Box::pin(async move {
             match task {
                 // ============ 原子任务 ============
@@ -68,8 +68,8 @@ impl TaskExecutor {
     async fn execute_set(
         _set: &serverless_workflow_core::models::task::SetTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 set 任务
         todo!("implement set task")
     }
@@ -77,8 +77,8 @@ impl TaskExecutor {
     async fn execute_emit(
         _emit: &serverless_workflow_core::models::task::EmitTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 emit 任务
         todo!("implement emit task")
     }
@@ -86,8 +86,8 @@ impl TaskExecutor {
     async fn execute_listen(
         _listen: &serverless_workflow_core::models::task::ListenTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 listen 任务
         todo!("implement listen task")
     }
@@ -95,8 +95,8 @@ impl TaskExecutor {
     async fn execute_raise(
         _raise: &serverless_workflow_core::models::task::RaiseTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 raise 任务
         todo!("implement raise task")
     }
@@ -104,8 +104,8 @@ impl TaskExecutor {
     async fn execute_wait(
         _wait: &serverless_workflow_core::models::task::WaitTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 wait 任务
         todo!("implement wait task")
     }
@@ -113,8 +113,8 @@ impl TaskExecutor {
     async fn execute_run(
         _run: &serverless_workflow_core::models::task::RunTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 run 任务
         todo!("implement run task")
     }
@@ -126,8 +126,8 @@ impl TaskExecutor {
     async fn execute_fork(
         fork_task: &serverless_workflow_core::models::task::ForkTaskDefinition,
         ctx: &TaskCtx,
-        input: Value,
-    ) -> StepResult<Value> {
+        input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         use futures::future::try_join_all;
 
         let mut futures = Vec::new();
@@ -151,15 +151,18 @@ impl TaskExecutor {
 
         // TODO: 根据 fork.compete 决定返回策略
         // 现在简单返回第一个结果
-        Ok(results.into_iter().next().unwrap_or(Value::Null))
+        Ok(results
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TaskOutput::new(Value::Null)))
     }
 
     /// Switch: 条件分支
     async fn execute_switch(
         _switch_task: &serverless_workflow_core::models::task::SwitchTaskDefinition,
         _ctx: &TaskCtx,
-        _input: Value,
-    ) -> StepResult<Value> {
+        _input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // TODO: 实现 switch 任务
         // 需要：
         // 1. 评估条件
@@ -172,17 +175,17 @@ impl TaskExecutor {
     async fn execute_try(
         try_task: &serverless_workflow_core::models::task::TryTaskDefinition,
         ctx: &TaskCtx,
-        input: Value,
-    ) -> StepResult<Value> {
+        input: TaskInput,
+    ) -> StepResult<TaskOutput> {
         // try_ 是一个 Map<String, TaskDefinition>，需要执行其中的任务
-        let mut current_data = input.clone();
+        let mut current = input;
 
         // 尝试执行 try 块中的所有任务
         for entry in &try_task.try_.entries {
             for (_name, task) in entry.iter() {
-                match Self::execute(task, ctx, current_data.clone()).await {
-                    Ok(result) => {
-                        current_data = result;
+                match Self::execute(task, ctx, current.clone()).await {
+                    Ok(output) => {
+                        current = output.into();
                     }
                     Err(err) => {
                         // 如果有 catch 块，执行它
@@ -193,7 +196,7 @@ impl TaskExecutor {
             }
         }
 
-        Ok(current_data)
+        Ok(current.into())
     }
 }
 
@@ -203,6 +206,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    #[ignore = "workflow execution wiring not implemented yet"]
     async fn test_execute_do_task() {
         let yaml = r#"
 document:
@@ -223,11 +227,11 @@ do:
         endpoint: https://httpbin.org/post
 "#;
 
-        let workflow: serverless_workflow_core::models::workflow::WorkflowDefinition =
+        let _workflow: serverless_workflow_core::models::workflow::WorkflowDefinition =
             serde_yaml::from_str(yaml).expect("invalid yaml");
 
-        let ctx = TaskCtx::default();
-        let input = json!({});
+        let _ctx = TaskCtx::default();
+        let _input = json!({});
 
         // workflow.do_ 本身就是一个 Do 任务
         // TODO: 需要从 workflow 提取任务并执行

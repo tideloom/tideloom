@@ -5,7 +5,7 @@ use serverless_workflow_core::models::authentication::AuthenticationPolicyDefini
 use serverless_workflow_core::models::task::{CallTaskDefinition, TaskDefinition};
 use std::str::FromStr;
 
-use crate::runtime::{StepResult, Task, TaskCtx};
+use crate::runtime::{StepResult, Task, TaskCtx, TaskInput, TaskOutput};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsyncApiDocument {
@@ -88,7 +88,8 @@ impl HTTPNode {
 
         let config: HTTPNode = HTTPNode {
             endpoint: reqwest::Url::parse(endpoint_url).context("invalid endpoint URL")?,
-            method: reqwest::Method::from_str(method).context("invalid http method")?,
+            method: reqwest::Method::from_str(&method.to_uppercase())
+                .context("invalid http method")?,
         };
 
         Ok(config)
@@ -121,12 +122,12 @@ impl TryFrom<&CallTaskDefinition> for HTTPNode {
 
 #[async_trait::async_trait]
 impl Task for HTTPNode {
-    async fn execute(&self, ctx: TaskCtx, input: Value) -> StepResult<Value> {
-        let req = self.build_request(&input)?;
+    async fn execute(&self, ctx: TaskCtx, input: TaskInput) -> StepResult<TaskOutput> {
+        let req = self.build_request(&input.data)?;
         ctx.http_client.execute(req).await?;
 
         // TODO: fix me
-        Ok(Value::Null)
+        Ok(TaskOutput::new(Value::Null))
     }
 
     fn name(&self) -> &'static str {
@@ -152,8 +153,8 @@ mod tests {
             .expect("missing task")
     }
 
-    #[tokio::test]
-    async fn http_node_from_task() {
+    #[test]
+    fn http_node_from_task() {
         let yaml = r#"
 document:
   dsl: '1.0.1'
@@ -171,11 +172,11 @@ do:
 
         let task = load_first_task(yaml);
         let step = HTTPNode::try_from_task(&task).expect("asyncapi node");
-        let ctx = TaskCtx::default();
         let input = json!({});
 
-        let output = step.execute(ctx, input).await.expect("step should succeed");
+        let request = step.build_request(&input).expect("request should build");
 
-        println!("{:?}", output);
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(request.url().as_str(), "https://httpbin.org/get");
     }
 }

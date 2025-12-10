@@ -8,6 +8,87 @@ use std::time::Duration;
 
 pub type StepResult<T> = anyhow::Result<T>;
 
+/// Input data passed to a task execution.
+/// Wraps the actual data with metadata for lineage tracking, validation, etc.
+#[derive(Debug, Clone)]
+pub struct TaskInput {
+    /// The actual input data
+    pub data: Value,
+    // Future extensions:
+    // pub metadata: HashMap<String, Value>,
+    // pub lineage: Vec<String>,
+    // pub validation_schema: Option<Schema>,
+}
+
+impl TaskInput {
+    pub fn new(data: Value) -> Self {
+        Self { data }
+    }
+
+    /// Convenience method to create from JSON value
+    pub fn from_value(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<Value> for TaskInput {
+    fn from(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<TaskInput> for TaskOutput {
+    fn from(input: TaskInput) -> Self {
+        TaskOutput::new(input.data)
+    }
+}
+
+/// Output data returned from a task execution.
+/// Wraps the actual data with metadata for metrics, lineage, etc.
+#[derive(Debug, Clone)]
+pub struct TaskOutput {
+    /// The actual output data
+    pub data: Value,
+    // Future extensions:
+    // pub metadata: HashMap<String, Value>,
+    // pub metrics: TaskMetrics,
+    // pub lineage: Vec<String>,
+}
+
+impl TaskOutput {
+    pub fn new(data: Value) -> Self {
+        Self { data }
+    }
+
+    /// Convenience method to create from JSON value
+    pub fn from_value(value: Value) -> Self {
+        Self::new(value)
+    }
+
+    /// Extract the inner data value
+    pub fn into_value(self) -> Value {
+        self.data
+    }
+}
+
+impl From<Value> for TaskOutput {
+    fn from(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<TaskOutput> for Value {
+    fn from(output: TaskOutput) -> Self {
+        output.data
+    }
+}
+
+impl From<TaskOutput> for TaskInput {
+    fn from(output: TaskOutput) -> Self {
+        TaskInput::new(output.data)
+    }
+}
+
 /// Basic retry configuration. Extend as the DSL retry semantics are modeled.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
@@ -58,7 +139,7 @@ pub type WorkflowContext = TaskCtx;
 
 #[async_trait::async_trait]
 pub trait Task: Send + Sync {
-    async fn execute(&self, ctx: TaskCtx, input: Value) -> StepResult<Value>;
+    async fn execute(&self, ctx: TaskCtx, input: TaskInput) -> StepResult<TaskOutput>;
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::default()
     }
@@ -145,8 +226,8 @@ pub async fn run_step(
     step: &mut StepInstance,
     task: &dyn crate::runtime::Task,
     ctx: TaskCtx,
-    input: Value,
-) -> StepResult<Value> {
+    input: TaskInput,
+) -> StepResult<TaskOutput> {
     step.transition(StepStatus::Running)?;
     match task.execute(ctx, input).await {
         Ok(output) => {

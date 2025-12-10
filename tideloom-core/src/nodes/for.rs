@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail};
 use serde_json::Value;
 use serverless_workflow_core::models::task::{ForTaskDefinition, TaskDefinition};
 
-use crate::runtime::{StepResult, Task, TaskCtx, executor::TaskExecutor};
+use crate::runtime::{StepResult, Task, TaskCtx, TaskInput, TaskOutput, executor::TaskExecutor};
 
 #[derive(Debug, Clone)]
 pub struct ForNode {
@@ -29,23 +29,24 @@ impl ForNode {
 
 #[async_trait::async_trait]
 impl Task for ForNode {
-    async fn execute(&self, ctx: TaskCtx, input: Value) -> StepResult<Value> {
+    async fn execute(&self, ctx: TaskCtx, input: TaskInput) -> StepResult<TaskOutput> {
         if self.while_expr.is_some() {
             bail!("'for.while' is not supported yet");
         }
 
-        let items = resolve_iterable(&self.in_expr, &input)?;
+        let items = resolve_iterable(&self.in_expr, &input.data)?;
         let mut results = Vec::with_capacity(items.len());
 
         for item in items {
-            let mut current = item;
+            let mut current = TaskInput::new(item);
             for task in &self.body {
-                current = TaskExecutor::execute(task, &ctx, current).await?;
+                let output = TaskExecutor::execute(task, &ctx, current).await?;
+                current = output.into();
             }
-            results.push(current);
+            results.push(current.data);
         }
 
-        Ok(Value::Array(results))
+        Ok(TaskOutput::new(Value::Array(results)))
     }
 
     fn name(&self) -> &'static str {
