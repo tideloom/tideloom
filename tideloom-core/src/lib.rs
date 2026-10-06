@@ -1,52 +1,24 @@
-pub mod runtime;
-pub mod nodes;
+//! Build a Serverless Workflow document into an immutable definition tree.
+//!
+//! This crate parses DSL 1.0 YAML or JSON and returns a [`Definition`]. It does
+//! not run tasks, evaluate jq, schedule work, or replay executions. Those steps
+//! are outside this build. The model is ADR-0001 in the repository `docs/`
+//! directory.
 
-use serverless_workflow_core::models::workflow::WorkflowDefinition;
+#![warn(missing_docs)]
 
-/// Wrapper around `WorkflowDefinition` with convenience constructors.
-pub struct Workflow {
-    workflow_definition: WorkflowDefinition,
-}
+mod definition;
+mod error;
+mod hash;
+mod node;
 
-impl Workflow {
-    /// Builds a workflow from a YAML string. Panics if input is invalid.
-    pub fn from_yaml(yaml: &str) -> Self {
-        let workflow_definition: WorkflowDefinition =
-            serde_yaml::from_str(yaml).expect("invalid workflow yaml");
-        Self {
-            workflow_definition,
-        }
-    }
-
-    /// Returns the underlying workflow definition.
-    pub fn definition(&self) -> &WorkflowDefinition {
-        &self.workflow_definition
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_from_yaml() {
-        let yaml = "
-document:
-  dsl: '1.0.0'
-  namespace: default
-  name: call-http
-  version: '1.0.0'
-do:
-- getPet:
-    call: http
-    with:
-      method: get
-      endpoint: https://petstore.swagger.io/v2/pet/{petId}
-        ";
-        let workflow = Workflow::from_yaml(yaml);
-        assert_eq!(
-            workflow.definition().document.name,
-            "call-http"
-        );
-    }
-}
+pub use definition::Definition;
+pub use error::BuildError;
+pub use hash::ContentHash;
+pub use hash::canonical_json;
+pub use node::CallKind;
+pub use node::FlowDirective;
+pub use node::Identity;
+pub use node::Node;
+pub use node::NodeKind;
+pub use node::RunKind;
