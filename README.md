@@ -2,7 +2,7 @@
 
 Tideloom is a Rust runtime for the [Serverless Workflow DSL](https://github.com/serverlessworkflow/specification) (Open Workflow Specification 1.0).
 
-This repository builds a workflow file into an immutable definition tree. It does not run tasks, evaluate jq, schedule work, or replay an execution. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md).
+This repository builds a workflow file into an immutable definition tree and re-walks that tree from the root. Resume state is a result log, not a node stack. The walk runs control flow inline and returns the next blocking or effectful block. `drive` performs a blocked `call: http`, writes the result into that log, and walks again. It does not talk to a broker or store a run. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md).
 
 ## Build
 
@@ -44,6 +44,45 @@ A node is a block boundary when it is blocking or effectful. Only effectful node
 let definition = tideloom_core::Definition::from_yaml(yaml)?;
 let task = definition.get("/do/0/validateOrder").unwrap();
 let _boundary = task.is_block_boundary();
+```
+
+## Walk
+
+`tideloom_core::walk` takes a definition, the workflow input, and a `ResultLog`. It always starts at the root.
+
+- `set`, `do`, `switch`, `for`, `raise`, `try` (until a retry backoff), and `call` of a `use.functions` entry run inline.
+- The walk stops at the next block boundary and returns a `Block`: position, execution key, pause reason, transformed input, `$context`, and whether the block is effectful.
+- Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`).
+- An effectful output or fault is stored with `ResultLog::record_output` / `record_fault`, keyed by position plus the ancestor `for` indexes and `try` attempts (`loop:0/attempt:1`). A later walk skips that task and continues with the logged value. Only those entries are `task_execution` results.
+- `wait`, `listen`, `fork`, and a retry backoff are not effectful. `ResultLog::release` marks them finished so the next walk can pass them. `fork` branches and `listen.foreach` are not walked.
+
+Expressions are a closed subset used by `if`, `switch.when`, `for.in`, `while`, `input.from`, `output.as`, `export.as`, and `${ ... }` inside `set`: paths, literals, comparisons, arithmetic, `and` / `or` / `not`, arrays, objects, and `|`. Full jq is not implemented.
+
+```rust
+let outcome = tideloom_core::walk(&definition, &input, &log);
+```
+
+## HTTP call
+
+`tideloom_core::drive` re-walks until the workflow completes, faults, or stops on a block that is not `call: http`. For each HTTP activity it sends the request and stores the raw output with `ResultLog::record_output`, or the fault with `record_fault`. The next walk applies `output.as`, `export.as`, and `try`.
+
+`with` accepts:
+
+| Field | Shape |
+| --- | --- |
+| `method` | Alphabetic token. Omitted means `GET`. |
+| `endpoint` | String or `{ uri }`. `${ ... }` is interpolated, then `{name}` is filled from a top-level task-input field. |
+| `headers` | Object of strings, numbers, booleans, or null. |
+| `query` | Same, or an array of those scalars repeated as one key. |
+| `body` | Any JSON value. Sent as JSON with `Content-Type: application/json` when that header is absent. |
+| `output` | `content` (default) or `response`. |
+
+`content` is parsed JSON when the response content type is JSON, a string for other text, and null when the body is empty. `response` is `{ request, statusCode, headers, content }`. Status codes outside 200–299 become a communication fault and are not returned as output. Redirects are not followed.
+
+Not in this slice: `output: raw`, endpoint authentication, HTTPS, DSL timeouts, URI-template operators other than `{name}`, gRPC, OpenAPI, AsyncAPI, brokers, and a database.
+
+```rust
+let outcome = tideloom_core::drive(&definition, &input, &mut log);
 ```
 
 The workspace layout matches this repository's existing FastLabs-style shape: one library crate, `tideloom-core`, beside the virtual-workspace `Cargo.toml`, with `rustfmt.toml`, `taplo.toml`, and `.github/workflows/ci.yml`.
