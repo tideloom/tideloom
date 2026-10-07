@@ -3,6 +3,8 @@ use std::fmt;
 use serde_json::Map;
 use serde_json::Value;
 
+const COMMUNICATION: &str =
+    "https://open-workflow-specification.org/spec/1.0.0/errors/communication";
 const EXPRESSION: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/expression";
 const RUNTIME: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/runtime";
 
@@ -34,6 +36,24 @@ impl Fault {
     /// Runtime failure at `instance`.
     pub fn runtime(instance: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::new(RUNTIME, 500, instance, "runtime error", Some(detail.into()))
+    }
+
+    /// HTTP or network failure at `instance`.
+    ///
+    /// `status` is the HTTP status when the server responded, or 500 when the
+    /// call did not complete.
+    pub fn communication(
+        instance: impl Into<String>,
+        status: u16,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            COMMUNICATION,
+            status,
+            instance,
+            "communication error",
+            Some(detail.into()),
+        )
     }
 
     fn new(

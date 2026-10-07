@@ -3,11 +3,13 @@
 //!
 //! [`Definition`] is the immutable tree (identity, dsl, content hash, nodes).
 //! [`walk`] runs control flow inline and returns the next blocking or
-//! effectful block. Resume state is a [`ResultLog`], not a node stack. The
-//! model is ADR-0001 in the repository `docs/` directory.
+//! effectful block. Resume state is a [`ResultLog`], not a node stack.
+//! [`drive`] performs a blocked `call: http` activity, records the result, and
+//! walks again. The model is ADR-0001 in the repository `docs/` directory.
 //!
-//! This crate does not perform HTTP, talk to a broker, or store a run. The
-//! expressions [`walk`] evaluates are a small subset, not full jq.
+//! This crate does not talk to a broker or store a run. The expressions
+//! [`walk`] evaluates are a small subset, not full jq. HTTP calls send JSON
+//! and read `content` or `response` output.
 
 #![warn(missing_docs)]
 
@@ -16,6 +18,7 @@ mod error;
 pub(crate) mod expr;
 mod fault;
 mod hash;
+mod http;
 pub(crate) mod log;
 mod node;
 mod walk;
@@ -25,6 +28,8 @@ pub use error::BuildError;
 pub use fault::Fault;
 pub use hash::ContentHash;
 pub use hash::canonical_json;
+pub use http::drive;
+pub use http::http_call;
 pub use log::ExecutionKey;
 pub use log::Frame;
 pub use log::ResultLog;
