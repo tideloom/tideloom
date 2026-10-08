@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::json;
 use tideloom_core::Definition;
 use tideloom_core::Frame;
@@ -261,7 +263,13 @@ fn retry_attempts_are_part_of_the_effectful_key() {
     let retry = blocked(walk(&definition, &json!({}), &log));
     assert_eq!(retry.position(), "/do/0/charge");
     assert!(!retry.effectful());
-    assert_eq!(retry.pause(), Pause::Retry { attempt: 0 });
+    assert_eq!(
+        retry.pause(),
+        Pause::Retry {
+            attempt: 0,
+            delay: Duration::ZERO,
+        }
+    );
     log.release(retry.key().clone(), json!(null));
 
     let again = blocked(walk(&definition, &json!({}), &log));
@@ -706,7 +714,13 @@ use:
         tideloom_core::Fault::runtime(call.position(), "down"),
     );
     let retry = blocked(walk(&definition, &json!({}), &log));
-    assert_eq!(retry.pause(), Pause::Retry { attempt: 0 });
+    assert_eq!(
+        retry.pause(),
+        Pause::Retry {
+            attempt: 0,
+            delay: Duration::ZERO,
+        }
+    );
     assert_eq!(retry.execution_key().to_string(), "attempt:0");
 }
 

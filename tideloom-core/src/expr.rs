@@ -75,6 +75,10 @@ fn evaluate_string(
     Ok(Value::String(out))
 }
 
+pub(crate) fn runtime_expression(text: &str) -> Option<&str> {
+    sole_interpolation(text)
+}
+
 fn sole_interpolation(text: &str) -> Option<&str> {
     let trimmed = text.trim();
     let rest = trimmed.strip_prefix("${")?;

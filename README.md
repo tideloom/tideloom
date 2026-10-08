@@ -52,7 +52,7 @@ let _boundary = task.is_block_boundary();
 
 - `set`, `do`, `switch`, `for`, `raise`, `try` (until a retry backoff), and `call` of a `use.functions` entry run inline.
 - The walk stops at the next block boundary and returns a `Block`: position, execution key, pause reason, transformed input, `$context`, and whether the block is effectful.
-- Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`).
+- Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`). A retry pause includes the computed wait. See [Retry backoff](#retry-backoff).
 - An effectful output or fault is stored with `ResultLog::record_output` / `record_fault`, keyed by position plus the ancestor `for` indexes and `try` attempts (`loop:0/attempt:1`). A later walk skips that task and continues with the logged value. Only those entries are `task_execution` results.
 - `wait`, `listen`, `fork`, and a retry backoff are not effectful. `ResultLog::release` marks them finished so the next walk can pass them. `fork` branches and `listen.foreach` are not walked.
 
@@ -61,6 +61,24 @@ Expressions are a closed subset used by `if`, `switch.when`, `for.in`, `while`, 
 ```rust
 let outcome = tideloom_core::walk(&definition, &input, &log);
 ```
+
+## Retry backoff
+
+When `catch.retry` wants another try, `walk` returns `Pause::Retry` and stops. It does not sleep. `attempt` is the zero-based try that just failed. `delay` is the wait before the next one.
+
+`Pause::retry_at(started_at)` is `started_at + delay`. The runner keeps `started_at` from the moment it first observed that pause. A later walk with the same inputs returns the same delay; it does not move `started_at`. `ResultLog::release` on the pause key makes the next walk run the try body under the next attempt key (`attempt:1`, and so on).
+
+| Backoff | Wait |
+| --- | --- |
+| omitted or `constant` | `delay` |
+| `linear` | `delay + increment * attempt`. A missing `increment` defaults to `delay`, so the waits are `delay`, `2 * delay`, `3 * delay`, ... |
+| `exponential` | `delay * 2^attempt`, exponent capped at 32. The first retry waits `delay`, then the wait doubles. |
+
+A missing `delay` is 0, and the walk still pauses so the attempt key can advance on release. `delay` is an ISO 8601 string (`PT3S`; a year is 365 days and a month is 30 days), an object (`days`, `hours`, `minutes`, `seconds`, `milliseconds`), or a `${ ... }` expression that evaluates to an ISO 8601 string.
+
+`jitter.from` and `jitter.to` are added after the backoff. `walk` uses `from`, so the delay does not change between walks. `walk_with` and `WalkOptions::with_jitter` pick another point: `JitterSample::FROM` is `from`, `JitterSample::TO` is `to`, and `JitterSample::new(parts_per_million)` is a point in between. Pass the same sample every time that pause is recomputed.
+
+`limit.attempt.count` is unchanged. `limit.attempt.duration` and `limit.duration` are not enforced. `drive` returns the retry pause instead of waiting.
 
 ## HTTP call
 
