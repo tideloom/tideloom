@@ -12,6 +12,7 @@
 //! expression fault.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::Map;
 use serde_json::Value;
@@ -20,15 +21,21 @@ use crate::CallKind;
 use crate::Definition;
 use crate::Fault;
 use crate::FlowDirective;
+use crate::JitterSample;
 use crate::Node;
 use crate::NodeKind;
 use crate::ResultLog;
 use crate::RunKind;
 use crate::TaskKey;
+use crate::Timestamp;
 use crate::expr::evaluate;
 use crate::expr::evaluate_data;
+use crate::expr::runtime_expression;
 use crate::log::ExecutionKey;
 use crate::log::Frame;
+use crate::retry::duration_millis;
+use crate::retry::retry_spec;
+use crate::retry::wait_ms;
 
 /// Stop an inline loop that never reaches a block boundary.
 const MAX_INLINE_STEPS: u32 = 10_000;
@@ -53,9 +60,13 @@ pub enum Pause {
         compete: bool,
     },
     /// `try` retry backoff. `attempt` is the attempt that just failed.
+    /// `delay` is the wait before the next attempt, including backoff and jitter.
     Retry {
         /// Zero-based attempt that failed.
         attempt: u64,
+        /// Wait before the next attempt. Add it to the instant this pause was
+        /// first observed. See [`Pause::retry_at`].
+        delay: Duration,
     },
     /// `run workflow`. Also effectful.
     Child,
@@ -124,6 +135,73 @@ impl Block {
     }
 }
 
+impl Pause {
+    /// Instant a retry pause may be released: `started_at + delay`.
+    ///
+    /// `started_at` is when the runner first observed this pause. A later walk
+    /// returns the same delay for the same attempt and jitter sample; it does
+    /// not move `started_at`, and it does not sleep. Other pause reasons
+    /// return `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use tideloom_core::Pause;
+    /// use tideloom_core::Timestamp;
+    ///
+    /// let pause = Pause::Retry {
+    ///     attempt: 0,
+    ///     delay: Duration::from_secs(3),
+    /// };
+    /// let started = Timestamp::from_millis(1_000);
+    /// assert_eq!(pause.retry_at(started), Some(Timestamp::from_millis(4_000)));
+    /// assert_eq!(Pause::Timer.retry_at(started), None);
+    /// ```
+    #[must_use]
+    pub fn retry_at(&self, started_at: Timestamp) -> Option<Timestamp> {
+        match self {
+            Self::Retry { delay, .. } => Some(started_at.saturating_add(*delay)),
+            Self::Activity | Self::Timer | Self::Events | Self::Join { .. } | Self::Child => None,
+        }
+    }
+}
+
+/// Knobs that are not the definition or the result log.
+///
+/// [`walk`] uses [`WalkOptions::default`], which pins jitter to `jitter.from`.
+/// Pass the same options on every re-walk so the computed delay stays put.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkOptions {
+    jitter: JitterSample,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            jitter: JitterSample::FROM,
+        }
+    }
+}
+
+impl WalkOptions {
+    /// Jitter sample at the `from` end of the range.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pick a point in `jitter.from` ..= `jitter.to`.
+    ///
+    /// [`JitterSample::FROM`] is `from`. [`JitterSample::TO`] is `to`.
+    #[must_use]
+    pub fn with_jitter(mut self, sample: JitterSample) -> Self {
+        self.jitter = sample;
+        self
+    }
+}
+
 /// What one walk from the root decided.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
@@ -153,6 +231,12 @@ pub enum Outcome {
 /// `input` is the workflow input. `log` supplies effectful outputs and
 /// released blocking pauses. The same arguments produce the same outcome.
 /// An inline cycle that never hits a boundary faults after 10_000 task entries.
+///
+/// A `try` retry pause carries the computed delay. This function does not
+/// sleep. [`Pause::retry_at`] adds that delay to the instant the runner first
+/// saw the pause. [`crate::ResultLog::release`] on the pause key makes the
+/// next walk retry the try at the next attempt. Jitter uses `jitter.from`.
+/// [`walk_with`] selects another point in the jitter range.
 ///
 /// # Examples
 ///
@@ -192,6 +276,20 @@ pub enum Outcome {
 /// ```
 #[must_use]
 pub fn walk(definition: &Definition, input: &Value, log: &ResultLog) -> Outcome {
+    walk_with(definition, input, log, WalkOptions::default())
+}
+
+/// [`walk`] with an explicit jitter sample.
+///
+/// The sample is part of the pure inputs. A later call with the same sample,
+/// definition, input, and log returns the same retry delay.
+#[must_use]
+pub fn walk_with(
+    definition: &Definition,
+    input: &Value,
+    log: &ResultLog,
+    options: WalkOptions,
+) -> Outcome {
     let mut interpreter = Interpreter {
         log,
         document: definition.root().body(),
@@ -200,6 +298,7 @@ pub fn walk(definition: &Definition, input: &Value, log: &ResultLog) -> Outcome 
         frames: Vec::new(),
         bindings: Vec::new(),
         steps: 0,
+        jitter: options.jitter,
     };
     let started = match interpreter.workflow_input(input) {
         Ok(value) => value,
@@ -238,6 +337,7 @@ struct Interpreter<'a> {
     frames: Vec<Frame>,
     bindings: Vec<BTreeMap<String, Value>>,
     steps: u32,
+    jitter: JitterSample,
 }
 
 enum Directive {
@@ -520,11 +620,9 @@ impl<'a> Interpreter<'a> {
                             attempt += 1;
                             continue;
                         }
-                        self.frames.push(Frame::Attempt(attempt));
-                        let block = self.block(node, input.clone(), Pause::Retry { attempt });
-                        self.frames.pop();
+                        let paused = self.retry_block(node, input, attempt);
                         self.bindings.pop();
-                        return Ok(TaskFlow::Blocked(block));
+                        return paused;
                     }
                     if catch_body.is_empty() {
                         self.bindings.pop();
@@ -825,6 +923,71 @@ impl<'a> Interpreter<'a> {
         let mut frames = self.frames.clone();
         frames.push(Frame::Attempt(attempt));
         TaskKey::new(node.position(), ExecutionKey::new(frames))
+    }
+
+    fn retry_block(&mut self, node: &Node, input: &Value, attempt: u64) -> Result<TaskFlow, Fault> {
+        let delay = self.retry_wait(node, input, attempt)?;
+        self.frames.push(Frame::Attempt(attempt));
+        let block = self.block(node, input.clone(), Pause::Retry { attempt, delay });
+        self.frames.pop();
+        Ok(TaskFlow::Blocked(block))
+    }
+
+    fn retry_wait(&self, node: &Node, input: &Value, attempt: u64) -> Result<Duration, Fault> {
+        let Some(policy) = self.retry_policy(node)? else {
+            return Ok(Duration::ZERO);
+        };
+        let spec =
+            retry_spec(&policy).map_err(|message| Fault::runtime(node.position(), message))?;
+        let delay_ms = match spec.delay {
+            Some(value) => self.duration_of(value, node, input)?,
+            None => 0,
+        };
+        let increment_ms = match spec.increment {
+            Some(value) => Some(self.duration_of(value, node, input)?),
+            None => None,
+        };
+        let jitter_ms = match (spec.jitter_from, spec.jitter_to) {
+            (Some(from), Some(to)) => Some((
+                self.duration_of(from, node, input)?,
+                self.duration_of(to, node, input)?,
+            )),
+            _ => None,
+        };
+        let millis = wait_ms(
+            delay_ms,
+            spec.kind,
+            increment_ms,
+            jitter_ms,
+            attempt,
+            self.jitter,
+        )
+        .map_err(|message| Fault::runtime(node.position(), message))?;
+        Ok(Duration::from_millis(millis))
+    }
+
+    fn duration_of(&self, value: &Value, node: &Node, input: &Value) -> Result<u64, Fault> {
+        let literal = if let Value::String(text) = value {
+            if let Some(source) = runtime_expression(text) {
+                let vars = self.scope(Some(node), input, None);
+                match evaluate(source, input, &vars)
+                    .map_err(|message| Fault::expression(node.position(), message))?
+                {
+                    Value::String(iso) => Value::String(iso),
+                    _ => {
+                        return Err(Fault::expression(
+                            node.position(),
+                            "duration expression must be an ISO 8601 string",
+                        ));
+                    }
+                }
+            } else {
+                value.clone()
+            }
+        } else {
+            value.clone()
+        };
+        duration_millis(&literal).map_err(|message| Fault::runtime(node.position(), message))
     }
 
     fn scope(

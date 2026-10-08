@@ -42,7 +42,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Each call's raw output or fault is written into `log` before the next walk,
 /// so task `output.as`, `export.as`, and `try` see it. A pause that is not an
 /// HTTP activity is returned as [`Outcome::Blocked`] with earlier HTTP results
-/// already stored.
+/// already stored. A `try` retry pause is one of those stops: this function
+/// does not sleep for the backoff.
 ///
 /// # Examples
 ///
