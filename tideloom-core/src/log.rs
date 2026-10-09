@@ -4,6 +4,7 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::Fault;
+use crate::retry::Timestamp;
 
 /// One ancestor counter in an [`ExecutionKey`].
 ///
@@ -129,6 +130,8 @@ pub enum TaskResult {
 pub struct ResultLog {
     effectful: BTreeMap<TaskKey, TaskResult>,
     released: BTreeMap<TaskKey, Value>,
+    workflow_started: Option<Timestamp>,
+    task_started: BTreeMap<TaskKey, Timestamp>,
 }
 
 impl ResultLog {
@@ -167,5 +170,34 @@ impl ResultLog {
     /// Output stored by [`ResultLog::release`].
     pub fn released(&self, key: &TaskKey) -> Option<&Value> {
         self.released.get(key)
+    }
+
+    /// Remember when the workflow run started.
+    ///
+    /// The first call wins. A later call does not move the workflow deadline.
+    pub fn start_workflow(&mut self, at: Timestamp) {
+        if self.workflow_started.is_none() {
+            self.workflow_started = Some(at);
+        }
+    }
+
+    /// Instant recorded by [`ResultLog::start_workflow`].
+    #[must_use]
+    pub fn workflow_started(&self) -> Option<Timestamp> {
+        self.workflow_started
+    }
+
+    /// Remember when a paused task started.
+    ///
+    /// `key` is the block key the runner received. The first call for that key
+    /// wins, so a later walk does not move the task deadline.
+    pub fn start_task(&mut self, key: TaskKey, at: Timestamp) {
+        self.task_started.entry(key).or_insert(at);
+    }
+
+    /// Instant recorded by [`ResultLog::start_task`].
+    #[must_use]
+    pub fn task_started(&self, key: &TaskKey) -> Option<Timestamp> {
+        self.task_started.get(key).copied()
     }
 }

@@ -5,8 +5,9 @@
 //! [`walk`] runs control flow inline and returns the next blocking or
 //! effectful block. Resume state is a [`ResultLog`], not a node stack.
 //! [`drive`] performs a blocked `call: http` activity, records the result, and
-//! walks again. A `try` retry pause carries its backoff delay; nothing here
-//! sleeps. The model is ADR-0001 in the repository `docs/` directory.
+//! walks again. A `try` retry pause carries its backoff delay. Workflow and
+//! task timeouts fault when a supplied clock passes a recorded start. Nothing
+//! here sleeps. The model is ADR-0001 in the repository `docs/` directory.
 //!
 //! This crate does not talk to a broker or store a run. The expressions
 //! [`walk`] evaluates are a small subset, not full jq. HTTP calls send JSON
@@ -31,6 +32,7 @@ pub use fault::Fault;
 pub use hash::ContentHash;
 pub use hash::canonical_json;
 pub use http::drive;
+pub use http::drive_with;
 pub use http::http_call;
 pub use log::ExecutionKey;
 pub use log::Frame;

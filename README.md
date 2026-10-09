@@ -80,6 +80,16 @@ A missing `delay` is 0, and the walk still pauses so the attempt key can advance
 
 `limit.attempt.count` is unchanged. `limit.attempt.duration` and `limit.duration` are not enforced. `drive` returns the retry pause instead of waiting.
 
+## Timeouts
+
+`timeout.after` on the workflow or on a task is a duration: an ISO 8601 string, an object (`days`, `hours`, `minutes`, `seconds`, `milliseconds`), a `${ ... }` expression that evaluates to an ISO 8601 string, or the name of an entry in `use.timeouts`. The walk does not sleep.
+
+Record the start with `ResultLog::start_workflow` or `ResultLog::start_task` (the block key). The first instant stays. Pass that clock reading to `WalkOptions::with_now`. When `now` is at or past the start plus `after`, the walk returns a timeout fault: status 408, type `https://open-workflow-specification.org/spec/1.0.0/errors/timeout`. A workflow timeout is instance `/`. A task timeout is the task's JSON Pointer, so `try` can catch it. A logged output or a released pause is kept.
+
+`Block::timeout` is the task duration. `Block::timeout_at(started_at)` is the deadline. `walk` without `now` still returns the block and does not enforce the deadline. `drive_with` uses the same clock and faults before it sends an HTTP call that has already timed out.
+
+`Fault::configuration`, `validation`, `authentication`, `authorization`, and `timeout` are the standard error types from the DSL, alongside the existing expression, communication, and runtime faults.
+
 ## HTTP call
 
 `tideloom_core::drive` re-walks until the workflow completes, faults, or stops on a block that is not `call: http`. For each HTTP activity it sends the request and stores the raw output with `ResultLog::record_output`, or the fault with `record_fault`. The next walk applies `output.as`, `export.as`, and `try`.
@@ -97,7 +107,7 @@ A missing `delay` is 0, and the walk still pauses so the attempt key can advance
 
 `content` is parsed JSON when the response content type is JSON, a string for other text, and null when the body is empty. `response` is `{ request, statusCode, headers, content }`. Status codes outside 200–299 become a communication fault and are not returned as output. Redirects are not followed.
 
-Not in this slice: `output: raw`, endpoint authentication, HTTPS, DSL timeouts, URI-template operators other than `{name}`, gRPC, OpenAPI, AsyncAPI, brokers, and a database.
+Not in this slice: `output: raw`, endpoint authentication, HTTPS, URI-template operators other than `{name}`, gRPC, OpenAPI, AsyncAPI, brokers, and a database. The HTTP client keeps its own 10 second cap. Workflow and task timeouts are the walk's clock, described above.
 
 ```rust
 let outcome = tideloom_core::drive(&definition, &input, &mut log);
