@@ -10,9 +10,10 @@
 //! Status codes outside 200–299 are communication faults. Redirects are not
 //! followed.
 //!
-//! Not in this slice: `output: raw`, endpoint authentication, HTTPS, DSL
-//! timeouts, URI-template operators other than `{name}`, and `$item` / `$index`
-//! inside `with` (those bindings are not on the block).
+//! Not in this slice: `output: raw`, endpoint authentication, HTTPS,
+//! URI-template operators other than `{name}`, and `$item` / `$index`
+//! inside `with` (those bindings are not on the block). Task and workflow
+//! timeouts are enforced by the walk, not by shortening this client's cap.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -31,7 +32,8 @@ use crate::Outcome;
 use crate::Pause;
 use crate::ResultLog;
 use crate::expr::evaluate_data;
-use crate::walk::walk;
+use crate::walk::WalkOptions;
+use crate::walk::walk_with;
 
 const MAX_HTTP_CALLS: u32 = 10_000;
 const MAX_BODY: usize = 1024 * 1024;
@@ -74,9 +76,23 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// ```
 #[must_use]
 pub fn drive(definition: &Definition, input: &Value, log: &mut ResultLog) -> Outcome {
+    drive_with(definition, input, log, WalkOptions::default())
+}
+
+/// [`drive`] with the same clock and jitter inputs as [`walk_with`](crate::walk_with).
+///
+/// A task or workflow that has already timed out at `options`'s `now` faults
+/// before the HTTP call is sent.
+#[must_use]
+pub fn drive_with(
+    definition: &Definition,
+    input: &Value,
+    log: &mut ResultLog,
+    options: WalkOptions,
+) -> Outcome {
     let mut calls = 0u32;
     loop {
-        match walk(definition, input, log) {
+        match walk_with(definition, input, log, options) {
             Outcome::Blocked { block } if is_http_activity(&block) => {
                 calls += 1;
                 if calls > MAX_HTTP_CALLS {

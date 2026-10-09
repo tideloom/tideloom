@@ -86,6 +86,7 @@ pub struct Block {
     context: Value,
     effectful: bool,
     kind: NodeKind,
+    timeout: Option<Duration>,
 }
 
 impl Block {
@@ -133,6 +134,21 @@ impl Block {
     pub fn kind(&self) -> &NodeKind {
         &self.kind
     }
+
+    /// Task `timeout.after`, when the task sets one.
+    #[must_use]
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Instant the task times out: `started_at + timeout.after`.
+    ///
+    /// `None` when the task has no timeout. The runner keeps `started_at` from
+    /// [`crate::ResultLog::start_task`]. The walk does not sleep.
+    #[must_use]
+    pub fn timeout_at(&self, started_at: Timestamp) -> Option<Timestamp> {
+        self.timeout.map(|after| started_at.saturating_add(after))
+    }
 }
 
 impl Pause {
@@ -175,12 +191,14 @@ impl Pause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalkOptions {
     jitter: JitterSample,
+    now: Option<Timestamp>,
 }
 
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
             jitter: JitterSample::FROM,
+            now: None,
         }
     }
 }
@@ -198,6 +216,17 @@ impl WalkOptions {
     #[must_use]
     pub fn with_jitter(mut self, sample: JitterSample) -> Self {
         self.jitter = sample;
+        self
+    }
+
+    /// Clock reading for workflow and task timeouts.
+    ///
+    /// Without it, a configured timeout is reported on the block and is not
+    /// enforced. The same `now` on a later walk, with a start instant already
+    /// stored in the log, faults once `now` reaches the deadline.
+    #[must_use]
+    pub fn with_now(mut self, now: Timestamp) -> Self {
+        self.now = Some(now);
         self
     }
 }
@@ -236,7 +265,8 @@ pub enum Outcome {
 /// sleep. [`Pause::retry_at`] adds that delay to the instant the runner first
 /// saw the pause. [`crate::ResultLog::release`] on the pause key makes the
 /// next walk retry the try at the next attempt. Jitter uses `jitter.from`.
-/// [`walk_with`] selects another point in the jitter range.
+/// [`walk_with`] selects another point in the jitter range and supplies `now`
+/// for workflow and task timeouts.
 ///
 /// # Examples
 ///
@@ -279,10 +309,11 @@ pub fn walk(definition: &Definition, input: &Value, log: &ResultLog) -> Outcome 
     walk_with(definition, input, log, WalkOptions::default())
 }
 
-/// [`walk`] with an explicit jitter sample.
+/// [`walk`] with an explicit jitter sample and clock reading.
 ///
 /// The sample is part of the pure inputs. A later call with the same sample,
-/// definition, input, and log returns the same retry delay.
+/// definition, input, and log returns the same retry delay. `now` enforces
+/// workflow and task timeouts against start instants stored in the log.
 #[must_use]
 pub fn walk_with(
     definition: &Definition,
@@ -299,7 +330,17 @@ pub fn walk_with(
         bindings: Vec::new(),
         steps: 0,
         jitter: options.jitter,
+        now: options.now,
     };
+    match interpreter.workflow_timeout(input) {
+        Ok(None) => {}
+        Ok(Some(fault)) | Err(fault) => {
+            return Outcome::Faulted {
+                fault,
+                context: Value::Object(Map::new()),
+            };
+        }
+    }
     let started = match interpreter.workflow_input(input) {
         Ok(value) => value,
         Err(fault) => {
@@ -338,6 +379,7 @@ struct Interpreter<'a> {
     bindings: Vec<BTreeMap<String, Value>>,
     steps: u32,
     jitter: JitterSample,
+    now: Option<Timestamp>,
 }
 
 enum Directive {
@@ -689,7 +731,7 @@ impl<'a> Interpreter<'a> {
         } else {
             Pause::Activity
         };
-        Ok(TaskFlow::Blocked(self.block(node, input.clone(), pause)))
+        self.pause(node, input.clone(), pause)
     }
 
     fn exec_pause(&mut self, node: &Node, input: &Value) -> Result<TaskFlow, Fault> {
@@ -703,7 +745,7 @@ impl<'a> Interpreter<'a> {
             NodeKind::Fork { compete } => Pause::Join { compete: *compete },
             _ => Pause::Activity,
         };
-        Ok(TaskFlow::Blocked(self.block(node, input.clone(), pause)))
+        self.pause(node, input.clone(), pause)
     }
 
     fn done(
@@ -903,8 +945,9 @@ impl<'a> Interpreter<'a> {
             .map(Some)
     }
 
-    fn block(&self, node: &Node, input: Value, pause: Pause) -> Block {
-        Block {
+    fn block(&self, node: &Node, input: Value, pause: Pause) -> Result<Block, Fault> {
+        let timeout = self.task_timeout(node, &input)?;
+        Ok(Block {
             key: self.task_key(node),
             name: node.name().map(str::to_string),
             pause,
@@ -912,7 +955,8 @@ impl<'a> Interpreter<'a> {
             context: Value::Object(self.context.clone()),
             effectful: node.effectful(),
             kind: node.kind().clone(),
-        }
+            timeout,
+        })
     }
 
     fn task_key(&self, node: &Node) -> TaskKey {
@@ -928,9 +972,9 @@ impl<'a> Interpreter<'a> {
     fn retry_block(&mut self, node: &Node, input: &Value, attempt: u64) -> Result<TaskFlow, Fault> {
         let delay = self.retry_wait(node, input, attempt)?;
         self.frames.push(Frame::Attempt(attempt));
-        let block = self.block(node, input.clone(), Pause::Retry { attempt, delay });
+        let paused = self.pause(node, input.clone(), Pause::Retry { attempt, delay });
         self.frames.pop();
-        Ok(TaskFlow::Blocked(block))
+        paused
     }
 
     fn retry_wait(&self, node: &Node, input: &Value, attempt: u64) -> Result<Duration, Fault> {
@@ -940,17 +984,17 @@ impl<'a> Interpreter<'a> {
         let spec =
             retry_spec(&policy).map_err(|message| Fault::runtime(node.position(), message))?;
         let delay_ms = match spec.delay {
-            Some(value) => self.duration_of(value, node, input)?,
+            Some(value) => self.duration_of(value, node.position(), Some(node), input)?,
             None => 0,
         };
         let increment_ms = match spec.increment {
-            Some(value) => Some(self.duration_of(value, node, input)?),
+            Some(value) => Some(self.duration_of(value, node.position(), Some(node), input)?),
             None => None,
         };
         let jitter_ms = match (spec.jitter_from, spec.jitter_to) {
             (Some(from), Some(to)) => Some((
-                self.duration_of(from, node, input)?,
-                self.duration_of(to, node, input)?,
+                self.duration_of(from, node.position(), Some(node), input)?,
+                self.duration_of(to, node.position(), Some(node), input)?,
             )),
             _ => None,
         };
@@ -966,17 +1010,23 @@ impl<'a> Interpreter<'a> {
         Ok(Duration::from_millis(millis))
     }
 
-    fn duration_of(&self, value: &Value, node: &Node, input: &Value) -> Result<u64, Fault> {
+    fn duration_of(
+        &self,
+        value: &Value,
+        position: &str,
+        node: Option<&Node>,
+        input: &Value,
+    ) -> Result<u64, Fault> {
         let literal = if let Value::String(text) = value {
             if let Some(source) = runtime_expression(text) {
-                let vars = self.scope(Some(node), input, None);
+                let vars = self.scope(node, input, None);
                 match evaluate(source, input, &vars)
-                    .map_err(|message| Fault::expression(node.position(), message))?
+                    .map_err(|message| Fault::expression(position, message))?
                 {
                     Value::String(iso) => Value::String(iso),
                     _ => {
                         return Err(Fault::expression(
-                            node.position(),
+                            position,
                             "duration expression must be an ISO 8601 string",
                         ));
                     }
@@ -987,7 +1037,117 @@ impl<'a> Interpreter<'a> {
         } else {
             value.clone()
         };
-        duration_millis(&literal).map_err(|message| Fault::runtime(node.position(), message))
+        duration_millis(&literal).map_err(|message| Fault::runtime(position, message))
+    }
+
+    fn workflow_timeout(&self, input: &Value) -> Result<Option<Fault>, Fault> {
+        let Some(after) = self.timeout_after(self.document.get("timeout"), "/", None, input)?
+        else {
+            return Ok(None);
+        };
+        let Some(now) = self.now else {
+            return Ok(None);
+        };
+        let Some(started) = self.log.workflow_started() else {
+            return Ok(None);
+        };
+        if now >= started.saturating_add(after) {
+            Ok(Some(Fault::timeout(
+                "/",
+                format!("timed out after {}ms", after.as_millis()),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn task_timeout(&self, node: &Node, input: &Value) -> Result<Option<Duration>, Fault> {
+        self.timeout_after(
+            node.body().get("timeout"),
+            node.position(),
+            Some(node),
+            input,
+        )
+    }
+
+    fn timeout_after(
+        &self,
+        timeout: Option<&Value>,
+        position: &str,
+        node: Option<&Node>,
+        input: &Value,
+    ) -> Result<Option<Duration>, Fault> {
+        let Some(timeout) = timeout else {
+            return Ok(None);
+        };
+        let policy = match timeout {
+            Value::String(name) => {
+                let found = self
+                    .document
+                    .get("use")
+                    .and_then(|value| value.get("timeouts"))
+                    .and_then(|value| value.as_object())
+                    .and_then(|timeouts| timeouts.get(name));
+                let Some(found) = found else {
+                    return Err(Fault::runtime(
+                        position,
+                        format!("unknown timeout `{name}`"),
+                    ));
+                };
+                if !found.is_object() {
+                    return Err(Fault::runtime(
+                        position,
+                        format!("timeout `{name}` must be an object"),
+                    ));
+                }
+                found
+            }
+            Value::Object(_) => timeout,
+            _ => {
+                return Err(Fault::runtime(
+                    position,
+                    "timeout must be a policy or a name",
+                ));
+            }
+        };
+        if let Some(key) = policy.as_object().and_then(|object| {
+            object
+                .keys()
+                .find(|key| key.as_str() != "after")
+                .map(String::as_str)
+        }) {
+            return Err(Fault::runtime(
+                position,
+                format!("unknown timeout field `{key}`"),
+            ));
+        }
+        let Some(after) = policy.get("after") else {
+            return Err(Fault::runtime(position, "timeout.after is required"));
+        };
+        let millis = self.duration_of(after, position, node, input)?;
+        Ok(Some(Duration::from_millis(millis)))
+    }
+
+    fn pause(&self, node: &Node, input: Value, pause: Pause) -> Result<TaskFlow, Fault> {
+        let block = self.block(node, input, pause)?;
+        if let Some(fault) = self.timeout_fault(&block) {
+            return Err(fault);
+        }
+        Ok(TaskFlow::Blocked(block))
+    }
+
+    fn timeout_fault(&self, block: &Block) -> Option<Fault> {
+        let after = block.timeout()?;
+        let now = self.now?;
+        let started = self.log.task_started(block.key())?;
+        if now >= started.saturating_add(after) {
+            Some(Fault::timeout(
+                block.position(),
+                format!("timed out after {}ms", after.as_millis()),
+            ))
+        } else {
+            None
+        }
     }
 
     fn scope(

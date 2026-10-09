@@ -3,10 +3,18 @@ use std::fmt;
 use serde_json::Map;
 use serde_json::Value;
 
+const AUTHENTICATION: &str =
+    "https://open-workflow-specification.org/spec/1.0.0/errors/authentication";
+const AUTHORIZATION: &str =
+    "https://open-workflow-specification.org/spec/1.0.0/errors/authorization";
 const COMMUNICATION: &str =
     "https://open-workflow-specification.org/spec/1.0.0/errors/communication";
+const CONFIGURATION: &str =
+    "https://open-workflow-specification.org/spec/1.0.0/errors/configuration";
 const EXPRESSION: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/expression";
 const RUNTIME: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/runtime";
+const TIMEOUT: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/timeout";
+const VALIDATION: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/validation";
 
 /// RFC 7807 problem details produced by the walk.
 ///
@@ -36,6 +44,69 @@ impl Fault {
     /// Runtime failure at `instance`.
     pub fn runtime(instance: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::new(RUNTIME, 500, instance, "runtime error", Some(detail.into()))
+    }
+
+    /// Configuration failure at `instance`. Status is 400.
+    pub fn configuration(instance: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(
+            CONFIGURATION,
+            400,
+            instance,
+            "configuration error",
+            Some(detail.into()),
+        )
+    }
+
+    /// Validation failure at `instance`. Status is 400.
+    pub fn validation(instance: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(
+            VALIDATION,
+            400,
+            instance,
+            "validation error",
+            Some(detail.into()),
+        )
+    }
+
+    /// Authentication failure at `instance`. Status is 401.
+    pub fn authentication(instance: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(
+            AUTHENTICATION,
+            401,
+            instance,
+            "authentication error",
+            Some(detail.into()),
+        )
+    }
+
+    /// Authorization failure at `instance`. Status is 403.
+    pub fn authorization(instance: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(
+            AUTHORIZATION,
+            403,
+            instance,
+            "authorization error",
+            Some(detail.into()),
+        )
+    }
+
+    /// Timeout at `instance`. Status is 408.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tideloom_core::Fault;
+    ///
+    /// let fault = Fault::timeout("/do/0/charge", "timed out after 30000ms");
+    /// assert_eq!(
+    ///     fault.error_type(),
+    ///     "https://open-workflow-specification.org/spec/1.0.0/errors/timeout"
+    /// );
+    /// assert_eq!(fault.status(), 408);
+    /// assert_eq!(fault.instance(), "/do/0/charge");
+    /// ```
+    pub fn timeout(instance: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(TIMEOUT, 408, instance, "timeout error", Some(detail.into()))
     }
 
     /// HTTP or network failure at `instance`.
