@@ -78,7 +78,7 @@ A missing `delay` is 0, and the walk still pauses so the attempt key can advance
 
 `jitter.from` and `jitter.to` are added after the backoff. `walk` uses `from`, so the delay does not change between walks. `walk_with` and `WalkOptions::with_jitter` pick another point: `JitterSample::FROM` is `from`, `JitterSample::TO` is `to`, and `JitterSample::new(parts_per_million)` is a point in between. Pass the same sample every time that pause is recomputed.
 
-`limit.attempt.count` is unchanged. `limit.attempt.duration` and `limit.duration` are not enforced. `drive` returns the retry pause instead of waiting.
+`limit.attempt.count` is unchanged. `limit.attempt.duration` is how long one attempt's paused task may run, from `start_task` on that task. `limit.duration` is how long retries may continue, from `start_task` on the first retry pause. Both use `WalkOptions::with_now` and fault or stop with the same clock as timeouts; neither sleeps. Without `now`, or before the start is recorded, they are not enforced. `drive` returns the retry pause instead of waiting.
 
 ## Timeouts
 
