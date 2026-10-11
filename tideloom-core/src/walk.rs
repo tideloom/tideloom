@@ -54,7 +54,11 @@ pub enum Pause {
     Timer,
     /// `listen`. The `foreach` body is not walked in this slice.
     Events,
-    /// `fork`. Branches are not walked; they belong to other instances.
+    /// `fork`, for a runner that keeps each branch as its own instance.
+    ///
+    /// This walk does not return [`Pause::Join`]. It runs branches in
+    /// declaration order and stops on a branch's own block. `compete` is the
+    /// DSL flag.
     Join {
         /// `fork.compete`.
         compete: bool,
@@ -483,9 +487,8 @@ impl<'a> Interpreter<'a> {
             NodeKind::Do => self.exec_do(node, &input),
             NodeKind::For => self.exec_for(node, &input),
             NodeKind::Try { .. } => self.exec_try(node, &input),
-            NodeKind::Fork { .. } | NodeKind::Wait | NodeKind::Listen => {
-                self.exec_pause(node, &input)
-            }
+            NodeKind::Fork { .. } => self.exec_fork(node, &input),
+            NodeKind::Wait | NodeKind::Listen => self.exec_pause(node, &input),
             NodeKind::Call(CallKind::Function(_)) => self.exec_function(node, &input),
             NodeKind::Call(_) | NodeKind::Emit | NodeKind::Run(_) => {
                 self.exec_effectful(node, &input)
@@ -734,6 +737,75 @@ impl<'a> Interpreter<'a> {
         self.pause(node, input.clone(), pause)
     }
 
+    /// Run fork branches in declaration order.
+    ///
+    /// This is not a race and not a set of child instances. `compete: false`
+    /// collects an array of branch outputs. `compete: true` keeps the first
+    /// branch that finishes and does not run the ones after it; the fork
+    /// faults only when every branch faults, and then with the first fault.
+    /// A branch that blocks is returned as that branch's block. Later branches
+    /// wait for a later walk. `then: end` on a branch completes the workflow.
+    /// `then: exit` only finishes that branch. A named `then` is a fault.
+    /// [`ResultLog::release`] on the fork key supplies the join value and
+    /// skips the branches.
+    fn exec_fork(&mut self, node: &Node, input: &Value) -> Result<TaskFlow, Fault> {
+        let key = self.task_key(node);
+        if let Some(output) = self.log.released(&key) {
+            return self.done(node, output.clone(), input, directive_of(node.then()));
+        }
+        let compete = matches!(node.kind(), NodeKind::Fork { compete: true });
+        let mut outputs = Vec::new();
+        let mut first_fault = None;
+        for branch in node.children() {
+            let flow = match self.exec_task(branch, input.clone()) {
+                Ok(flow) => flow,
+                Err(fault) => {
+                    if compete {
+                        if first_fault.is_none() {
+                            first_fault = Some(fault);
+                        }
+                        continue;
+                    }
+                    return Err(fault);
+                }
+            };
+            match flow {
+                TaskFlow::Blocked(block) => return Ok(TaskFlow::Blocked(block)),
+                TaskFlow::Done { output, directive } => match directive {
+                    Directive::Jump(name) => {
+                        return Err(Fault::runtime(
+                            branch.position(),
+                            format!("fork branch cannot target `{name}`"),
+                        ));
+                    }
+                    Directive::End => {
+                        if compete {
+                            return self.done(node, output, input, Directive::End);
+                        }
+                        outputs.push(output);
+                        return self.done(node, Value::Array(outputs), input, Directive::End);
+                    }
+                    Directive::Continue | Directive::Exit => {
+                        if compete {
+                            return self.done(node, output, input, directive_of(node.then()));
+                        }
+                        outputs.push(output);
+                    }
+                },
+            }
+        }
+        if compete {
+            return Err(first_fault
+                .unwrap_or_else(|| Fault::runtime(node.position(), "fork has no branches")));
+        }
+        self.done(
+            node,
+            Value::Array(outputs),
+            input,
+            directive_of(node.then()),
+        )
+    }
+
     fn exec_pause(&mut self, node: &Node, input: &Value) -> Result<TaskFlow, Fault> {
         let key = self.task_key(node);
         if let Some(output) = self.log.released(&key) {
@@ -742,7 +814,6 @@ impl<'a> Interpreter<'a> {
         let pause = match node.kind() {
             NodeKind::Wait => Pause::Timer,
             NodeKind::Listen => Pause::Events,
-            NodeKind::Fork { compete } => Pause::Join { compete: *compete },
             _ => Pause::Activity,
         };
         self.pause(node, input.clone(), pause)

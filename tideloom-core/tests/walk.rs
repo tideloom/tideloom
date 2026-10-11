@@ -476,7 +476,413 @@ use:
 }
 
 #[test]
-fn fork_stops_for_the_join_and_does_not_run_branches() {
+fn fork_joins_branch_outputs_in_declaration_order() {
+    let definition = sample(
+        r#"
+  - prep:
+      set:
+        ready: true
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+          - note:
+              set:
+                lane: note
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(
+        output,
+        json!([
+            {"ready": true, "lane": "ship"},
+            {"ready": true, "lane": "note"}
+        ])
+    );
+}
+
+#[test]
+fn fork_branches_receive_the_transformed_task_input() {
+    let definition = sample(
+        r#"
+  - rush:
+      input:
+        from: .order
+      fork:
+        branches:
+          - show:
+              set:
+                seen: ${ .id }
+"#,
+    );
+    let (output, _) = completed(walk(
+        &definition,
+        &json!({"order": {"id": 7}, "extra": true}),
+        &ResultLog::new(),
+    ));
+    assert_eq!(output, json!([{"id": 7, "seen": 7}]));
+}
+
+#[test]
+fn fork_output_as_reads_the_joined_array() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+          - note:
+              set:
+                lane: note
+      output:
+        as: .[0].lane
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!("ship"));
+}
+
+#[test]
+fn compete_keeps_the_first_success_and_skips_the_rest() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        compete: true
+        branches:
+          - ship:
+              set:
+                lane: ship
+              export:
+                as: '{ lane: .lane }'
+          - boom:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: skipped
+  - later:
+      set:
+        seen: ${ $context.lane }
+"#,
+    );
+    let (output, context) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!({"lane": "ship", "seen": "ship"}));
+    assert_eq!(context, json!({"lane": "ship"}));
+}
+
+#[test]
+fn compete_uses_the_next_branch_after_a_fault() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        compete: true
+        branches:
+          - boom:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: first
+          - note:
+              set:
+                lane: note
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!({"lane": "note"}));
+}
+
+#[test]
+fn compete_faults_with_the_first_error_when_every_branch_fails() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        compete: true
+        branches:
+          - first:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: first
+          - second:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 400
+                  title: second
+"#,
+    );
+    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(fault.instance(), "/do/0/rush/fork/branches/0/first");
+    assert_eq!(fault.title(), "first");
+    assert_eq!(fault.status(), 500);
+}
+
+#[test]
+fn a_cooperative_branch_fault_does_not_run_later_branches() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - boom:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: boom
+          - notify:
+              emit: {}
+"#,
+    );
+    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(fault.instance(), "/do/0/rush/fork/branches/0/boom");
+    assert_eq!(fault.title(), "boom");
+}
+
+#[test]
+fn an_outer_try_catches_a_fork_after_it_fails() {
+    let definition = sample(
+        r#"
+  - wrap:
+      try:
+        - rush:
+            fork:
+              branches:
+                - boom:
+                    raise:
+                      error:
+                        type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                        status: 500
+                        title: boom
+      catch:
+        do:
+          - recover:
+              set:
+                ok: true
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!({"ok": true}));
+}
+
+#[test]
+fn a_try_inside_a_branch_handles_that_branch_locally() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - wrap:
+              try:
+                - boom:
+                    raise:
+                      error:
+                        type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                        status: 500
+                        title: boom
+              catch:
+                do:
+                  - recover:
+                      set:
+                        ok: true
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!([{"ok": true}]));
+}
+
+#[test]
+fn a_blocking_branch_is_that_branchs_pause() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+          - notify:
+              emit: {}
+          - note:
+              set:
+                lane: note
+"#,
+    );
+    let mut log = ResultLog::new();
+    let block = blocked(walk(&definition, &json!({}), &log));
+    assert_eq!(block.position(), "/do/0/rush/fork/branches/1/notify");
+    assert_eq!(block.pause(), Pause::Activity);
+    assert_eq!(block.input(), &json!({}));
+    log.record_output(block.key().clone(), json!({"sent": true}));
+    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    assert_eq!(
+        output,
+        json!([
+            {"lane": "ship"},
+            {"sent": true},
+            {"lane": "note"}
+        ])
+    );
+}
+
+#[test]
+fn compete_does_not_run_branches_after_a_resumed_winner() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        compete: true
+        branches:
+          - notify:
+              emit: {}
+          - boom:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: skipped
+"#,
+    );
+    let mut log = ResultLog::new();
+    let block = blocked(walk(&definition, &json!({}), &log));
+    assert_eq!(block.position(), "/do/0/rush/fork/branches/0/notify");
+    log.record_output(block.key().clone(), json!({"sent": true}));
+    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    assert_eq!(output, json!({"sent": true}));
+}
+
+#[test]
+fn then_end_on_a_branch_completes_the_workflow() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+              then: end
+          - note:
+              set:
+                lane: note
+  - after:
+      set:
+        joined: true
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!([{"lane": "ship"}]));
+}
+
+#[test]
+fn then_exit_on_a_branch_only_finishes_that_branch() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+              then: exit
+          - note:
+              set:
+                lane: note
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!([{"lane": "ship"}, {"lane": "note"}]));
+}
+
+#[test]
+fn a_wait_inside_a_branch_is_that_waits_timer() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - pause:
+              wait: {}
+          - note:
+              set:
+                lane: note
+"#,
+    );
+    let mut log = ResultLog::new();
+    let block = blocked(walk(&definition, &json!({}), &log));
+    assert_eq!(block.position(), "/do/0/rush/fork/branches/0/pause");
+    assert_eq!(block.pause(), Pause::Timer);
+    log.release(block.key().clone(), json!({"held": true}));
+    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    assert_eq!(output, json!([{"held": true}, {"lane": "note"}]));
+}
+
+#[test]
+fn a_named_then_on_a_branch_is_a_runtime_fault() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+              then: note
+          - note:
+              set:
+                lane: note
+"#,
+    );
+    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(fault.instance(), "/do/0/rush/fork/branches/0/ship");
+    assert!(
+        fault.detail().unwrap_or("").contains("cannot target"),
+        "{fault}"
+    );
+}
+
+#[test]
+fn an_empty_fork_joins_as_an_empty_array() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        branches: []
+"#,
+    );
+    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(output, json!([]));
+}
+
+#[test]
+fn an_empty_compete_fork_is_a_runtime_fault() {
+    let definition = sample(
+        r#"
+  - rush:
+      fork:
+        compete: true
+        branches: []
+"#,
+    );
+    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    assert_eq!(fault.instance(), "/do/0/rush");
+    assert!(
+        fault.detail().unwrap_or("").contains("no branches"),
+        "{fault}"
+    );
+}
+
+#[test]
+fn a_released_fork_uses_the_join_value_and_skips_branches() {
     let definition = sample(
         r#"
   - prep:
@@ -486,21 +892,21 @@ fn fork_stops_for_the_join_and_does_not_run_branches() {
       fork:
         compete: true
         branches:
-          - ship:
-              set:
-                lane: ship
+          - boom:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: skipped
   - after:
       set:
         joined: true
 "#,
     );
     let mut log = ResultLog::new();
-    let block = blocked(walk(&definition, &json!({}), &log));
-    assert_eq!(block.position(), "/do/1/rush");
-    assert!(!block.effectful());
-    assert_eq!(block.pause(), Pause::Join { compete: true });
-    assert_eq!(block.input(), &json!({"ready": true}));
-    log.release(block.key().clone(), json!({"winner": "ship"}));
+    let fork = definition.get("/do/1/rush").unwrap();
+    let key = tideloom_core::TaskKey::new(fork.position(), tideloom_core::ExecutionKey::empty());
+    log.release(key, json!({"winner": "ship"}));
     let (output, _) = completed(walk(&definition, &json!({}), &log));
     assert_eq!(output, json!({"winner": "ship", "joined": true}));
 }

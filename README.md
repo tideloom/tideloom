@@ -52,9 +52,9 @@ let _boundary = task.is_block_boundary();
 
 - `set`, `do`, `switch`, `for`, `raise`, `try` (until a retry backoff), and `call` of a `use.functions` entry run inline.
 - The walk stops at the next block boundary and returns a `Block`: position, execution key, pause reason, transformed input, `$context`, and whether the block is effectful.
-- Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`). A retry pause includes the computed wait. See [Retry backoff](#retry-backoff).
+- Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Retry` (`try` backoff), and `Child` (`run workflow`). A retry pause includes the computed wait. See [Retry backoff](#retry-backoff). `Pause::Join` remains for a runner that keeps fork branches as other instances; this walk does not return it.
 - An effectful output or fault is stored with `ResultLog::record_output` / `record_fault`, keyed by position plus the ancestor `for` indexes and `try` attempts (`loop:0/attempt:1`). A later walk skips that task and continues with the logged value. Only those entries are `task_execution` results.
-- `wait`, `listen`, `fork`, and a retry backoff are not effectful. `ResultLog::release` marks them finished so the next walk can pass them. `fork` branches and `listen.foreach` are not walked.
+- `wait`, `listen`, and a retry backoff are not effectful. `ResultLog::release` marks them finished so the next walk can pass them. A `fork` runs its branches; `release` on the fork key supplies the join value and skips them. `listen.foreach` is not walked. See [Fork](#fork).
 
 Expressions are a closed subset used by `if`, `switch.when`, `for.in`, `while`, `input.from`, `output.as`, `export.as`, and `${ ... }` inside `set`: paths, literals, comparisons, arithmetic, `and` / `or` / `not`, arrays, objects, and `|`. Full jq is not implemented.
 
@@ -89,6 +89,21 @@ Record the start with `ResultLog::start_workflow` or `ResultLog::start_task` (th
 `Block::timeout` is the task duration. `Block::timeout_at(started_at)` is the deadline. `walk` without `now` still returns the block and does not enforce the deadline. `drive_with` uses the same clock and faults before it sends an HTTP call that has already timed out.
 
 `Fault::configuration`, `validation`, `authentication`, `authorization`, and `timeout` are the standard error types from the DSL, alongside the existing expression, communication, and runtime faults.
+
+## Fork
+
+A `fork` runs each branch in declaration order, in this process. It does not spawn instances, and it does not race them. Every branch receives the fork task's transformed input. One branch cannot see another's output.
+
+| `fork.compete` | Result |
+| --- | --- |
+| `false` (default) | A JSON array of branch outputs, in declaration order. The first branch fault fails the fork with that fault. Later branches do not run. |
+| `true` | The output of the first branch that finishes. Later branches do not run. A branch fault is kept, and the fork moves to the next branch. The fork faults only when every branch faults, and then with the first fault. |
+
+A branch that reaches `emit`, `call`, `wait`, `listen`, or `run` stops the walk on that branch's block. The next walk replays finished branches and continues. `drive` performs an HTTP call inside a branch the same way it performs one at the top level.
+
+`then: end` on a branch completes the workflow and does not run later branches. `then: exit` only finishes that branch. A named `then` is a runtime fault. `ResultLog::release` on the fork's own key supplies the join value and does not run the branches.
+
+An empty branch list joins as `[]`. With `compete: true` it is a runtime fault.
 
 ## HTTP call
 

@@ -153,8 +153,9 @@ impl ResultLog {
     /// Record that a blocking, non-effectful pause has finished.
     ///
     /// `output` is the value the walk continues with. A `wait` usually passes
-    /// its input through. A `fork` passes the join value supplied by the
-    /// runner. A retry backoff ignores the value; pass [`Value::Null`].
+    /// its input through. A released `fork` uses `output` as the join value
+    /// and does not run its branches. A retry backoff ignores the value; pass
+    /// [`Value::Null`].
     ///
     /// This is not a `task_execution` row. Effectful nodes, including
     /// `run workflow`, use [`ResultLog::record_output`] instead.

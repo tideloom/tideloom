@@ -457,6 +457,61 @@ fn an_object_template_value_does_not_connect() {
 }
 
 #[test]
+fn drive_runs_an_http_call_inside_a_fork_branch() {
+    let server = TestServer::start();
+    let tasks = format!(
+        r#"
+  - rush:
+      fork:
+        branches:
+          - ship:
+              set:
+                lane: ship
+          - fetch:
+              call: http
+              with:
+                method: get
+                endpoint: {base}/pets/milou
+"#,
+        base = server.base
+    );
+    let output = completed(&tasks, json!({}));
+    assert_eq!(server.hits(), 1);
+    assert_eq!(
+        output,
+        json!([
+            {"lane": "ship"},
+            {"id": "milou", "name": "milou", "status": "pending"}
+        ])
+    );
+}
+
+#[test]
+fn compete_does_not_call_branches_after_the_winner() {
+    let server = TestServer::start();
+    let tasks = format!(
+        r#"
+  - rush:
+      fork:
+        compete: true
+        branches:
+          - ship:
+              set:
+                lane: ship
+          - fetch:
+              call: http
+              with:
+                method: get
+                endpoint: {base}/pets/milou
+"#,
+        base = server.base
+    );
+    let output = completed(&tasks, json!({}));
+    assert_eq!(server.hits(), 0);
+    assert_eq!(output, json!({"lane": "ship"}));
+}
+
+#[test]
 fn drive_leaves_a_non_http_activity_blocked() {
     let (outcome, log) = run(
         r#"
