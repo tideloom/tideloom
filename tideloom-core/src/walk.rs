@@ -625,65 +625,26 @@ impl<'a> Interpreter<'a> {
             self.frames.push(Frame::Attempt(attempt));
             let sequence = self.exec_sequence(try_body, input.clone());
             self.frames.pop();
-            match sequence {
-                Ok(Flow::Blocked(block)) => return Ok(TaskFlow::Blocked(block)),
+            let fault = match sequence {
+                Ok(Flow::Blocked(block)) => match self.attempt_timed_out(node, input, &block)? {
+                    Some(after) => Fault::timeout(
+                        block.position(),
+                        format!("attempt timed out after {}ms", after.as_millis()),
+                    ),
+                    None => return Ok(TaskFlow::Blocked(block)),
+                },
                 Ok(Flow::Finished(raw) | Flow::Exited(raw)) => {
                     return self.done(node, raw, input, directive_of(node.then()));
                 }
                 Ok(Flow::Ended(raw)) => return self.done(node, raw, input, Directive::End),
-                Err(fault) => {
-                    let error_name = error_binding(node)?;
-                    let mut binding = BTreeMap::new();
-                    binding.insert(error_name, fault.to_value());
-                    self.bindings.push(binding);
-                    let matched = self.catch_matches(node, &fault, input);
-                    let matched = match matched {
-                        Ok(value) => value,
-                        Err(error) => {
-                            self.bindings.pop();
-                            return Err(error);
-                        }
-                    };
-                    if !matched {
-                        self.bindings.pop();
-                        return Err(fault);
-                    }
-                    let retry = match self.retry_wanted(node, input, attempt, max_retries) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            self.bindings.pop();
-                            return Err(error);
-                        }
-                    };
-                    if retry {
-                        let key = self.key_for_attempt(node, attempt);
-                        if self.log.released(&key).is_some() {
-                            self.bindings.pop();
-                            attempt += 1;
-                            continue;
-                        }
-                        let paused = self.retry_block(node, input, attempt);
-                        self.bindings.pop();
-                        return paused;
-                    }
-                    if catch_body.is_empty() {
-                        self.bindings.pop();
-                        return Err(fault);
-                    }
-                    self.frames.push(Frame::Attempt(attempt));
-                    let catch_sequence = self.exec_sequence(catch_body, input.clone());
-                    self.frames.pop();
-                    self.bindings.pop();
-                    let directive = catch_directive(node);
-                    return match catch_sequence? {
-                        Flow::Finished(raw) | Flow::Exited(raw) => {
-                            self.done(node, raw, input, directive)
-                        }
-                        Flow::Ended(raw) => self.done(node, raw, input, Directive::End),
-                        Flow::Blocked(block) => Ok(TaskFlow::Blocked(block)),
-                    };
-                }
+                Err(fault) => fault,
+            };
+            if let Some(flow) =
+                self.finish_attempt(node, input, attempt, max_retries, catch_body, fault)?
+            {
+                return Ok(flow);
             }
+            attempt += 1;
         }
     }
 
@@ -809,6 +770,72 @@ impl<'a> Interpreter<'a> {
         Fault::from_error(node.position(), error)
     }
 
+    fn finish_attempt(
+        &mut self,
+        node: &Node,
+        input: &Value,
+        attempt: u64,
+        max_retries: u64,
+        catch_body: &[Node],
+        fault: Fault,
+    ) -> Result<Option<TaskFlow>, Fault> {
+        let error_name = error_binding(node)?;
+        let mut binding = BTreeMap::new();
+        binding.insert(error_name, fault.to_value());
+        self.bindings.push(binding);
+        let matched = match self.catch_matches(node, &fault, input) {
+            Ok(value) => value,
+            Err(error) => {
+                self.bindings.pop();
+                return Err(error);
+            }
+        };
+        if !matched {
+            self.bindings.pop();
+            return Err(fault);
+        }
+        let retry = match self.retry_wanted(node, input, attempt, max_retries) {
+            Ok(value) => value,
+            Err(error) => {
+                self.bindings.pop();
+                return Err(error);
+            }
+        };
+        let window_open = match self.retry_window_open(node, input) {
+            Ok(value) => value,
+            Err(error) => {
+                self.bindings.pop();
+                return Err(error);
+            }
+        };
+        if retry && window_open {
+            let key = self.key_for_attempt(node, attempt);
+            if self.log.released(&key).is_some() {
+                self.bindings.pop();
+                return Ok(None);
+            }
+            let paused = self.retry_block(node, input, attempt);
+            self.bindings.pop();
+            return paused.map(Some);
+        }
+        if catch_body.is_empty() {
+            self.bindings.pop();
+            return Err(fault);
+        }
+        self.frames.push(Frame::Attempt(attempt));
+        let catch_sequence = self.exec_sequence(catch_body, input.clone());
+        self.frames.pop();
+        self.bindings.pop();
+        let directive = catch_directive(node);
+        match catch_sequence? {
+            Flow::Finished(raw) | Flow::Exited(raw) => {
+                self.done(node, raw, input, directive).map(Some)
+            }
+            Flow::Ended(raw) => self.done(node, raw, input, Directive::End).map(Some),
+            Flow::Blocked(block) => Ok(Some(TaskFlow::Blocked(block))),
+        }
+    }
+
     fn retry_limit(&self, node: &Node) -> Result<u64, Fault> {
         let Some(policy) = self.retry_policy(node)? else {
             return Ok(0);
@@ -928,6 +955,58 @@ impl<'a> Interpreter<'a> {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// `limit.attempt.duration` bounds one try of the body. The clock is
+    /// `start_task` on the paused task. No clock or no start means still running.
+    fn attempt_timed_out(
+        &self,
+        node: &Node,
+        input: &Value,
+        block: &Block,
+    ) -> Result<Option<Duration>, Fault> {
+        let Some(after) = self.retry_limit_duration(node, input, "/limit/attempt/duration")? else {
+            return Ok(None);
+        };
+        if self.deadline_reached(self.log.task_started(block.key()), after) {
+            Ok(Some(after))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `limit.duration` bounds how long retries may continue. The clock starts
+    /// at `start_task` on the first retry pause (attempt 0). Until that start
+    /// is recorded, the window stays open.
+    fn retry_window_open(&self, node: &Node, input: &Value) -> Result<bool, Fault> {
+        let Some(after) = self.retry_limit_duration(node, input, "/limit/duration")? else {
+            return Ok(true);
+        };
+        let started = self.log.task_started(&self.key_for_attempt(node, 0));
+        Ok(!self.deadline_reached(started, after))
+    }
+
+    fn retry_limit_duration(
+        &self,
+        node: &Node,
+        input: &Value,
+        pointer: &str,
+    ) -> Result<Option<Duration>, Fault> {
+        let Some(policy) = self.retry_policy(node)? else {
+            return Ok(None);
+        };
+        let Some(value) = policy.pointer(pointer) else {
+            return Ok(None);
+        };
+        let millis = self.duration_of(value, node.position(), Some(node), input)?;
+        Ok(Some(Duration::from_millis(millis)))
+    }
+
+    fn deadline_reached(&self, started: Option<Timestamp>, after: Duration) -> bool {
+        match (self.now, started) {
+            (Some(now), Some(started)) => now >= started.saturating_add(after),
+            _ => false,
+        }
     }
 
     fn optional_bool(
