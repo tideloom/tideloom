@@ -2,17 +2,20 @@ use std::time::Duration;
 use std::time::Instant;
 
 use serde_json::json;
+use tideloom_core::Continuation;
+use tideloom_core::Counter;
 use tideloom_core::Definition;
-use tideloom_core::Frame;
 use tideloom_core::JitterSample;
 use tideloom_core::Outcome;
 use tideloom_core::Pause;
-use tideloom_core::ResultLog;
+use tideloom_core::Resume;
 use tideloom_core::Timestamp;
 use tideloom_core::WalkOptions;
 use tideloom_core::drive;
-use tideloom_core::walk;
-use tideloom_core::walk_with;
+use tideloom_core::resume;
+use tideloom_core::resume_with;
+use tideloom_core::start;
+use tideloom_core::start_with;
 
 fn sample(tasks: &str) -> Definition {
     document("", tasks)
@@ -25,15 +28,22 @@ fn document(head: &str, tasks: &str) -> Definition {
     Definition::from_yaml(&yaml).unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn blocked(outcome: Outcome) -> tideloom_core::Block {
+fn blocked(outcome: Outcome) -> (tideloom_core::Block, Continuation) {
     match outcome {
-        Outcome::Blocked { block } => block,
+        Outcome::Blocked {
+            block,
+            continuation,
+        } => (block, continuation),
         other => panic!("expected a block, got {other:?}"),
     }
 }
 
 fn retry_pause(tasks: &str) -> tideloom_core::Block {
-    blocked(walk(&sample(tasks), &json!({}), &ResultLog::new()))
+    blocked(start(&sample(tasks), &json!({}))).0
+}
+
+fn down(position: &str) -> Resume {
+    Resume::Fault(tideloom_core::Fault::runtime(position, "down"))
 }
 
 fn assert_retry(block: &tideloom_core::Block, attempt: u64, delay: Duration) {
@@ -68,32 +78,34 @@ fn constant_backoff_waits_then_retries_the_next_attempt() {
               count: 1
 "#,
     );
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &log));
+    let (call, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(call.position(), "/do/0/charge/try/0/callPay");
-    assert_eq!(call.execution_key().frames(), &[Frame::Attempt(0)]);
-    log.record_fault(
-        call.key().clone(),
-        tideloom_core::Fault::runtime(call.position(), "down"),
-    );
+    assert_eq!(call.execution_key().counters(), &[Counter::Attempt(0)]);
 
-    let retry = blocked(walk(&definition, &json!({}), &log));
+    let (retry, continuation) = blocked(resume(&definition, continuation, down(call.position())));
     assert_eq!(retry.position(), "/do/0/charge");
     assert!(!retry.effectful());
     assert_retry(&retry, 0, Duration::from_secs(3));
     assert_eq!(retry.execution_key().to_string(), "attempt:0");
+    assert_eq!(continuation.pause(), retry.pause());
 
-    let again = blocked(walk(&definition, &json!({}), &log));
+    let (again, continuation) = blocked(resume(&definition, continuation, Resume::Tick));
     assert_eq!(again.key(), retry.key());
     assert_retry(&again, 0, Duration::from_secs(3));
 
-    log.release(retry.key().clone(), json!(null));
-    let retried = blocked(walk(&definition, &json!({}), &log));
+    let (retried, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Release(json!(null)),
+    ));
     assert_eq!(retried.position(), "/do/0/charge/try/0/callPay");
-    assert_eq!(retried.execution_key().frames(), &[Frame::Attempt(1)]);
-    log.record_output(retried.key().clone(), json!({"paid": true}));
+    assert_eq!(retried.execution_key().counters(), &[Counter::Attempt(1)]);
 
-    let Outcome::Completed { output, .. } = walk(&definition, &json!({}), &log) else {
+    let Outcome::Completed { output, .. } = resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"paid": true})),
+    ) else {
         panic!("expected completion");
     };
     assert_eq!(output, json!({"paid": true}));
@@ -126,14 +138,12 @@ fn linear_and_exponential_series_release_until_the_catch() {
                 ok: false
 "#,
     );
-    let mut log = ResultLog::new();
-    let first = blocked(walk(&linear, &json!({}), &log));
+    let (first, continuation) = blocked(start(&linear, &json!({})));
     assert_retry(&first, 0, Duration::from_secs(3));
-    log.release(first.key().clone(), json!(null));
-    let second = blocked(walk(&linear, &json!({}), &log));
+    let (second, continuation) =
+        blocked(resume(&linear, continuation, Resume::Release(json!(null))));
     assert_retry(&second, 1, Duration::from_secs(6));
-    log.release(second.key().clone(), json!(null));
-    let (output, _) = match walk(&linear, &json!({}), &log) {
+    let (output, _) = match resume(&linear, continuation, Resume::Release(json!(null))) {
         Outcome::Completed { output, context } => (output, context),
         other => panic!("expected the catch, got {other:?}"),
     };
@@ -159,18 +169,18 @@ fn linear_and_exponential_series_release_until_the_catch() {
               count: 3
 "#,
     );
-    let mut log = ResultLog::new();
+    let mut outcome = start(&exponential, &json!({}));
     let expected = [1_u64, 2, 4];
     for (attempt, seconds) in expected.into_iter().enumerate() {
-        let pause = blocked(walk(&exponential, &json!({}), &log));
+        let (pause, continuation) = blocked(outcome);
         assert_retry(
             &pause,
             u64::try_from(attempt).unwrap(),
             Duration::from_secs(seconds),
         );
-        log.release(pause.key().clone(), json!(null));
+        outcome = resume(&exponential, continuation, Resume::Release(json!(null)));
     }
-    let Outcome::Faulted { fault, .. } = walk(&exponential, &json!({}), &log) else {
+    let Outcome::Faulted { fault, .. } = outcome else {
         panic!("expected the raised fault after the last attempt");
     };
     assert_eq!(fault.instance(), "/do/0/charge/try/0/boom");
@@ -204,35 +214,43 @@ fn jitter_is_added_after_backoff_and_stays_on_the_chosen_sample() {
               count: 2
 "#,
     );
-    let log = ResultLog::new();
-    let from_end = blocked(walk(&definition, &json!({}), &log));
+    let (from_end, continuation) = blocked(start(&definition, &json!({})));
     assert_retry(&from_end, 0, Duration::from_millis(1_100));
 
-    let same = blocked(walk(&definition, &json!({}), &log));
+    // The delay was fixed when the pause was created. Another sample on a
+    // later tick does not move it.
+    let (same, _) = blocked(resume_with(
+        &definition,
+        continuation,
+        Resume::Tick,
+        WalkOptions::new().with_jitter(JitterSample::TO),
+    ));
     assert_eq!(same.pause(), from_end.pause());
 
-    let to_end = blocked(walk_with(
+    let (to_end, _) = blocked(start_with(
         &definition,
         &json!({}),
-        &log,
         WalkOptions::new().with_jitter(JitterSample::TO),
     ));
     assert_retry(&to_end, 0, Duration::from_millis(1_500));
 
     let mid = JitterSample::new(500_000).unwrap();
-    let middle = blocked(walk_with(
+    let (middle, _) = blocked(start_with(
         &definition,
         &json!({}),
-        &log,
         WalkOptions::new().with_jitter(mid),
     ));
     assert_retry(&middle, 0, Duration::from_millis(1_300));
 
-    let mut log = ResultLog::new();
     let options = WalkOptions::new().with_jitter(JitterSample::FROM);
-    let first = blocked(walk_with(&definition, &json!({}), &log, options));
-    log.release(first.key().clone(), json!(null));
-    let second = blocked(walk_with(&definition, &json!({}), &log, options));
+    let (first, continuation) = blocked(start_with(&definition, &json!({}), options));
+    assert_retry(&first, 0, Duration::from_millis(1_100));
+    let (second, _) = blocked(resume_with(
+        &definition,
+        continuation,
+        Resume::Release(json!(null)),
+        options,
+    ));
     assert_retry(&second, 1, Duration::from_millis(2_100));
 }
 
@@ -274,7 +292,7 @@ fn durations_accept_iso_objects_expressions_and_named_policies() {
     );
     assert_retry(&object, 0, Duration::from_millis(61_000));
 
-    let definition = sample(
+    let expressed = retry_pause(
         r#"
   - charge:
       try:
@@ -290,7 +308,6 @@ fn durations_accept_iso_objects_expressions_and_named_policies() {
           delay: ${ $error.detail }
 "#,
     );
-    let expressed = blocked(walk(&definition, &json!({}), &ResultLog::new()));
     assert_retry(&expressed, 0, Duration::from_secs(2));
 
     let named = document(
@@ -321,11 +338,9 @@ use:
         retry: patient
 "#,
     );
-    let mut log = ResultLog::new();
-    let first = blocked(walk(&named, &json!({}), &log));
+    let (first, continuation) = blocked(start(&named, &json!({})));
     assert_retry(&first, 0, Duration::from_millis(40));
-    log.release(first.key().clone(), json!(null));
-    let second = blocked(walk(&named, &json!({}), &log));
+    let (second, _) = blocked(resume(&named, continuation, Resume::Release(json!(null))));
     assert_retry(&second, 1, Duration::from_millis(50));
 }
 
@@ -349,7 +364,7 @@ fn a_bad_policy_faults_instead_of_pausing() {
               factor: 2
 "#,
     );
-    let Outcome::Faulted { fault, .. } = walk(&definition, &json!({}), &ResultLog::new()) else {
+    let Outcome::Faulted { fault, .. } = start(&definition, &json!({})) else {
         panic!("expected a fault");
     };
     assert_eq!(fault.instance(), "/do/0/charge");
@@ -372,7 +387,7 @@ fn a_bad_policy_faults_instead_of_pausing() {
             to: PT1S
 "#,
     );
-    let Outcome::Faulted { fault, .. } = walk(&backwards, &json!({}), &ResultLog::new()) else {
+    let Outcome::Faulted { fault, .. } = start(&backwards, &json!({})) else {
         panic!("expected a fault");
     };
     assert!(
@@ -406,39 +421,40 @@ fn a_for_loop_retries_under_that_iteration_attempt_key() {
 "#,
     );
     let input = json!({"items": [1, 2]});
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &input, &log));
+    let (call, continuation) = blocked(start(&definition, &input));
     assert_eq!(call.position(), "/do/0/each/do/0/charge/try/0/callPay");
     assert_eq!(
-        call.execution_key().frames(),
-        &[Frame::Loop(0), Frame::Attempt(0)]
-    );
-    log.record_fault(
-        call.key().clone(),
-        tideloom_core::Fault::runtime(call.position(), "down"),
+        call.execution_key().counters(),
+        &[Counter::Loop(0), Counter::Attempt(0)]
     );
 
-    let retry = blocked(walk(&definition, &input, &log));
+    let (retry, continuation) = blocked(resume(&definition, continuation, down(call.position())));
     assert_eq!(retry.position(), "/do/0/each/do/0/charge");
     assert_retry(&retry, 0, Duration::from_secs(2));
     assert_eq!(
-        retry.execution_key().frames(),
-        &[Frame::Loop(0), Frame::Attempt(0)]
+        retry.execution_key().counters(),
+        &[Counter::Loop(0), Counter::Attempt(0)]
     );
-    log.release(retry.key().clone(), json!(null));
 
-    let retried = blocked(walk(&definition, &input, &log));
+    let (retried, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Release(json!(null)),
+    ));
     assert_eq!(retried.position(), call.position());
     assert_eq!(
-        retried.execution_key().frames(),
-        &[Frame::Loop(0), Frame::Attempt(1)]
+        retried.execution_key().counters(),
+        &[Counter::Loop(0), Counter::Attempt(1)]
     );
-    log.record_output(retried.key().clone(), json!({"paid": true}));
 
-    let next = blocked(walk(&definition, &input, &log));
+    let (next, _) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"paid": true})),
+    ));
     assert_eq!(
-        next.execution_key().frames(),
-        &[Frame::Loop(1), Frame::Attempt(0)]
+        next.execution_key().counters(),
+        &[Counter::Loop(1), Counter::Attempt(0)]
     );
 }
 
@@ -463,7 +479,7 @@ fn drive_returns_the_retry_pause_without_sleeping() {
 "#,
     );
     let started = Instant::now();
-    let pause = blocked(drive(&definition, &json!({}), &mut ResultLog::new()));
+    let (pause, _) = blocked(drive(&definition, &json!({})));
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_retry(&pause, 0, Duration::from_secs(30));
 }

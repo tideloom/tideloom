@@ -2,9 +2,13 @@
 
 ## Status
 
-Proposed
+Accepted
 
 日期：2026-09-28
+
+修订：2026-10-12。实现曾以 `ResultLog` 从根重放来恢复（见备选 B），本次回到第 3 节的显式续体，并补上 `then` 跳转的 `pass` 计数。
+
+修订：2026-10-12（M2 MR-0）。第 9 节的三个 trait 落在独立 crate `tideloom-runtime`，`tideloom-core` 不依赖它们；续体带 `schema` 版本号；Open Question 1 定案为"标记未知，不自动重做"。里程碑拆分见 `docs/milestone-m2-single-process-runtime.md`。
 
 ## Context
 
@@ -55,13 +59,26 @@ Block 定义为一次运行中，从一个恢复点开始、到下一个不可�
 
 ### 3. 状态层：显式续体 + 每个 Block 一次 checkpoint
 
-执行状态是一个显式的、可序列化的续体：当前位置、各层祖先节点的状态、`$context`。不采用 replay 式恢复，因为 replay 是宿主语言调用栈不可序列化时才需要付的代价，DSL 解释器的栈天生是数据。
+执行状态是一个显式的、可序列化的续体 `Continuation`：`$context`、每个外围控制流任务一帧、以及停下来的那个 Block。它是一个值，带 `schema` 版本号，序列化后存进 `workflow_instance`，恢复时原样交回解释器，从停下的位置继续。改变帧结构的变更必须同时提供从上一版本读取的路径，或说明为什么可以拒绝旧版本。不采用 replay 式恢复：replay 是宿主语言调用栈不可序列化时才需要付的代价，DSL 解释器的栈天生是数据，直接快照即可，也不必承担"inline 任务必须确定性"的约束。
+
+帧是封闭枚举，每种 composite 节点一个变体，只记"这一层接下来该干什么"：
+
+| 帧 | 持有 | 贡献的 `execution_key` 计数 |
+|---|---|---|
+| `Seq` | 所属任务、正在执行的子任务下标、`then` 跳转次数 `pass` | `pass:n`（n > 0 时） |
+| `For` | 集合、当前下标、`each` / `at` 变量名 | `loop:n` |
+| `Try` | attempt、阶段（body / backoff / catch）、正在处理的错误、重试窗口起点 | `attempt:n` |
+| `Function` | 调用点 | 无 |
+
+叶子任务不入栈：停下来的叶子就是 Block。`execution_key` 由帧序列投影得到，不单独存储，也没有"返回次数"这类无语义的计数器。`pass` 是唯一需要为跳转引入的计数，它保证 `then` 回跳再次经过同一个 effectful 任务时产生新的 key。
+
+恢复的入口是 `resume(definition, continuation, event)`，`event` 是封闭枚举：`Output` / `Fault`（effectful 任务的结果）、`Release`（`wait`、`listen`、`fork` join、重试 backoff 结束）、`Tick`（什么都没发生，只是时钟前进，重新检查工作流超时、任务超时、`limit.attempt.duration`、`limit.duration`）。时钟由调用方注入，解释器从不 sleep；续体记录工作流起点和当前 Block 的首次观察时刻，重试窗口的起点在 attempt 0 的 backoff 被 release 时复制到 `Try` 帧上。
 
 存储接口按引擎需要的保证定义，而不是按仓库模式定义。引擎只依赖四个原语：租约领取、带版本 CAS 的原子提交、按主键读、按条件扫描。原子提交建模为值对象 `Commit`，各后端自行决定如何实现原子性，事务句柄不出现在接口中。trait 定义见第 9 节。
 
-两张核心表：`workflow_instance` 保存续体、状态、版本、租约、`wake_at`；`task_execution` 保存每次 activity 的位置、`execution_key`、attempt、输入输出、起止时间。后者是耗时统计的一等来源，不依赖额外的分析管道。
+两张核心表：`workflow_instance` 保存续体、状态、版本、租约、`wake_at`；`task_execution` 保存每次 activity 的位置、`execution_key`、attempt、输入输出、起止时间。后者是 Journal：只写不读，是耗时统计和排障的一等来源，不参与恢复。
 
-checkpoint 粒度是 Block 而非 task：写次数等于 activity 数，不等于任务数。
+checkpoint 粒度是 Block 而非 task：写次数等于 Block 数，不等于任务数。
 
 ### 4. 消息总线：可重放日志，只作唤醒与信号，不承载状态
 
@@ -79,7 +96,7 @@ checkpoint 粒度是 Block 而非 task：写次数等于 activity 数，不等�
 
 | 等待类型 | 重算来源 | 代价 |
 |---|---|---|
-| Timer / Retry | 续体中的 `startedAt` 与 duration、attempt | 无 |
+| Timer / Retry | 续体中的任务起点、已算好的 backoff delay 与 attempt | 无 |
 | 子实例 / fork 分支完成 | 子实例行的终态与输出 | 无，前提是子实例是独立行 |
 | 外部事件 | 事件日志，且消费位点在实例 `Apply` 之后才推进 | 总线必须可重放 |
 | 进行中的 activity | 无，副作用在外部 | 不可重算，按任务声明幂等重做或标记未知 |
@@ -111,6 +128,8 @@ HTTP、gRPC、shell、container 等执行能力的差异不体现在 Block 上�
 
 实现语言为 Rust。引擎与外部世界的边界恰好是三个 trait：`InstanceStore`、`Wakeup`、`ActivityExecutor`，另加 `Clock` 用于测试。以下定义为规范性定义，后续实现以此为准。
 
+这三个 trait、`Commit` 与 `Engine` 放在独立 crate `tideloom-runtime`。`tideloom-core` 只含定义、续体与解释器，是纯函数，不依赖 tokio，不做 I/O，不读时钟；核心需要新能力时只扩展 `Pause` / `Block` / `Resume` / `Outcome` 四个类型。
+
 ```rust
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,7 +141,7 @@ use futures::stream::BoxStream;
 pub struct Commit {
     pub instance_id: InstanceId,
     pub expected_version: u64,
-    pub new_stack: Vec<u8>,
+    pub continuation: Vec<u8>,
     pub new_status: Status,
     pub wake_at: Option<Timestamp>,
     pub step_results: Vec<StepResult>,   // task_execution rows to upsert
@@ -230,6 +249,8 @@ pub struct Engine {
 
 拒绝。这些系统 replay 的原因是宿主语言调用栈不可序列化，需要重放重建；同时要求工作流代码确定性，并把版本兼容问题推给 patch API 或不可变部署。DSL 解释器的状态天然可序列化，直接快照即可，无需承担确定性约束。保留其"副作用前写 checkpoint、副作用后同事务写结果"的核心纪律。
 
+实现曾短暂采用这条路线：恢复状态是按 `(position, execution_key)` 索引的结果日志，每次从根重走，inline 任务重跑。它暴露了三个问题：位置必须重走一遍才知道，运维与取消都要先 walk；jitter 样本、`for.in` 结果等必须每次一致，确定性税开始出现；`execution_key` 漏掉 `then` 回跳的计数时，轮询模式会在同一个 key 上命中旧结果而死循环。已回退到显式续体。
+
 ### C. 消息承载续体，DB 只在暂停点介入（Lemline 模式）
 
 拒绝。emit 先于 ack 使交付语义为 at-least-once，确定性消息 ID 只在 broker 支持按 ID 去重时有效，Kafka 不支持，热路径无去重表，崩溃窗口内同一续体会被并行执行两次；无实例表导致列表、定位、取消都需要额外管道；续体随每条消息流转，`$context` 增大直接撞消息体上限；为适配不同状态载体维护两套 orchestrator。其换取的热路径零写与高吞吐，不是当前场景的主要痛点。
@@ -248,7 +269,7 @@ pub struct Engine {
 
 ## Open Questions
 
-1. 进行中的 activity 在 worker 崩溃后的默认策略：自动幂等重做，还是标记未知等待人工介入。这决定 `task_execution` 的状态机。
+1. ~~进行中的 activity 在 worker 崩溃后的默认策略：自动幂等重做，还是标记未知等待人工介入。这决定 `task_execution` 的状态机。~~ 已定案（M2 MR-0）：activity 执行前先提交一条 `pending` 的 `task_execution`，执行后再提交结果。崩溃后再次领取时若最近一条仍是 `pending`，执行器声明幂等则重做，否则实例置为 `Faulted`，detail 为 `activity outcome unknown`，等待人工介入。
 2. `$context` 的体积上限，以及超限后拒绝还是外置到对象存储。
 3. 内存等待阈值的初值与是否按暂停类型区分。
 

@@ -1,15 +1,16 @@
 use std::time::Duration;
 
 use serde_json::json;
+use tideloom_core::Continuation;
+use tideloom_core::Counter;
 use tideloom_core::Definition;
-use tideloom_core::Frame;
 use tideloom_core::NodeKind;
 use tideloom_core::Outcome;
 use tideloom_core::Pause;
-use tideloom_core::ResultLog;
+use tideloom_core::Resume;
 use tideloom_core::RunKind;
-use tideloom_core::TaskResult;
-use tideloom_core::walk;
+use tideloom_core::resume;
+use tideloom_core::start;
 
 fn sample(tasks: &str) -> Definition {
     document("", tasks)
@@ -22,9 +23,12 @@ fn document(head: &str, tasks: &str) -> Definition {
     Definition::from_yaml(&yaml).unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn blocked(outcome: Outcome) -> tideloom_core::Block {
+fn blocked(outcome: Outcome) -> (tideloom_core::Block, Continuation) {
     match outcome {
-        Outcome::Blocked { block } => block,
+        Outcome::Blocked {
+            block,
+            continuation,
+        } => (block, continuation),
         other => panic!("expected a block, got {other:?}"),
     }
 }
@@ -55,7 +59,7 @@ fn sets_run_inline_to_completion() {
         sealed: true
 "#,
     );
-    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    let (output, _) = completed(start(&definition, &json!({})));
     assert_eq!(output, json!({"color": "red", "sealed": true}));
 }
 
@@ -71,7 +75,7 @@ fn stops_at_the_first_effectful_block_after_inline_work() {
 "#,
     );
     let before = definition.clone();
-    let block = blocked(walk(&definition, &json!({}), &ResultLog::new()));
+    let (block, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(definition, before);
     assert_eq!(block.position(), "/do/1/notify");
     assert_eq!(block.name(), Some("notify"));
@@ -80,10 +84,15 @@ fn stops_at_the_first_effectful_block_after_inline_work() {
     assert_eq!(block.pause(), Pause::Activity);
     assert!(matches!(block.kind(), NodeKind::Emit));
     assert_eq!(block.input(), &json!({"color": "red"}));
+    assert_eq!(continuation.position(), "/do/1/notify");
+    assert_eq!(continuation.pause(), Pause::Activity);
+    assert_eq!(&continuation.key(), block.key());
+    assert_eq!(continuation.to_string(), "/do/1/notify");
+    assert_eq!(continuation.depth(), 1);
 }
 
 #[test]
-fn a_logged_effectful_output_is_skipped_on_the_next_walk() {
+fn an_output_resumes_the_tasks_after_the_block() {
     let definition = sample(
         r#"
   - paint:
@@ -96,18 +105,14 @@ fn a_logged_effectful_output_is_skipped_on_the_next_walk() {
         sealed: true
 "#,
     );
-    let log = ResultLog::new();
-    let first = blocked(walk(&definition, &json!({}), &log));
+    let (first, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(first.position(), "/do/1/notify");
-
-    let mut log = log;
-    log.record_output(first.key().clone(), json!({"sent": true}));
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
-    assert_eq!(output, json!({"sent": true, "sealed": true}));
-    assert!(matches!(
-        log.effect(first.key()),
-        Some(TaskResult::Output(value)) if value == &json!({"sent": true})
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"sent": true})),
     ));
+    assert_eq!(output, json!({"sent": true, "sealed": true}));
 }
 
 #[test]
@@ -120,21 +125,26 @@ fn effectful_tasks_stop_one_at_a_time() {
       emit: {}
 "#,
     );
-    let mut log = ResultLog::new();
-    let first = blocked(walk(&definition, &json!({}), &log));
+    let (first, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(first.position(), "/do/0/first");
-    log.record_output(first.key().clone(), json!({"n": 1}));
-    let second = blocked(walk(&definition, &json!({}), &log));
+    let (second, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"n": 1})),
+    ));
     assert_eq!(second.position(), "/do/1/second");
     assert_eq!(second.input(), &json!({"n": 1}));
     assert_ne!(first.key(), second.key());
-    log.record_output(second.key().clone(), json!({"n": 2}));
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"n": 2})),
+    ));
     assert_eq!(output, json!({"n": 2}));
 }
 
 #[test]
-fn the_same_walk_is_deterministic() {
+fn the_same_start_is_deterministic() {
     let definition = sample(
         r#"
   - paint:
@@ -144,11 +154,81 @@ fn the_same_walk_is_deterministic() {
       emit: {}
 "#,
     );
-    let log = ResultLog::new();
     assert_eq!(
-        walk(&definition, &json!({"n": 1}), &log),
-        walk(&definition, &json!({"n": 1}), &log)
+        start(&definition, &json!({"n": 1})),
+        start(&definition, &json!({"n": 1}))
     );
+}
+
+#[test]
+fn a_continuation_round_trips_through_json() {
+    let definition = sample(
+        r#"
+  - fan:
+      for:
+        each: item
+        in: .items
+      do:
+        - charge:
+            try:
+              - callPay:
+                  call: http
+            catch:
+              do:
+                - recover:
+                    set:
+                      paid: false
+  - seal:
+      set:
+        sealed: true
+"#,
+    );
+    let input = json!({"items": ["a"]});
+    let (block, continuation) = blocked(start(&definition, &input));
+    assert_eq!(
+        continuation.to_string(),
+        "/do/0/fan/do/0/charge/try/0/callPay@loop:0/attempt:0"
+    );
+    assert_eq!(continuation.depth(), 5);
+    let stored = serde_json::to_string(&continuation).unwrap_or_else(|error| panic!("{error}"));
+    let restored: Continuation =
+        serde_json::from_str(&stored).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(restored, continuation);
+    assert_eq!(&restored.key(), block.key());
+    let (output, _) = completed(resume(
+        &definition,
+        restored,
+        Resume::Output(json!({"paid": true})),
+    ));
+    assert_eq!(output, json!({"paid": true, "sealed": true}));
+}
+
+#[test]
+fn a_tick_without_a_deadline_returns_the_same_block() {
+    let definition = sample(
+        r#"
+  - notify:
+      emit: {}
+"#,
+    );
+    let (block, continuation) = blocked(start(&definition, &json!({})));
+    let (again, same) = blocked(resume(&definition, continuation.clone(), Resume::Tick));
+    assert_eq!(again, block);
+    assert_eq!(same, continuation);
+}
+
+#[test]
+fn a_blocking_pause_rejects_an_output() {
+    let definition = sample(
+        r#"
+  - pause:
+      wait: {}
+"#,
+    );
+    let (_, continuation) = blocked(start(&definition, &json!({})));
+    let fault = faulted(resume(&definition, continuation, Resume::Output(json!({}))));
+    assert_eq!(fault.instance(), "/do/0/pause");
+    assert!(fault.detail().unwrap_or("").contains("Release"), "{fault}");
 }
 
 #[test]
@@ -162,13 +242,15 @@ fn wait_is_a_timer_until_it_is_released() {
         sealed: true
 "#,
     );
-    let mut log = ResultLog::new();
-    let block = blocked(walk(&definition, &json!({}), &log));
+    let (block, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(block.position(), "/do/0/pause");
     assert!(!block.effectful());
     assert_eq!(block.pause(), Pause::Timer);
-    log.release(block.key().clone(), json!({"held": true}));
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Release(json!({"held": true})),
+    ));
     assert_eq!(output, json!({"held": true, "sealed": true}));
 }
 
@@ -186,21 +268,52 @@ fn for_iterations_use_distinct_execution_keys() {
 "#,
     );
     let input = json!({"items": ["a", "b"]});
-    let mut log = ResultLog::new();
-    let first = blocked(walk(&definition, &input, &log));
+    let (first, continuation) = blocked(start(&definition, &input));
     assert_eq!(first.position(), "/do/0/fan/do/0/ping");
-    assert_eq!(first.execution_key().frames(), &[Frame::Loop(0)]);
+    assert_eq!(first.execution_key().counters(), &[Counter::Loop(0)]);
     assert_eq!(first.execution_key().to_string(), "loop:0");
     assert_eq!(first.input(), &input);
-    log.record_output(first.key().clone(), json!({"sent": 0}));
 
-    let second = blocked(walk(&definition, &input, &log));
-    assert_eq!(second.execution_key().frames(), &[Frame::Loop(1)]);
+    let (second, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"sent": 0})),
+    ));
+    assert_eq!(second.execution_key().counters(), &[Counter::Loop(1)]);
     assert_eq!(second.input(), &json!({"sent": 0}));
-    log.record_output(second.key().clone(), json!({"sent": 1}));
 
-    let (output, _) = completed(walk(&definition, &input, &log));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"sent": 1})),
+    ));
     assert_eq!(output, json!({"sent": 1}));
+}
+
+#[test]
+fn loop_variables_are_bound_after_a_resume() {
+    let definition = sample(
+        r#"
+  - fan:
+      for:
+        each: item
+        in: .items
+      do:
+        - ping:
+            emit: {}
+        - mark:
+            set:
+              seen: ${ $item }
+              at: ${ $index }
+"#,
+    );
+    let input = json!({"items": ["a", "b"]});
+    let (_, continuation) = blocked(start(&definition, &input));
+    let (second, continuation) =
+        blocked(resume(&definition, continuation, Resume::Output(json!({}))));
+    assert_eq!(second.input(), &json!({"seen": "a", "at": 0}));
+    let (output, _) = completed(resume(&definition, continuation, Resume::Output(json!({}))));
+    assert_eq!(output, json!({"seen": "b", "at": 1}));
 }
 
 #[test]
@@ -218,11 +331,7 @@ fn while_stops_the_loop_before_later_iterations() {
               n: ${ $item }
 "#,
     );
-    let (output, _) = completed(walk(
-        &definition,
-        &json!({"items": ["a", "b", "c"]}),
-        &ResultLog::new(),
-    ));
+    let (output, _) = completed(start(&definition, &json!({"items": ["a", "b", "c"]})));
     assert_eq!(output["n"], json!("a"));
 }
 
@@ -248,19 +357,18 @@ fn retry_attempts_are_part_of_the_effectful_key() {
                 paid: false
 "#,
     );
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &log));
+    let (call, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(call.position(), "/do/0/charge/try/0/callPay");
     assert!(call.effectful());
     assert_eq!(call.pause(), Pause::Activity);
-    assert_eq!(call.execution_key().frames(), &[Frame::Attempt(0)]);
+    assert_eq!(call.execution_key().counters(), &[Counter::Attempt(0)]);
     assert_eq!(call.execution_key().to_string(), "attempt:0");
-    log.record_fault(
-        call.key().clone(),
-        tideloom_core::Fault::runtime(call.position(), "down"),
-    );
 
-    let retry = blocked(walk(&definition, &json!({}), &log));
+    let (retry, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Fault(tideloom_core::Fault::runtime(call.position(), "down")),
+    ));
     assert_eq!(retry.position(), "/do/0/charge");
     assert!(!retry.effectful());
     assert_eq!(
@@ -270,15 +378,21 @@ fn retry_attempts_are_part_of_the_effectful_key() {
             delay: Duration::ZERO,
         }
     );
-    log.release(retry.key().clone(), json!(null));
 
-    let again = blocked(walk(&definition, &json!({}), &log));
+    let (again, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Release(json!(null)),
+    ));
     assert_eq!(again.position(), "/do/0/charge/try/0/callPay");
-    assert_eq!(again.execution_key().frames(), &[Frame::Attempt(1)]);
+    assert_eq!(again.execution_key().counters(), &[Counter::Attempt(1)]);
     assert_ne!(call.key(), again.key());
-    log.record_output(again.key().clone(), json!({"paid": true}));
 
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"paid": true})),
+    ));
     assert_eq!(output, json!({"paid": true}));
 }
 
@@ -301,7 +415,7 @@ fn raise_inside_try_is_caught_inline() {
                 ok: true
 "#,
     );
-    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    let (output, _) = completed(start(&definition, &json!({})));
     assert_eq!(output, json!({"ok": true}));
 }
 
@@ -320,14 +434,43 @@ fn an_effectful_fault_is_caught_without_stopping_again() {
                 paid: false
 "#,
     );
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &log));
-    log.record_fault(
-        call.key().clone(),
-        tideloom_core::Fault::runtime(call.position(), "down"),
-    );
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (call, continuation) = blocked(start(&definition, &json!({})));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Fault(tideloom_core::Fault::runtime(call.position(), "down")),
+    ));
     assert_eq!(output, json!({"paid": false}));
+}
+
+#[test]
+fn the_error_binding_is_visible_after_a_resume_inside_the_catch() {
+    let definition = sample(
+        r#"
+  - charge:
+      try:
+        - callPay:
+            call: http
+      catch:
+        as: problem
+        do:
+          - notify:
+              emit: {}
+          - recover:
+              set:
+                status: ${ $problem.status }
+"#,
+    );
+    let (call, continuation) = blocked(start(&definition, &json!({})));
+    let (notify, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Fault(tideloom_core::Fault::runtime(call.position(), "down")),
+    ));
+    assert_eq!(notify.position(), "/do/0/charge/catch/do/0/notify");
+    assert_eq!(notify.execution_key().to_string(), "attempt:0");
+    let (output, _) = completed(resume(&definition, continuation, Resume::Output(json!({}))));
+    assert_eq!(output, json!({"status": 500}));
 }
 
 #[test]
@@ -342,7 +485,7 @@ fn uncaught_raise_faults_at_the_task_pointer() {
           title: nope
 "#,
     );
-    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&definition, &json!({})));
     assert_eq!(fault.instance(), "/do/0/boom");
     assert_eq!(fault.status(), 500);
     assert_eq!(fault.title(), "nope");
@@ -369,18 +512,57 @@ fn switch_jumps_to_the_matching_sibling() {
       then: end
 "#,
     );
-    let (high, _) = completed(walk(
-        &definition,
-        &json!({"priority": "high"}),
-        &ResultLog::new(),
-    ));
+    let (high, _) = completed(start(&definition, &json!({"priority": "high"})));
     assert_eq!(high["lane"], json!("rush"));
-    let (low, _) = completed(walk(
-        &definition,
-        &json!({"priority": "low"}),
-        &ResultLog::new(),
-    ));
+    let (low, _) = completed(start(&definition, &json!({"priority": "low"})));
     assert_eq!(low["lane"], json!("slow"));
+}
+
+#[test]
+fn a_jump_back_through_an_effectful_task_gets_a_new_pass_key() {
+    let definition = sample(
+        r#"
+  - poll:
+      call: http
+      with:
+        method: get
+        endpoint: https://example.test/job/1
+  - check:
+      switch:
+        - pending:
+            when: .status == "pending"
+            then: poll
+        - done:
+            then: end
+"#,
+    );
+    let (first, continuation) = blocked(start(&definition, &json!({})));
+    assert_eq!(first.position(), "/do/0/poll");
+    assert!(first.execution_key().is_empty());
+
+    let (second, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"status": "pending"})),
+    ));
+    assert_eq!(second.position(), "/do/0/poll");
+    assert_eq!(second.execution_key().counters(), &[Counter::Pass(1)]);
+    assert_eq!(second.key().to_string(), "/do/0/poll@pass:1");
+    assert_eq!(second.input(), &json!({"status": "pending"}));
+
+    let (third, continuation) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"status": "pending"})),
+    ));
+    assert_eq!(third.execution_key().counters(), &[Counter::Pass(2)]);
+
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"status": "done"})),
+    ));
+    assert_eq!(output, json!({"status": "done"}));
 }
 
 #[test]
@@ -396,7 +578,33 @@ fn end_completes_before_later_siblings() {
         n: 2
 "#,
     );
-    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    let (output, _) = completed(start(&definition, &json!({})));
+    assert_eq!(output, json!({"n": 1}));
+}
+
+#[test]
+fn end_after_a_resume_skips_the_rest_of_every_list() {
+    let definition = sample(
+        r#"
+  - outer:
+      do:
+        - notify:
+            emit: {}
+            then: end
+        - skipped:
+            set:
+              n: 2
+  - after:
+      set:
+        tail: true
+"#,
+    );
+    let (_, continuation) = blocked(start(&definition, &json!({})));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"n": 1})),
+    ));
     assert_eq!(output, json!({"n": 1}));
 }
 
@@ -420,7 +628,7 @@ fn exit_leaves_the_nested_do() {
               tail: true
 "#,
     );
-    let (output, _) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    let (output, _) = completed(start(&definition, &json!({})));
     assert_eq!(output, json!({"n": 1, "tail": true}));
 }
 
@@ -439,7 +647,7 @@ use:
       call: normalize
 "#,
     );
-    let (output, _) = completed(walk(&definition, &json!({"n": 1}), &ResultLog::new()));
+    let (output, _) = completed(start(&definition, &json!({"n": 1})));
     assert_eq!(output, json!({"n": 1, "ok": true}));
 }
 
@@ -451,7 +659,7 @@ fn an_undefined_function_faults_instead_of_calling_out() {
       call: missing
 "#,
     );
-    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&definition, &json!({})));
     assert_eq!(fault.instance(), "/do/0/go");
     assert!(fault.detail().unwrap_or("").contains("missing"), "{fault}");
 }
@@ -468,11 +676,22 @@ use:
         r#"
   - go:
       call: ping
+      output:
+        as: .pinged
+  - after:
+      set:
+        tail: true
 "#,
     );
-    let block = blocked(walk(&definition, &json!({}), &ResultLog::new()));
+    let (block, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(block.position(), "/do/0/go/_fn");
     assert!(block.effectful());
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"pinged": {"ok": true}})),
+    ));
+    assert_eq!(output, json!({"ok": true, "tail": true}));
 }
 
 #[test]
@@ -494,14 +713,16 @@ fn fork_stops_for_the_join_and_does_not_run_branches() {
         joined: true
 "#,
     );
-    let mut log = ResultLog::new();
-    let block = blocked(walk(&definition, &json!({}), &log));
+    let (block, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(block.position(), "/do/1/rush");
     assert!(!block.effectful());
     assert_eq!(block.pause(), Pause::Join { compete: true });
     assert_eq!(block.input(), &json!({"ready": true}));
-    log.release(block.key().clone(), json!({"winner": "ship"}));
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Release(json!({"winner": "ship"})),
+    ));
     assert_eq!(output, json!({"winner": "ship", "joined": true}));
 }
 
@@ -525,12 +746,14 @@ fn listen_is_an_event_pause_and_foreach_is_not_walked() {
         done: true
 "#,
     );
-    let mut log = ResultLog::new();
-    let block = blocked(walk(&definition, &json!({}), &log));
+    let (block, continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(block.pause(), Pause::Events);
     assert!(!block.effectful());
-    log.release(block.key().clone(), json!({"events": 1}));
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Release(json!({"events": 1})),
+    ));
     assert_eq!(output, json!({"events": 1, "done": true}));
 }
 
@@ -546,7 +769,7 @@ fn run_workflow_is_an_effectful_child_pause() {
           version: '1.0.0'
 "#,
     );
-    let block = blocked(walk(&definition, &json!({}), &ResultLog::new()));
+    let (block, _) = blocked(start(&definition, &json!({})));
     assert!(block.effectful());
     assert_eq!(block.pause(), Pause::Child);
     assert!(matches!(block.kind(), NodeKind::Run(RunKind::Workflow)));
@@ -563,7 +786,7 @@ fn http_call_stops_without_being_executed() {
         endpoint: https://example.test/pay
 "#,
     );
-    let block = blocked(walk(&definition, &json!({}), &ResultLog::new()));
+    let (block, _) = blocked(start(&definition, &json!({})));
     assert_eq!(block.position(), "/do/0/callPay");
     assert_eq!(block.pause(), Pause::Activity);
     assert!(block.effectful());
@@ -581,14 +804,14 @@ fn if_false_skips_an_effectful_task() {
         ran: true
 "#,
     );
-    let (output, _) = completed(walk(&definition, &json!({"go": false}), &ResultLog::new()));
+    let (output, _) = completed(start(&definition, &json!({"go": false})));
     assert_eq!(output, json!({"go": false, "ran": true}));
-    let block = blocked(walk(&definition, &json!({"go": true}), &ResultLog::new()));
+    let (block, _) = blocked(start(&definition, &json!({"go": true})));
     assert_eq!(block.position(), "/do/0/maybe");
 }
 
 #[test]
-fn output_as_is_applied_to_a_logged_activity_output() {
+fn output_as_is_applied_to_an_activity_output() {
     let definition = sample(
         r#"
   - notify:
@@ -597,10 +820,12 @@ fn output_as_is_applied_to_a_logged_activity_output() {
         as: .sent
 "#,
     );
-    let mut log = ResultLog::new();
-    let block = blocked(walk(&definition, &json!({}), &log));
-    log.record_output(block.key().clone(), json!({"sent": true, "other": 1}));
-    let (output, _) = completed(walk(&definition, &json!({}), &log));
+    let (_, continuation) = blocked(start(&definition, &json!({})));
+    let (output, _) = completed(resume(
+        &definition,
+        continuation,
+        Resume::Output(json!({"sent": true, "other": 1})),
+    ));
     assert_eq!(output, json!(true));
 }
 
@@ -618,8 +843,32 @@ fn export_as_is_visible_to_later_tasks() {
         seen: ${ $context.color }
 "#,
     );
-    let (output, context) = completed(walk(&definition, &json!({}), &ResultLog::new()));
+    let (output, context) = completed(start(&definition, &json!({})));
     assert_eq!(output, json!({"color": "red", "seen": "red"}));
+    assert_eq!(context, json!({"color": "red"}));
+}
+
+#[test]
+fn context_survives_a_stop() {
+    let definition = sample(
+        r#"
+  - remember:
+      set:
+        color: red
+      export:
+        as: '{ color: .color }'
+  - notify:
+      emit: {}
+  - later:
+      set:
+        seen: ${ $context.color }
+"#,
+    );
+    let (block, continuation) = blocked(start(&definition, &json!({})));
+    assert_eq!(block.context(), &json!({"color": "red"}));
+    assert_eq!(continuation.context(), json!({"color": "red"}));
+    let (output, context) = completed(resume(&definition, continuation, Resume::Output(json!({}))));
+    assert_eq!(output, json!({"seen": "red"}));
     assert_eq!(context, json!({"color": "red"}));
 }
 
@@ -633,10 +882,9 @@ fn workflow_and_task_input_from_transform_data() {
         seen: ${ .id }
 "#,
     );
-    let (output, _) = completed(walk(
+    let (output, _) = completed(start(
         &definition,
         &json!({"order": {"id": 7}, "extra": true}),
-        &ResultLog::new(),
     ));
     assert_eq!(output, json!({"id": 7, "seen": 7}));
 
@@ -649,11 +897,7 @@ fn workflow_and_task_input_from_transform_data() {
         n: 1
 "#,
     );
-    let (output, _) = completed(walk(
-        &definition,
-        &json!({"inner": {"a": 1}, "b": 2}),
-        &ResultLog::new(),
-    ));
+    let (output, _) = completed(start(&definition, &json!({"inner": {"a": 1}, "b": 2})));
     assert_eq!(output, json!({"a": 1, "n": 1}));
 }
 
@@ -667,7 +911,7 @@ fn an_unsupported_expression_is_an_expression_fault() {
         n: 1
 "#,
     );
-    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&definition, &json!({})));
     assert_eq!(fault.instance(), "/do/0/check");
     assert_eq!(fault.status(), 400);
 }
@@ -682,7 +926,7 @@ fn a_missing_sibling_is_a_runtime_fault() {
       then: missing
 "#,
     );
-    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&definition, &json!({})));
     assert_eq!(fault.instance(), "/do/0/first");
     assert_eq!(fault.status(), 500);
 }
@@ -707,13 +951,12 @@ use:
         retry: once
 "#,
     );
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &log));
-    log.record_fault(
-        call.key().clone(),
-        tideloom_core::Fault::runtime(call.position(), "down"),
-    );
-    let retry = blocked(walk(&definition, &json!({}), &log));
+    let (call, continuation) = blocked(start(&definition, &json!({})));
+    let (retry, _) = blocked(resume(
+        &definition,
+        continuation,
+        Resume::Fault(tideloom_core::Fault::runtime(call.position(), "down")),
+    ));
     assert_eq!(
         retry.pause(),
         Pause::Retry {
@@ -746,7 +989,7 @@ fn catch_errors_with_can_decline_a_fault() {
                 ok: true
 "#,
     );
-    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&definition, &json!({})));
     assert_eq!(fault.error_type(), "https://example.test/other");
     assert_eq!(fault.instance(), "/do/0/attempt/try/0/boom");
 }
@@ -761,6 +1004,6 @@ fn an_inline_cycle_faults_instead_of_looping_forever() {
       then: again
 "#,
     );
-    let fault = faulted(walk(&definition, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&definition, &json!({})));
     assert!(fault.detail().unwrap_or("").contains("10000"), "{fault}");
 }

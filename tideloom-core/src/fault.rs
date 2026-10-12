@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -20,7 +22,7 @@ const VALIDATION: &str = "https://open-workflow-specification.org/spec/1.0.0/err
 ///
 /// `instance` is the JSON Pointer of the task that failed. Workflow-level
 /// failures use `/`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fault {
     error_type: String,
     status: u16,

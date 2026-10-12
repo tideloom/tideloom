@@ -16,10 +16,13 @@ use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
+use tideloom_core::Continuation;
 use tideloom_core::Definition;
 use tideloom_core::Outcome;
-use tideloom_core::ResultLog;
+use tideloom_core::WalkOptions;
 use tideloom_core::drive;
+use tideloom_core::drive_from;
+use tideloom_core::start;
 
 const COMMUNICATION: &str =
     "https://open-workflow-specification.org/spec/1.0.0/errors/communication";
@@ -68,22 +71,19 @@ fn definition(tasks: &str) -> Definition {
     Definition::from_yaml(&yaml).unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn run(tasks: &str, input: Value) -> (Outcome, ResultLog) {
-    let definition = definition(tasks);
-    let mut log = ResultLog::new();
-    let outcome = drive(&definition, &input, &mut log);
-    (outcome, log)
+fn run(tasks: &str, input: Value) -> Outcome {
+    drive(&definition(tasks), &input)
 }
 
 fn completed(tasks: &str, input: Value) -> Value {
-    match run(tasks, input).0 {
+    match run(tasks, input) {
         Outcome::Completed { output, .. } => output,
         other => panic!("expected completion, got {other:?}"),
     }
 }
 
 fn faulted(tasks: &str, input: Value) -> tideloom_core::Fault {
-    match run(tasks, input).0 {
+    match run(tasks, input) {
         Outcome::Faulted { fault, .. } => fault,
         other => panic!("expected a fault, got {other:?}"),
     }
@@ -127,7 +127,7 @@ fn content_output_feeds_the_next_walk() {
 }
 
 #[test]
-fn a_finished_call_is_not_repeated_from_the_same_log() {
+fn a_stored_continuation_resumes_without_repeating_the_call() {
     let server = TestServer::start();
     let tasks = format!(
         r#"
@@ -136,16 +136,26 @@ fn a_finished_call_is_not_repeated_from_the_same_log() {
       with:
         method: get
         endpoint: {base}/pets/milou
+  - stamp:
+      set:
+        stamped: true
 "#,
         base = server.base
     );
     let definition = definition(&tasks);
-    let mut log = ResultLog::new();
-    let first = drive(&definition, &json!({}), &mut log);
-    assert!(matches!(first, Outcome::Completed { .. }));
-    assert_eq!(server.hits(), 1);
-    let second = drive(&definition, &json!({}), &mut log);
-    assert_eq!(first, second);
+    let Outcome::Blocked { continuation, .. } = start(&definition, &json!({})) else {
+        panic!("expected the call to block");
+    };
+    assert_eq!(server.hits(), 0);
+    let stored = serde_json::to_vec(&continuation).unwrap_or_else(|error| panic!("{error}"));
+    let restored: Continuation =
+        serde_json::from_slice(&stored).unwrap_or_else(|error| panic!("{error}"));
+    let Outcome::Completed { output, .. } =
+        drive_from(&definition, restored, WalkOptions::default())
+    else {
+        panic!("expected completion");
+    };
+    assert_eq!(output["stamped"], true);
     assert_eq!(server.hits(), 1);
 }
 
@@ -458,7 +468,7 @@ fn an_object_template_value_does_not_connect() {
 
 #[test]
 fn drive_leaves_a_non_http_activity_blocked() {
-    let (outcome, log) = run(
+    let outcome = run(
         r#"
   - notify:
       emit:
@@ -469,11 +479,15 @@ fn drive_leaves_a_non_http_activity_blocked() {
 "#,
         json!({}),
     );
-    let Outcome::Blocked { block } = outcome else {
+    let Outcome::Blocked {
+        block,
+        continuation,
+    } = outcome
+    else {
         panic!("expected a block");
     };
     assert_eq!(block.position(), "/do/0/notify");
-    assert!(log.effect(block.key()).is_none());
+    assert_eq!(continuation.position(), "/do/0/notify");
 }
 
 fn respond(mut stream: TcpStream) -> std::io::Result<()> {

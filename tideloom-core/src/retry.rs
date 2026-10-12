@@ -10,14 +10,16 @@
 //!   the waits are `delay`, `2 * delay`, `3 * delay`, ...
 //! - `backoff.exponential`: `delay * 2^attempt`, with the exponent capped at 32. The first retry
 //!   waits `delay`, then the wait doubles.
-//! - `jitter`: add a point between `from` and `to` after that backoff. [`crate::walk`] uses `from`.
-//!   [`crate::walk_with`] can select another point.
+//! - `jitter`: add a point between `from` and `to` after that backoff. [`crate::start`] uses
+//!   `from`. [`crate::start_with`] can select another point.
 //!
 //! A missing `delay` is 0. Years in an ISO 8601 duration are 365 days. Months
 //! are 30 days. Fractions round to the nearest millisecond, half up.
 
 use std::time::Duration;
 
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -32,9 +34,9 @@ const MAX_EXPONENT: u32 = 32;
 
 /// Milliseconds since the Unix epoch.
 ///
-/// A runner passes the instant it first observed a retry pause. This crate
-/// does not store that instant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A runner passes the instant it first observed a pause. The continuation
+/// stores it so later deadline checks use the same start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Timestamp {
     millis: u64,
 }
@@ -62,9 +64,9 @@ impl Timestamp {
 
 /// One point in a retry jitter range, in parts per million.
 ///
-/// `0` is `jitter.from`. [`JitterSample::TO`] is `jitter.to`. [`crate::walk`]
-/// uses [`JitterSample::FROM`], so a later walk with the same inputs returns
-/// the same delay.
+/// `0` is `jitter.from`. [`JitterSample::TO`] is `jitter.to`. [`crate::start`]
+/// uses [`JitterSample::FROM`]. The sample is read once, when the retry pause
+/// is created; the delay then lives on the continuation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JitterSample(u32);
 
