@@ -129,6 +129,14 @@ pub struct Lease {
     pub worker: WorkerId,
     /// When it lapses. A sweeper returns lapsed instances to `Runnable`.
     pub until: Timestamp,
+    /// Journal attempt this hold has opened and not finished.
+    ///
+    /// The store sets it from a `Pending` row committed while the lease is
+    /// held, and clears it when that attempt's outcome is upserted. A step
+    /// that still holds the lease continues the attempt. A new claim does not
+    /// carry it, so a crash is not mistaken for the second commit.
+    #[serde(default)]
+    pub open_attempt: Option<u32>,
 }
 
 /// One workflow instance as the store keeps it.

@@ -168,6 +168,7 @@ fn claims_are_due_ordered_limited_and_exclude_live_leases_and_other_waits() {
         value.lease = lease_until.map(|until| Lease {
             worker: WorkerId("old".into()),
             until: at(until),
+            open_attempt: None,
         });
         run(store.create(value.clone())).unwrap();
         expected.push(value);
@@ -191,7 +192,8 @@ fn claims_are_due_ordered_limited_and_exclude_live_leases_and_other_waits() {
             value.lease,
             Some(Lease {
                 worker: worker.clone(),
-                until: at(20)
+                until: at(20),
+                open_attempt: None,
             })
         );
         assert_eq!(&run(store.get(&value.id)).unwrap(), value);
@@ -249,6 +251,7 @@ fn sweep_is_read_only_and_only_lists_running_leases_strictly_before_the_cutoff()
         value.lease = until.map(|until| Lease {
             worker: WorkerId("old".into()),
             until: at(until),
+            open_attempt: None,
         });
         run(store.create(value.clone())).unwrap();
         originals.push(value);
@@ -417,6 +420,7 @@ fn cancellation_skips_terminal_instances_and_invalidates_in_flight_commits() {
         value.lease = Some(Lease {
             worker: WorkerId("old".into()),
             until: at(50),
+            open_attempt: None,
         });
         run(store.create(value.clone())).unwrap();
         originals.push(value);

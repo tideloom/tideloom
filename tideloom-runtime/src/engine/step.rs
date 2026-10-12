@@ -2,21 +2,29 @@
 //!
 //! A step reads the clock once. It may call the interpreter several times —
 //! a tick, then each activity the run reaches — and applies one commit at
-//! the stop. A crash before that commit redoes the whole step from the
-//! stored continuation. Journal rows for a half-finished activity are MR-4.
+//! the stop. An activity also commits around the executor: `Pending` before
+//! it runs, then the outcome upserted on the same `(instance, key, attempt)`
+//! row. A crash between those two leaves `Pending`. The next claim reads
+//! that row only to choose between re-running an idempotent executor and
+//! faulting the instance. The continuation, not the journal, says where the
+//! run is.
 
 use std::time::Duration;
 
 use serde_json::Value;
 use tideloom_core::Block;
+use tideloom_core::CallKind;
 use tideloom_core::Continuation;
 use tideloom_core::Definition;
 use tideloom_core::Fault;
+use tideloom_core::NodeKind;
 use tideloom_core::Outcome;
 use tideloom_core::Pause;
 use tideloom_core::Resume;
+use tideloom_core::TaskKey;
 use tideloom_core::Timestamp;
 use tideloom_core::WalkOptions;
+use tideloom_core::http_call;
 use tideloom_core::resume_with;
 use tideloom_core::start_at_with;
 use tideloom_core::start_with;
@@ -38,6 +46,8 @@ use crate::Instance;
 use crate::InstanceId;
 use crate::ManualClock;
 use crate::Status;
+use crate::StepOutcome;
+use crate::StepResult;
 use crate::StoreError;
 use crate::TaskExecution;
 use crate::TaskKind;
@@ -56,6 +66,10 @@ const CLAIM_LIMIT: usize = 64;
 /// An activity loop that never reaches a pause. The interpreter has its own
 /// inline cap; this one bounds executor calls inside a single step.
 const MAX_ACTIVITIES: u32 = 64;
+
+/// Detail of the runtime fault written when a non-idempotent activity's
+/// outcome is unknown. The milestone fixes this string.
+pub const UNKNOWN_DETAIL: &str = "activity outcome unknown";
 
 /// How many instances a pass processed, and how many commits it dropped
 /// because another worker won the CAS.
@@ -120,7 +134,7 @@ impl Engine {
     ///
     /// A due timer is claimable, so a workflow parked on a future `wait` does
     /// stop here: its `wake_at` is still ahead. A test that wants it to fire
-    /// advances [`ManualClock`](crate::ManualClock) and calls this again. A
+    /// advances [`ManualClock`] and calls this again. A
     /// join does not need that. Finishing a child releases the parent back to
     /// `Runnable` inside the same drive. The process does not sleep.
     ///
@@ -136,6 +150,65 @@ impl Engine {
                 return Ok(stepped);
             }
         }
+    }
+
+    /// Run one claimed instance until its `Pending` journal row is committed.
+    ///
+    /// The executor has not run. The lease stays held, with `open_attempt`
+    /// set, so a later [`Engine::step`] of the same instance finishes the
+    /// attempt instead of treating it as a crash. Tests use this to stand in
+    /// for a worker that died between the two commits: lapse the lease, then
+    /// `run_once`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Engine::step`].
+    pub async fn step_until_pending(
+        &self,
+        instance: Instance,
+        now: Timestamp,
+    ) -> Result<bool, EngineError> {
+        if instance.status == Status::Cancelled || instance.status.is_terminal() {
+            return Ok(false);
+        }
+        let current = self.store().get(&instance.id).await?;
+        if current.status == Status::Cancelled || current.status.is_terminal() {
+            return Ok(false);
+        }
+        let definition = self.definitions().get(&current.definition).await?;
+        let options = WalkOptions::new().with_now(now);
+        let outcome = match &current.continuation {
+            None => self.begin(&current, &definition, options)?,
+            Some(bytes) => {
+                let continuation = decode(&current.id, bytes)?;
+                resume_with(&definition, continuation, Resume::Tick, options)
+            }
+        };
+        let Outcome::Blocked {
+            block,
+            continuation,
+        } = outcome
+        else {
+            return Ok(false);
+        };
+        if block.pause() != Pause::Activity {
+            return Ok(false);
+        }
+        let journalled = self
+            .run_journalled(
+                &current,
+                &definition,
+                &block,
+                &continuation,
+                current.version,
+                now,
+                true,
+            )
+            .await?;
+        let Some(commit) = journalled.done else {
+            return Ok(false);
+        };
+        self.apply_step(commit).await
     }
 
     /// Run one claimed instance to its next stop and commit that.
@@ -235,6 +308,7 @@ impl Engine {
             }
         };
         let mut activities = 0;
+        let mut version = instance.version;
         while let Outcome::Blocked {
             block,
             continuation,
@@ -266,10 +340,22 @@ impl Engine {
                 ));
             }
             activities += 1;
-            let event = match self.execute(instance, block, continuation).await? {
-                Ok(output) => Resume::Output(output),
-                Err(fault) => Resume::Fault(fault),
-            };
+            let journalled = self
+                .run_journalled(
+                    instance,
+                    definition,
+                    block,
+                    continuation,
+                    version,
+                    now,
+                    false,
+                )
+                .await?;
+            if let Some(commit) = journalled.done {
+                return Ok((commit, Vec::new()));
+            }
+            version = journalled.version;
+            let event = journalled.event.unwrap_or(Resume::Tick);
             outcome = resume_with(definition, continuation.clone(), event, options);
         }
         let events = match &outcome {
@@ -278,13 +364,7 @@ impl Engine {
             }
             _ => None,
         };
-        let commit = translate(
-            &instance.id,
-            instance.version,
-            &instance.definition,
-            outcome,
-            now,
-        )?;
+        let commit = translate(&instance.id, version, &instance.definition, outcome, now)?;
         if let Some(tideloom_core::BlockDetail::Listen(spec)) = events {
             listen::subscribe(self.events_in().as_ref(), &instance.id, spec.clone())
                 .await
@@ -367,6 +447,127 @@ impl Engine {
         Ok((commit, release.ids))
     }
 
+    /// Journal one activity, then run it unless `cut` stops after `Pending`.
+    ///
+    /// The pending commit keeps the lease. The outcome upserts the same
+    /// `(instance, key, attempt)` row. A `Pending` row whose attempt is not on
+    /// this lease is a crash: an idempotent executor runs again at
+    /// `attempt + 1`, and any other executor faults the instance.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_journalled(
+        &self,
+        instance: &Instance,
+        definition: &Definition,
+        block: &Block,
+        continuation: &Continuation,
+        version: u64,
+        now: Timestamp,
+        after_pending: bool,
+    ) -> Result<Journalled, EngineError> {
+        let Some(kind) = TaskKind::of(block.kind()) else {
+            return Ok(Journalled::resume(Resume::Fault(Fault::runtime(
+                block.position(),
+                "effectful task has no executor kind",
+            ))));
+        };
+        let held = instance
+            .lease
+            .as_ref()
+            .filter(|lease| lease.worker == *self.worker())
+            .and_then(|lease| lease.open_attempt);
+        match self
+            .open_attempt(&instance.id, block.key(), kind, held)
+            .await?
+        {
+            OpenAttempt::Unknown { pending } => {
+                let fault = Fault::runtime(block.position(), UNKNOWN_DETAIL);
+                let mut unknown = pending;
+                unknown.attempt = unknown.attempt.saturating_add(1);
+                unknown.outcome = StepOutcome::Unknown;
+                unknown.finished_at = now;
+                let mut commit = faulted_at(&instance.id, version, now, fault);
+                commit.step_results.push(unknown);
+                Ok(Journalled::finished(commit))
+            }
+            OpenAttempt::Run { attempt } => {
+                let mut version = version;
+                if held != Some(attempt) {
+                    let pending = activity_row(
+                        instance,
+                        block,
+                        kind,
+                        attempt,
+                        StepOutcome::Pending,
+                        now,
+                        now,
+                    );
+                    if after_pending {
+                        // This cut is the pending commit. A follow-up commit
+                        // would replace Waiting(Activity) and clear the open
+                        // attempt the next step of this hold continues.
+                        let mut commit = Commit::new(
+                            instance.id.clone(),
+                            version,
+                            Status::Waiting(WaitReason::Activity),
+                            now,
+                        );
+                        commit.continuation = Some(encode(&instance.id, continuation)?);
+                        commit.release_lease = false;
+                        commit.step_results.push(pending);
+                        return Ok(Journalled::finished(commit));
+                    }
+                    self.commit_row(
+                        &instance.id,
+                        version,
+                        continuation,
+                        pending,
+                        Status::Waiting(WaitReason::Activity),
+                    )
+                    .await?;
+                    version += 1;
+                } else if after_pending {
+                    return Ok(Journalled::finished(still_running(
+                        instance,
+                        version,
+                        continuation,
+                        now,
+                    )?));
+                }
+                let event = match self
+                    .execute(instance, definition, block, continuation, kind, attempt)
+                    .await?
+                {
+                    Ok(output) => Resume::Output(output),
+                    Err(fault) => Resume::Fault(fault),
+                };
+                let finished = match &event {
+                    Resume::Output(output) => StepOutcome::Output(output.clone()),
+                    Resume::Fault(fault) => StepOutcome::Fault(fault.clone()),
+                    Resume::Release(_) | Resume::Tick => StepOutcome::Fault(Fault::runtime(
+                        block.position(),
+                        "activity resume was neither Output nor Fault",
+                    )),
+                };
+                let started_at = self
+                    .started_at_of(&instance.id, block.key(), attempt, now)
+                    .await?;
+                self.commit_row(
+                    &instance.id,
+                    version,
+                    continuation,
+                    activity_row(instance, block, kind, attempt, finished, started_at, now),
+                    Status::Running,
+                )
+                .await?;
+                Ok(Journalled {
+                    version: version + 1,
+                    event: Some(event),
+                    done: None,
+                })
+            }
+        }
+    }
+
     /// Start a run that has no continuation yet.
     ///
     /// A `fork` branch carries its task position in the instance input under
@@ -436,15 +637,17 @@ impl Engine {
     async fn execute(
         &self,
         instance: &Instance,
+        definition: &Definition,
         block: &Block,
         continuation: &Continuation,
+        kind: TaskKind,
+        attempt: u32,
     ) -> Result<Result<Value, Fault>, EngineError> {
-        let Some(kind) = TaskKind::of(block.kind()) else {
-            return Ok(Err(Fault::runtime(
-                block.position(),
-                "effectful task has no executor kind",
-            )));
-        };
+        // `http_call` needs the block the interpreter already built. `Block`
+        // has no public constructor, so this does not go through an executor.
+        if kind == TaskKind::Http && matches!(block.kind(), NodeKind::Call(CallKind::Http)) {
+            return Ok(http_call(definition, continuation.workflow_input(), block));
+        }
         let Some(executor) = self.executor(kind) else {
             return Ok(Err(Fault::runtime(
                 block.position(),
@@ -456,7 +659,7 @@ impl Engine {
             definition: instance.definition.clone(),
             key: block.key().clone(),
             kind,
-            attempt: 0,
+            attempt,
             input: block.input().clone(),
             context: continuation.context(),
             workflow_input: continuation.workflow_input().clone(),
@@ -468,6 +671,73 @@ impl Engine {
                 Ok(Err(Fault::runtime(block.position(), detail)))
             }
         }
+    }
+
+    async fn open_attempt(
+        &self,
+        instance: &InstanceId,
+        key: &TaskKey,
+        kind: TaskKind,
+        held_attempt: Option<u32>,
+    ) -> Result<OpenAttempt, EngineError> {
+        let steps = self.store().steps(instance).await?;
+        let latest = steps.iter().rev().find(|step| &step.key == key);
+        let Some(latest) = latest else {
+            return Ok(OpenAttempt::Run { attempt: 0 });
+        };
+        if !matches!(latest.outcome, StepOutcome::Pending) {
+            return Ok(OpenAttempt::Run {
+                attempt: latest.attempt.saturating_add(1),
+            });
+        }
+        // This hold already wrote Pending and has not finished. Continue it.
+        // A new claim does not carry `open_attempt`, so a Pending row then is
+        // a crash, not the second half of this call.
+        if held_attempt == Some(latest.attempt) {
+            return Ok(OpenAttempt::Run {
+                attempt: latest.attempt,
+            });
+        }
+        if activity_idempotent(self, kind) {
+            return Ok(OpenAttempt::Run {
+                attempt: latest.attempt.saturating_add(1),
+            });
+        }
+        Ok(OpenAttempt::Unknown {
+            pending: latest.clone(),
+        })
+    }
+
+    async fn started_at_of(
+        &self,
+        instance: &InstanceId,
+        key: &TaskKey,
+        attempt: u32,
+        now: Timestamp,
+    ) -> Result<Timestamp, EngineError> {
+        let steps = self.store().steps(instance).await?;
+        Ok(steps
+            .iter()
+            .rev()
+            .find(|step| &step.key == key && step.attempt == attempt)
+            .map(|step| step.started_at)
+            .unwrap_or(now))
+    }
+
+    async fn commit_row(
+        &self,
+        instance: &InstanceId,
+        version: u64,
+        continuation: &Continuation,
+        step: StepResult,
+        status: Status,
+    ) -> Result<(), EngineError> {
+        let mut commit = Commit::new(instance.clone(), version, status, step.finished_at);
+        commit.continuation = Some(encode(instance, continuation)?);
+        commit.release_lease = false;
+        commit.step_results.push(step);
+        self.apply_step(commit).await?;
+        Ok(())
     }
 
     async fn sweep(&self, now: Timestamp) -> Result<(), EngineError> {
@@ -630,6 +900,92 @@ fn still_waiting(
         now,
     );
     commit.continuation = Some(encode(&instance.id, continuation)?);
+    Ok(commit)
+}
+
+/// One activity after its journal commits.
+struct Journalled {
+    /// Version the next commit must expect.
+    version: u64,
+    /// What the interpreter resumes with, when the activity ran.
+    event: Option<Resume>,
+    /// A commit that ends the step: the unknown-outcome fault, or a cut
+    /// after `Pending`. The caller applies this instead of translating.
+    done: Option<Commit>,
+}
+
+impl Journalled {
+    fn resume(event: Resume) -> Self {
+        Self {
+            version: 0,
+            event: Some(event),
+            done: None,
+        }
+    }
+
+    fn finished(commit: Commit) -> Self {
+        Self {
+            version: commit.expected_version,
+            event: None,
+            done: Some(commit),
+        }
+    }
+}
+
+/// What the latest journal row for this key says the executor should do.
+#[allow(clippy::large_enum_variant)]
+enum OpenAttempt {
+    /// No open `Pending` row, or an idempotent one that must be run again.
+    Run { attempt: u32 },
+    /// A `Pending` row whose executor must not be run again.
+    Unknown { pending: StepResult },
+}
+
+fn activity_idempotent(engine: &Engine, kind: TaskKind) -> bool {
+    match kind {
+        TaskKind::Http => false,
+        other => engine
+            .executor(other)
+            .is_some_and(|executor| executor.idempotent()),
+    }
+}
+
+fn activity_row(
+    instance: &Instance,
+    block: &Block,
+    kind: TaskKind,
+    attempt: u32,
+    outcome: StepOutcome,
+    started_at: Timestamp,
+    finished_at: Timestamp,
+) -> StepResult {
+    StepResult {
+        instance: instance.id.clone(),
+        key: block.key().clone(),
+        kind,
+        attempt,
+        input: block.input().clone(),
+        outcome,
+        started_at,
+        finished_at,
+    }
+}
+
+fn faulted_at(instance: &InstanceId, version: u64, now: Timestamp, fault: Fault) -> Commit {
+    let mut commit = Commit::new(instance.clone(), version, Status::Faulted, now);
+    commit.fault = Some(fault);
+    commit
+}
+
+fn still_running(
+    instance: &Instance,
+    version: u64,
+    continuation: &Continuation,
+    now: Timestamp,
+) -> Result<Commit, EngineError> {
+    let mut commit = Commit::new(instance.id.clone(), version, Status::Running, now);
+    commit.continuation = Some(encode(&instance.id, continuation)?);
+    commit.release_lease = false;
     Ok(commit)
 }
 

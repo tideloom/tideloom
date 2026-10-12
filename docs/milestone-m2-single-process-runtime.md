@@ -50,7 +50,7 @@ M1 钉死了解释器核心的形状：`Definition`、`Continuation`、`start` /
 | MR-1 | `tideloom-runtime/src/store/memory.rs`、`tideloom-runtime/tests/memory_store.rs` | `tideloom-runtime/src/store.rs`（仅 `mod memory;` 与 re-export）、`src/lib.rs`（re-export） | trait 签名、`commit.rs`、`instance.rs` |
 | MR-2 | `tideloom-runtime/src/wakeup/local.rs`、`tests/local_wakeup.rs` | `src/wakeup.rs`（仅 mod 与 re-export）、`src/lib.rs`、`Cargo.toml`（加 tokio） | trait 签名 |
 | MR-3 | `tideloom-runtime/src/engine/step.rs`、`src/engine/translate.rs`、`src/executor/http.rs`、`src/executor/log.rs`、`tests/engine.rs` | `src/engine.rs`（加 `run_once` / `drive_until_idle`，不改 `commit`）、`src/lib.rs` | `tideloom-core/src/walk.rs`、trait 签名 |
-| MR-4 | `tideloom-runtime/tests/journal.rs` | `src/engine/step.rs`（pending / done 两次提交与恢复判定）、`src/store/memory.rs`（journal 存取） | `commit.rs` 中 `StepResult` 的字段 |
+| MR-4 | `tideloom-runtime/src/engine/step.rs`、`tideloom-runtime/tests/journal.rs` | `src/engine.rs`（`run_once` / `step`，不改 `commit`）、`src/store/memory.rs`（journal 存取；租约记下未完成的 attempt）、`src/instance.rs`（`Lease::open_attempt`）、`src/lib.rs`（re-export） | `commit.rs` 中 `StepResult` 的字段 |
 | MR-5 | `tideloom-runtime/src/engine/join.rs`、`tests/fork.rs` | `src/engine/translate.rs`（Join 分支）、`src/engine/step.rs`（子实例终态触发父实例重算） | `tideloom-core`（`start_at` 与 `Branches` 已就绪） |
 | MR-6 | `tideloom-runtime/src/engine/child.rs`、`tests/child_workflow.rs` | `src/engine/translate.rs`（Child 分支）、`src/engine/join.rs`（复用重算路径） | `tideloom-core`（`ChildRef` 已就绪） |
 | MR-7 | `tideloom-runtime/src/events/local.rs`、`src/executor/emit.rs`、`src/engine/listen.rs`、`tests/listen.rs` | `src/events.rs`（仅 mod 与 re-export）、`src/engine/translate.rs`（Events 分支）、`src/engine/step.rs`（claim 后检查 inbox） | `tideloom-core`（`ListenSpec` 已就绪；需要 `until` / `correlate` 时另开核心 MR） |
@@ -136,7 +136,7 @@ M1 钉死了解释器核心的形状：`Definition`、`Continuation`、`start` /
 - Journal 只写不读：解释器不从 `task_execution` 恢复任何状态，这是和 replay 模式的分界线。唯一的读取是上面这条恢复判定，且它只决定"重做还是 fault"，不决定"在哪里"。
 - 不改 `StepResult` 的字段。
 
-**测试**：`tideloom-runtime/tests/journal.rs`。一次 http 调用产生 `Pending` 与 `Output` 两条记录；模拟执行后崩溃（在两次提交之间中断）再 claim，非幂等执行器导致 `Faulted` 且 journal 里有 `Unknown`；幂等执行器重做且 `attempt` 为 1。
+**测试**：`tideloom-runtime/tests/journal.rs`。一次 http 调用先提交 `Pending` 再把同一 `(instance, key, attempt)` 行 upsert 为 `Output`（`Commit::step_results` 的现行契约是 upsert，不是追加两条记录；MR-1 已按此实现并测试）。模拟执行后崩溃（在两次提交之间中断）再 claim，非幂等执行器导致 `Faulted` 且 journal 里有 `Unknown`；幂等执行器重做且 `attempt` 为 1。
 
 ---
 
