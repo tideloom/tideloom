@@ -7,6 +7,10 @@ use crate::InstanceId;
 use crate::StepResult;
 use crate::WorkerId;
 
+mod memory;
+
+pub use memory::MemoryStore;
+
 /// Why a store call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

@@ -58,6 +58,7 @@ pub use instance::Status;
 pub use instance::WaitReason;
 pub use instance::WorkerId;
 pub use store::InstanceStore;
+pub use store::MemoryStore;
 pub use store::StoreError;
 pub use wakeup::BusError;
 pub use wakeup::Hint;
