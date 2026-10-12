@@ -23,6 +23,8 @@ use tideloom_core::start_with;
 
 use super::join::JoinDecision;
 use super::join::decide;
+use super::listen;
+use super::listen::ListenStep;
 use super::translate::decode;
 use super::translate::encode;
 use super::translate::translate;
@@ -169,9 +171,9 @@ impl Engine {
         }
         let definition = self.definitions().get(&current.definition).await?;
         let result = self.interpret(&current, &definition, now).await;
-        let commit = match result {
+        let (commit, acked) = match result {
             Ok(commit) => commit,
-            Err(error) => fault_commit(&current, now, &error)?,
+            Err(error) => (fault_commit(&current, now, &error)?, Vec::new()),
         };
         let terminal = commit.status.is_terminal();
         let parent = current.parent.clone();
@@ -181,6 +183,13 @@ impl Engine {
             commit
         };
         let conflict = self.apply_step(commit).await?;
+        if !conflict && !acked.is_empty() {
+            // After the commit, never before. A conflict above leaves the
+            // inbox intact so the next claim releases the same events.
+            listen::ack_after_commit(self.events_in().as_ref(), &current.id, &acked)
+                .await
+                .map_err(|error| EngineError::Events(error.to_string()))?;
+        }
         if !conflict
             && terminal
             && let Some(parent) = parent
@@ -203,7 +212,7 @@ impl Engine {
         instance: &Instance,
         definition: &Definition,
         now: Timestamp,
-    ) -> Result<Commit, EngineError> {
+    ) -> Result<(Commit, Vec<String>), EngineError> {
         let options = WalkOptions::new().with_now(now);
         let mut outcome = match &instance.continuation {
             None => self.begin(instance, definition, options)?,
@@ -214,7 +223,13 @@ impl Engine {
                 // no continuation at all, so `begin` walks to the join and
                 // `translate` spawns the children.
                 if matches!(continuation.pause(), Pause::Join { .. }) {
-                    return self.rejoin(instance, definition, continuation, now).await;
+                    return Ok((
+                        self.rejoin(instance, definition, continuation, now).await?,
+                        Vec::new(),
+                    ));
+                }
+                if matches!(continuation.pause(), Pause::Events) {
+                    return self.relisten(instance, definition, continuation, now).await;
                 }
                 resume_with(definition, continuation, Resume::Tick, options)
             }
@@ -238,10 +253,16 @@ impl Engine {
                 break;
             }
             if activities >= MAX_ACTIVITIES {
-                return Ok(faulted(
-                    instance,
-                    now,
-                    Fault::runtime(block.position(), "activity loop exceeded 64 executor calls"),
+                return Ok((
+                    faulted(
+                        instance,
+                        now,
+                        Fault::runtime(
+                            block.position(),
+                            "activity loop exceeded 64 executor calls",
+                        ),
+                    ),
+                    Vec::new(),
                 ));
             }
             activities += 1;
@@ -251,13 +272,99 @@ impl Engine {
             };
             outcome = resume_with(definition, continuation.clone(), event, options);
         }
-        translate(
+        let events = match &outcome {
+            Outcome::Blocked { block, .. } if matches!(block.pause(), Pause::Events) => {
+                Some(block.detail().clone())
+            }
+            _ => None,
+        };
+        let commit = translate(
             &instance.id,
             instance.version,
             &instance.definition,
             outcome,
             now,
-        )
+        )?;
+        if let Some(tideloom_core::BlockDetail::Listen(spec)) = events {
+            listen::subscribe(self.events_in().as_ref(), &instance.id, spec.clone())
+                .await
+                .map_err(|error| EngineError::Events(error.to_string()))?;
+            // Subscribe happens before the commit, so an emit in this same
+            // step is already in the inbox. Release now instead of parking
+            // on `Waiting(Events)`, which `claim` would never return.
+            let inbox = self
+                .events_in()
+                .inbox(&instance.id)
+                .await
+                .map_err(|error| EngineError::Events(error.to_string()))?;
+            if crate::LocalEventBus::satisfied(&spec, &inbox) {
+                // Due now, so the next `run_once` claims it and releases.
+                // An unsatisfied listen stays `Waiting(Events)`, which
+                // `claim` does not return, so `drive_until_idle` can stop.
+                let mut due = commit;
+                due.status = Status::Waiting(WaitReason::Timer);
+                due.wake_at = Some(now);
+                return Ok((due, Vec::new()));
+            }
+        }
+        Ok((commit, Vec::new()))
+    }
+
+    /// A claimed listen either keeps waiting or resumes with the inbox.
+    ///
+    /// The inbox is the source of truth. A missing signal does not lose the
+    /// event: the next claim reads the same inbox.
+    async fn relisten(
+        &self,
+        instance: &Instance,
+        definition: &Definition,
+        continuation: Continuation,
+        now: Timestamp,
+    ) -> Result<(Commit, Vec<String>), EngineError> {
+        // Tick rebuilds the listen block, including its spec. The stored
+        // continuation does not carry `BlockDetail`.
+        let ticked = resume_with(
+            definition,
+            continuation.clone(),
+            Resume::Tick,
+            WalkOptions::new().with_now(now),
+        );
+        let Outcome::Blocked {
+            block,
+            continuation,
+        } = ticked
+        else {
+            let commit = translate(
+                &instance.id,
+                instance.version,
+                &instance.definition,
+                ticked,
+                now,
+            )?;
+            return Ok((commit, Vec::new()));
+        };
+        let decision = listen::after_claim(self.events_in().as_ref(), &instance.id, block.detail())
+            .await
+            .map_err(|error| EngineError::Events(error.to_string()))?;
+        let ListenStep::Release(release) = decision else {
+            return Ok((still_events(instance, &continuation, now)?, Vec::new()));
+        };
+        let outcome = resume_with(
+            definition,
+            continuation,
+            Resume::Release(serde_json::Value::Array(release.events)),
+            WalkOptions::new().with_now(now),
+        );
+        let commit = translate(
+            &instance.id,
+            instance.version,
+            &instance.definition,
+            outcome,
+            now,
+        )?;
+        // The caller commits, then acks these ids. Acking here would drop
+        // the events if that commit lost the CAS.
+        Ok((commit, release.ids))
     }
 
     /// Start a run that has no continuation yet.
@@ -495,6 +602,22 @@ async fn parent_row_version(engine: &Engine, id: &InstanceId) -> Result<u64, Eng
     }
 }
 
+fn still_events(
+    instance: &Instance,
+    continuation: &Continuation,
+    now: Timestamp,
+) -> Result<Commit, EngineError> {
+    let mut commit = Commit::new(
+        instance.id.clone(),
+        instance.version,
+        Status::Waiting(WaitReason::Events),
+        // wake_at stays unset: an unsatisfied listen is not claimable.
+        now,
+    );
+    commit.continuation = Some(encode(&instance.id, continuation)?);
+    Ok(commit)
+}
+
 fn still_waiting(
     instance: &Instance,
     continuation: &Continuation,
@@ -541,6 +664,7 @@ fn rewrap(error: &EngineError) -> EngineError {
         },
         EngineError::NoExecutor(kind) => EngineError::NoExecutor(*kind),
         EngineError::Unsupported(detail) => EngineError::Unsupported(detail.clone()),
+        EngineError::Events(detail) => EngineError::Events(detail.clone()),
     }
 }
 

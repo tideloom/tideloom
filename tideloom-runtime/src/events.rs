@@ -8,6 +8,11 @@ use tideloom_core::ListenSpec;
 
 use crate::InstanceId;
 
+mod local;
+
+pub use local::ListenRelease;
+pub use local::LocalEventBus;
+
 /// A CloudEvent as the runtime moves it around.
 ///
 /// Context attributes are flat strings, which is what `listen` filters match

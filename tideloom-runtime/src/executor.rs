@@ -11,6 +11,10 @@ use tideloom_core::TaskKey;
 use crate::DefinitionKey;
 use crate::InstanceId;
 
+mod emit;
+
+pub use emit::EmitExecutor;
+
 /// Which executor an effectful task is routed to.
 ///
 /// This is the `task_execution.kind` column. `run: workflow` is not here: it

@@ -21,6 +21,10 @@ mod translate;
 
 pub use step::StepCount;
 
+/// Listen subscription, inbox check, and ack. The step calls these from the
+/// Events branch of translate and after claim.
+pub mod listen;
+
 /// Why an engine step failed.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -45,6 +49,9 @@ pub enum EngineError {
     /// a missing milestone behind a workflow fault, so the step returns it.
     #[error("{0}")]
     Unsupported(String),
+    /// The event bus refused a subscribe, an inbox read, or an ack.
+    #[error("events: {0}")]
+    Events(String),
 }
 
 /// Everything an [`Engine`] is built from.

@@ -16,13 +16,20 @@
 //! their own pull requests; this crate ships the in-memory ones that are small
 //! enough to be obviously right ([`ManualClock`], [`SystemClock`],
 //! [`MemoryDefinitions`]).
+//!
+//! [`engine`] is public so milestone MRs can add step helpers beside
+//! [`Engine`](engine::Engine) without a new crate path.
 
 #![warn(missing_docs)]
 
 mod clock;
 mod commit;
 mod definitions;
-mod engine;
+/// The engine, its step loop, and the listen helpers that loop calls.
+///
+/// [`Engine`](engine::Engine) is the composition root. [`engine::listen`] is
+/// the Events branch of translate and the post-claim inbox check.
+pub mod engine;
 mod events;
 mod executor;
 mod instance;
@@ -46,8 +53,11 @@ pub use events::CloudEvent;
 pub use events::EventError;
 pub use events::EventSink;
 pub use events::EventSource;
+pub use events::ListenRelease;
+pub use events::LocalEventBus;
 pub use executor::ActivityError;
 pub use executor::ActivityExecutor;
+pub use executor::EmitExecutor;
 pub use executor::TaskExecution;
 pub use executor::TaskKind;
 pub use instance::DefinitionKey;
