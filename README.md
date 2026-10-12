@@ -60,7 +60,7 @@ let _boundary = task.is_block_boundary();
 - `Continuation::schema` is the persistence format version (`tideloom_core::SCHEMA`). A continuation written with another version is refused on resume.
 - `listen.foreach` is not walked.
 
-Expressions are a closed subset used by `if`, `switch.when`, `for.in`, `while`, `input.from`, `output.as`, `export.as`, and `${ ... }` inside `set`: paths, literals, comparisons, arithmetic, `and` / `or` / `not`, arrays, objects, and `|`. Full jq is not implemented.
+Expressions are a closed jq subset used by `if`, `switch.when`, `for.in`, `while`, `input.from`, `output.as`, `export.as`, and `${ ... }` inside `set`. See [Expressions](#expressions) for the supported filters.
 
 ```rust
 let Outcome::Blocked { block, continuation } = tideloom_core::start(&definition, &input) else {
@@ -70,6 +70,34 @@ let stored = serde_json::to_vec(&continuation)?;
 let restored: Continuation = serde_json::from_slice(&stored)?;
 let outcome = tideloom_core::resume(&definition, restored, Resume::Output(output));
 ```
+
+## Expressions
+
+The pure evaluator supports paths (including `$` variables and negative array indexes), JSON literals, comparisons, arithmetic, `and` / `or` / `not`, array and object constructors, and pipes (`|`). It does not invoke jq or perform I/O. Full jq is not implemented: unsupported syntax, unknown functions, wrong argument counts, and invalid input types become expression faults.
+
+| Filter | Behavior |
+| --- | --- |
+| `map(f)` | Evaluate `f` on each array element or object value and collect its results into an array; for example, `map(.price * 2)`. |
+| `select(f)` | Keep the input when `f` is truthy; otherwise emit no result. Use `map(select(.enabled))` to filter a collection. |
+| `length` | Array/object size, Unicode character count for strings, absolute value for numbers, or 0 for null; booleans fault. |
+| `has(key)` | Test object membership by string key or array membership by integer index, including entries whose value is null; negative indexes return false. |
+| `keys` | Sorted object keys or an array's zero-based indexes. |
+| `add` | Reduce array elements or object values with `+`; numbers sum, strings/arrays concatenate, objects merge with later keys winning, and null is the identity. Empty collections return null. |
+| `tostring` | Leave strings unchanged; serialize any other JSON value as compact JSON text. |
+| `tonumber` | Leave numbers unchanged or parse a finite numeric string; other values and invalid strings fault. |
+| `ascii_downcase` | Lowercase ASCII letters in a string, leaving non-ASCII characters unchanged. |
+| `split(separator)` | Split a string by a literal string separator, preserving empty fields; an empty separator splits into Unicode characters, and empty input returns `[]`. |
+| `join(separator)` | Join array scalars with a string separator; null becomes empty text, numbers/booleans become JSON text, and nested arrays/objects fault. |
+| `startswith(prefix)` | Test whether a string starts with a string prefix. |
+| `endswith(suffix)` | Test whether a string ends with a string suffix. |
+| `contains(value)` | String substring, recursive array containment (every requested element matches some input element), recursive object containment, or equality for same-type scalars. Top-level type mismatches fault. |
+| `if condition then yes else no end` | Evaluate only the chosen branch against the original input; conditionals may nest. |
+| `left // right` | Keep the left filter's non-null/non-false results; evaluate the right filter against the original input only when none remain. Errors on the left are not swallowed. |
+| `[.[] \| f]` | Iterate array elements or object values, apply `f`, and collect all results, including an empty stream as `[]`. |
+
+`select`, expression conditionals, and `//` use jq truthiness: only null and false are falsy; 0, empty strings, and empty collections are truthy. Existing `and` / `or` / `not` remain boolean-only, and integer arithmetic retains checked overflow and integer division.
+
+Pipes apply their right filter to each left result. Array constructors and `map` collect streams; an expression at the workflow boundary must produce exactly one JSON value. Uncollected zero/multiple results fault rather than silently losing data. For example, `[.items[] | select(.enabled) | .name | ascii_downcase]` returns an array, whereas `.items[]` faults if it emits zero or more than one item. `set` strings without `${ ... }` remain literal strings.
 
 ## Retry backoff
 
