@@ -1,9 +1,8 @@
 //! Expressions this walk evaluates.
 //!
-//! The language is the subset control flow needs: paths, literals, comparisons,
-//! arithmetic, `and` / `or` / `not`, arrays, objects, and `|`. It is not jq.
-//! Anything else fails as an expression error so a later slice can replace
-//! this evaluator without changing the walk.
+//! A closed jq subset, with streams inside filters and a single JSON value at
+//! the workflow boundary. Array constructors collect streams. Unsupported
+//! syntax and uncollected zero/multiple results are expression errors.
 //!
 //! `set` strings are literals unless they contain `${ ... }`. A string whose
 //! whole value is one interpolation becomes that value. Other interpolations
@@ -22,7 +21,14 @@ pub(crate) fn evaluate(
     vars: &BTreeMap<String, Value>,
 ) -> Result<Value, String> {
     let expr = parse(source).map_err(|message| format!("{message} in `{source}`"))?;
-    eval(&expr, dot, vars)
+    let mut values = eval(&expr, dot, vars)?;
+    if values.len() != 1 {
+        return Err(format!(
+            "expression must produce one value, got {} in `{source}`",
+            values.len()
+        ));
+    }
+    Ok(values.remove(0))
 }
 
 pub(crate) fn evaluate_data(
@@ -140,6 +146,10 @@ enum Expr {
     Neg(Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Pipe(Box<Expr>, Box<Expr>),
+    Iterate(Box<Expr>),
+    Function(String, Option<Box<Expr>>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Default(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,10 +185,21 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn parse_pipe(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_or()?;
+        let mut left = self.parse_default()?;
         while self.eat_op("|") {
-            let right = self.parse_or()?;
+            let right = self.parse_default()?;
             left = Expr::Pipe(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_default(&mut self) -> Result<Expr, String> {
+        let left = self.parse_or()?;
+        if self.eat_op("//") {
+            return Ok(Expr::Default(
+                Box::new(left),
+                Box::new(self.parse_default()?),
+            ));
         }
         Ok(left)
     }
@@ -266,6 +287,21 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
         self.skip();
+        if self.eat_keyword("if") {
+            let condition = self.parse_pipe()?;
+            if !self.eat_keyword("then") {
+                return Err("expected `then`".to_string());
+            }
+            let yes = self.parse_pipe()?;
+            if !self.eat_keyword("else") {
+                return Err("expected `else`".to_string());
+            }
+            let no = self.parse_pipe()?;
+            if !self.eat_keyword("end") {
+                return Err("expected `end`".to_string());
+            }
+            return Ok(Expr::If(Box::new(condition), Box::new(yes), Box::new(no)));
+        }
         if self.eat_char('(') {
             let expr = self.parse_pipe()?;
             if !self.eat_char(')') {
@@ -296,6 +332,27 @@ impl<'a> Parser<'a> {
         }
         if self.peek() == Some('.') || self.peek() == Some('$') {
             return self.parse_path();
+        }
+        if let Some(name) = self.parse_ident() {
+            let takes_argument = match name.as_str() {
+                "map" | "select" | "has" | "split" | "join" | "startswith" | "endswith"
+                | "contains" => true,
+                "length" | "keys" | "add" | "tostring" | "tonumber" | "ascii_downcase" => false,
+                _ => return Err(format!("unsupported function `{name}`")),
+            };
+            let argument = if takes_argument {
+                if !self.eat_char('(') {
+                    return Err(format!("`{name}` expects an argument"));
+                }
+                let argument = self.parse_pipe()?;
+                if !self.eat_char(')') {
+                    return Err("expected `)`".to_string());
+                }
+                Some(Box::new(argument))
+            } else {
+                None
+            };
+            return Ok(Expr::Function(name, argument));
         }
         Err(format!("expected a value, found `{}`", self.snippet()))
     }
@@ -369,6 +426,7 @@ impl<'a> Parser<'a> {
             return Err("expected a path".to_string());
         };
         if matches!(expr, Expr::Dot)
+            && self.peek().is_some_and(is_ident_start)
             && let Some(name) = self.parse_ident()
         {
             expr = Expr::Field(Box::new(expr), name);
@@ -380,6 +438,10 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| "expected a field name".to_string())?;
                 expr = Expr::Field(Box::new(expr), name);
             } else if self.eat_char('[') {
+                if self.eat_char(']') {
+                    expr = Expr::Iterate(Box::new(expr));
+                    continue;
+                }
                 let index = self.parse_pipe()?;
                 if !self.eat_char(']') {
                     return Err("expected `]`".to_string());
@@ -516,6 +578,9 @@ impl<'a> Parser<'a> {
             return false;
         }
         let after = self.index + op.len();
+        if op == "/" && self.source[after..].starts_with('/') {
+            return false;
+        }
         if matches!(op, "<" | ">" | "!" | "=") && self.source[after..].starts_with('=') {
             return false;
         }
@@ -582,98 +647,289 @@ fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
-fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Value, String> {
+fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>, String> {
     match expr {
-        Expr::Dot => Ok(dot.clone()),
+        Expr::Dot => Ok(vec![dot.clone()]),
         Expr::Var(name) => vars
             .get(name)
             .cloned()
+            .map(|value| vec![value])
             .ok_or_else(|| format!("unknown variable `${name}`")),
-        Expr::Field(base, name) => {
-            let value = eval(base, dot, vars)?;
-            match value {
+        Expr::Field(base, name) => eval(base, dot, vars)?
+            .into_iter()
+            .map(|value| match value {
                 Value::Object(object) => Ok(object.get(name).cloned().unwrap_or(Value::Null)),
                 Value::Null => Ok(Value::Null),
                 _ => Err(format!("cannot read field `{name}` on a non-object")),
-            }
-        }
+            })
+            .collect(),
         Expr::Index(base, index) => {
-            let value = eval(base, dot, vars)?;
-            let index = eval(index, dot, vars)?;
-            index_value(&value, &index)
+            let mut out = Vec::new();
+            for value in eval(base, dot, vars)? {
+                for index in eval(index, dot, vars)? {
+                    out.push(index_value(&value, &index)?);
+                }
+            }
+            Ok(out)
         }
-        Expr::Lit(value) => Ok(value.clone()),
+        Expr::Lit(value) => Ok(vec![value.clone()]),
         Expr::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(eval(item, dot, vars)?);
+                out.extend(eval(item, dot, vars)?);
             }
-            Ok(Value::Array(out))
+            Ok(vec![Value::Array(out)])
         }
         Expr::Object(fields) => {
-            let mut object = Map::new();
+            let mut objects = vec![Map::new()];
             for (key, value) in fields {
-                object.insert(key.clone(), eval(value, dot, vars)?);
+                let values = eval(value, dot, vars)?;
+                let mut next = Vec::new();
+                for object in objects {
+                    for value in &values {
+                        let mut object = object.clone();
+                        object.insert(key.clone(), value.clone());
+                        next.push(object);
+                    }
+                }
+                objects = next;
             }
-            Ok(Value::Object(object))
+            Ok(objects.into_iter().map(Value::Object).collect())
         }
-        Expr::Not(inner) => {
-            let value = eval(inner, dot, vars)?;
-            match value {
+        Expr::Not(inner) => eval(inner, dot, vars)?
+            .into_iter()
+            .map(|value| match value {
                 Value::Bool(flag) => Ok(Value::Bool(!flag)),
                 _ => Err("`not` expects a boolean".to_string()),
-            }
-        }
-        Expr::Neg(inner) => {
-            let value = eval(inner, dot, vars)?;
-            match as_num(&value) {
+            })
+            .collect(),
+        Expr::Neg(inner) => eval(inner, dot, vars)?
+            .into_iter()
+            .map(|value| match as_num(&value) {
                 Some(Num::Int(number)) => number
                     .checked_neg()
                     .map(Value::from)
                     .ok_or_else(|| "numeric overflow".to_string()),
                 Some(Num::Float(number)) => finite_number(-number),
                 None => Err("`-` expects a number".to_string()),
+            })
+            .collect(),
+        Expr::Binary(op, left, right) => {
+            let mut out = Vec::new();
+            for left in eval(left, dot, vars)? {
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let Value::Bool(flag) = left else {
+                        return Err(format!("`{}` expects a boolean", bin_name(*op)));
+                    };
+                    if (*op == BinOp::And && !flag) || (*op == BinOp::Or && flag) {
+                        out.push(Value::Bool(flag));
+                        continue;
+                    }
+                }
+                for right in eval(right, dot, vars)? {
+                    out.push(eval_binary(*op, &left, &right)?);
+                }
+            }
+            Ok(out)
+        }
+        Expr::Pipe(left, right) => {
+            let mut out = Vec::new();
+            for value in eval(left, dot, vars)? {
+                out.extend(eval(right, &value, vars)?);
+            }
+            Ok(out)
+        }
+        Expr::Iterate(base) => {
+            let mut out = Vec::new();
+            for value in eval(base, dot, vars)? {
+                out.extend(iterate(value)?);
+            }
+            Ok(out)
+        }
+        Expr::If(condition, yes, no) => {
+            let mut out = Vec::new();
+            for value in eval(condition, dot, vars)? {
+                out.extend(eval(if truthy(&value) { yes } else { no }, dot, vars)?);
+            }
+            Ok(out)
+        }
+        Expr::Default(left, right) => {
+            let values: Vec<_> = eval(left, dot, vars)?.into_iter().filter(truthy).collect();
+            if values.is_empty() {
+                eval(right, dot, vars)
+            } else {
+                Ok(values)
             }
         }
-        Expr::Binary(op, left, right) => eval_binary(*op, left, right, dot, vars),
-        Expr::Pipe(left, right) => {
-            let value = eval(left, dot, vars)?;
-            eval(right, &value, vars)
+        Expr::Function(name, argument) => {
+            if let Some(argument) = argument {
+                if name == "map" {
+                    let mut out = Vec::new();
+                    for value in iterate(dot.clone())? {
+                        out.extend(eval(argument, &value, vars)?);
+                    }
+                    return Ok(vec![Value::Array(out)]);
+                }
+                let mut out = Vec::new();
+                for value in eval(argument, dot, vars)? {
+                    if name == "select" {
+                        if truthy(&value) {
+                            out.push(dot.clone());
+                        }
+                    } else {
+                        out.push(eval_function(name, dot, Some(&value))?);
+                    }
+                }
+                Ok(out)
+            } else {
+                Ok(vec![eval_function(name, dot, None)?])
+            }
         }
     }
 }
 
-fn eval_binary(
-    op: BinOp,
-    left: &Expr,
-    right: &Expr,
-    dot: &Value,
-    vars: &BTreeMap<String, Value>,
-) -> Result<Value, String> {
-    if matches!(op, BinOp::And | BinOp::Or) {
-        let left = eval(left, dot, vars)?;
-        let Value::Bool(flag) = left else {
-            return Err(format!("`{}` expects a boolean", bin_name(op)));
-        };
-        if (op == BinOp::And && !flag) || (op == BinOp::Or && flag) {
-            return Ok(Value::Bool(flag));
-        }
-        let right = eval(right, dot, vars)?;
-        return match right {
-            Value::Bool(flag) => Ok(Value::Bool(flag)),
-            _ => Err(format!("`{}` expects a boolean", bin_name(op))),
-        };
-    }
-    let left = eval(left, dot, vars)?;
-    let right = eval(right, dot, vars)?;
+fn eval_binary(op: BinOp, left: &Value, right: &Value) -> Result<Value, String> {
     match op {
         BinOp::Eq => Ok(Value::Bool(left == right)),
         BinOp::Ne => Ok(Value::Bool(left != right)),
-        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => compare(op, &left, &right),
-        BinOp::Add => add(&left, &right),
-        BinOp::Sub => arith(op, &left, &right),
-        BinOp::Mul | BinOp::Div => arith(op, &left, &right),
-        BinOp::And | BinOp::Or => unreachable!("handled above"),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => compare(op, left, right),
+        BinOp::Add => add(left, right),
+        BinOp::Sub | BinOp::Mul | BinOp::Div => arith(op, left, right),
+        BinOp::And | BinOp::Or => match right {
+            Value::Bool(_) => Ok(right.clone()),
+            _ => Err(format!("`{}` expects a boolean", bin_name(op))),
+        },
+    }
+}
+
+fn truthy(value: &Value) -> bool {
+    !matches!(value, Value::Null | Value::Bool(false))
+}
+
+fn iterate(value: Value) -> Result<Vec<Value>, String> {
+    match value {
+        Value::Array(items) => Ok(items),
+        Value::Object(object) => Ok(object.into_values().collect()),
+        _ => Err("iteration expects an array or object".to_string()),
+    }
+}
+
+fn eval_function(name: &str, dot: &Value, argument: Option<&Value>) -> Result<Value, String> {
+    match (name, dot, argument) {
+        ("length", Value::Null, _) => Ok(Value::from(0)),
+        ("length", Value::String(text), _) => Ok(Value::from(text.chars().count())),
+        ("length", Value::Array(items), _) => Ok(Value::from(items.len())),
+        ("length", Value::Object(object), _) => Ok(Value::from(object.len())),
+        ("length", Value::Number(number), _) if number.is_u64() => Ok(dot.clone()),
+        ("length", Value::Number(_), _) => match as_num(dot) {
+            Some(Num::Int(number)) => Ok(Value::from(number.unsigned_abs())),
+            Some(Num::Float(number)) => finite_number(number.abs()),
+            None => Err("invalid number".to_string()),
+        },
+        ("has", Value::Object(object), Some(Value::String(key))) => {
+            Ok(Value::Bool(object.contains_key(key)))
+        }
+        ("has", Value::Array(items), Some(Value::Number(index))) => {
+            let index = index
+                .as_i64()
+                .ok_or_else(|| "`has` expects an integer array index".to_string())?;
+            Ok(Value::Bool(
+                usize::try_from(index).is_ok_and(|index| index < items.len()),
+            ))
+        }
+        ("keys", Value::Object(object), _) => {
+            let mut keys: Vec<_> = object.keys().cloned().collect();
+            keys.sort();
+            Ok(Value::Array(keys.into_iter().map(Value::String).collect()))
+        }
+        ("keys", Value::Array(items), _) => {
+            Ok(Value::Array((0..items.len()).map(Value::from).collect()))
+        }
+        ("add", Value::Array(_) | Value::Object(_), _) => {
+            let mut sum = Value::Null;
+            for value in iterate(dot.clone())? {
+                sum = add(&sum, &value)?;
+            }
+            Ok(sum)
+        }
+        ("tostring", _, _) => Ok(Value::String(stringify(dot))),
+        ("tonumber", Value::Number(_), _) => Ok(dot.clone()),
+        ("tonumber", Value::String(text), _) => {
+            let text = text.trim();
+            if let Ok(number) = text.parse::<i64>() {
+                return Ok(Value::from(number));
+            }
+            if let Ok(number) = text.parse::<u64>() {
+                return Ok(Value::from(number));
+            }
+            let number = text
+                .parse::<f64>()
+                .map_err(|_| "`tonumber` expects a numeric string".to_string())?;
+            finite_number(number)
+        }
+        ("ascii_downcase", Value::String(text), _) => Ok(Value::String(text.to_ascii_lowercase())),
+        ("split", Value::String(text), Some(Value::String(separator))) => {
+            let items = if text.is_empty() {
+                Vec::new()
+            } else if separator.is_empty() {
+                text.chars()
+                    .map(|ch| Value::String(ch.to_string()))
+                    .collect()
+            } else {
+                text.split(separator)
+                    .map(|part| Value::String(part.to_string()))
+                    .collect()
+            };
+            Ok(Value::Array(items))
+        }
+        ("join", Value::Array(items), Some(Value::String(separator))) => {
+            let parts: Result<Vec<_>, _> = items
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(String::new()),
+                    Value::Array(_) | Value::Object(_) => {
+                        Err("`join` expects scalar elements".to_string())
+                    }
+                    _ => Ok(stringify(value)),
+                })
+                .collect();
+            Ok(Value::String(parts?.join(separator)))
+        }
+        ("startswith", Value::String(text), Some(Value::String(prefix))) => {
+            Ok(Value::Bool(text.starts_with(prefix)))
+        }
+        ("endswith", Value::String(text), Some(Value::String(suffix))) => {
+            Ok(Value::Bool(text.ends_with(suffix)))
+        }
+        ("contains", _, Some(value)) => Ok(Value::Bool(contains(dot, value)?)),
+        _ => Err(format!("invalid input or argument for `{name}`")),
+    }
+}
+
+fn contains(container: &Value, value: &Value) -> Result<bool, String> {
+    match (container, value) {
+        (Value::String(text), Value::String(part)) => Ok(text.contains(part)),
+        (Value::Array(items), Value::Array(parts)) => Ok(parts.iter().all(|part| {
+            items
+                .iter()
+                .any(|item| contains(item, part).unwrap_or(false))
+        })),
+        (Value::Object(object), Value::Object(parts)) => Ok(parts.iter().all(|(key, part)| {
+            object
+                .get(key)
+                .is_some_and(|item| contains(item, part).unwrap_or(false))
+        })),
+        (Value::Number(_), Value::Number(_)) => {
+            if let (Some(left), Some(right)) = (as_num(container), as_num(value)) {
+                return Ok(match (left, right) {
+                    (Num::Int(left), Num::Int(right)) => left == right,
+                    (left, right) => left.float() == right.float(),
+                });
+            }
+            Err("invalid number".to_string())
+        }
+        (Value::Null, Value::Null) | (Value::Bool(_), Value::Bool(_)) => Ok(container == value),
+        _ => Err("`contains` expects inputs of the same type".to_string()),
     }
 }
 
@@ -696,8 +952,22 @@ fn compare(op: BinOp, left: &Value, right: &Value) -> Result<Value, String> {
 }
 
 fn add(left: &Value, right: &Value) -> Result<Value, String> {
+    if left.is_null() {
+        return Ok(right.clone());
+    }
+    if right.is_null() {
+        return Ok(left.clone());
+    }
     if let (Value::String(left), Value::String(right)) = (left, right) {
         return Ok(Value::String(format!("{left}{right}")));
+    }
+    if let (Value::Array(left), Value::Array(right)) = (left, right) {
+        return Ok(Value::Array(left.iter().chain(right).cloned().collect()));
+    }
+    if let (Value::Object(left), Value::Object(right)) = (left, right) {
+        let mut object = left.clone();
+        object.extend(right.clone());
+        return Ok(Value::Object(object));
     }
     arith(BinOp::Add, left, right)
 }
@@ -877,8 +1147,288 @@ mod tests {
     }
 
     #[test]
-    fn rejects_jq_functions() {
-        let error = evaluate("map(.)", &json!({}), &BTreeMap::new()).unwrap_err();
-        assert!(error.contains("expected a value"), "{error}");
+    fn evaluates_the_function_subset_and_rejects_invalid_inputs() {
+        let cases = [
+            (
+                "map(. * 3)",
+                json!([2, -1, 4]),
+                json!([6, -3, 12]),
+                json!(2),
+            ),
+            (
+                "[select(.n > 2)]",
+                json!({"n": 3}),
+                json!([{"n": 3}]),
+                json!(3),
+            ),
+            ("length", json!("é水🙂"), json!(3), json!(true)),
+            ("has(\"x\")", json!({"x": null}), json!(true), json!([])),
+            (
+                "keys",
+                json!({"z": 0, "a": 1}),
+                json!(["a", "z"]),
+                json!(null),
+            ),
+            ("add", json!([2, -5, 9]), json!(6), json!([1, "x"])),
+            ("tonumber", json!(" -1.25e2 "), json!(-125.0), json!("1x")),
+            ("ascii_downcase", json!("AÉZ水"), json!("aÉz水"), json!([])),
+            (
+                "split(\"::\")",
+                json!("a::::b::"),
+                json!(["a", "", "b", ""]),
+                json!(3),
+            ),
+            (
+                "join(\"/\")",
+                json!(["a", null, true, 2]),
+                json!("a//true/2"),
+                json!([{}]),
+            ),
+            (
+                "startswith(\"ab\")",
+                json!("abcd"),
+                json!(true),
+                json!(null),
+            ),
+            ("endswith(\"cd\")", json!("abcd"), json!(true), json!(3)),
+            (
+                "contains({a: [\"bc\"]})",
+                json!({"a": ["abcd", 1], "b": 2}),
+                json!(true),
+                json!([]),
+            ),
+        ];
+        for (source, input, expected, invalid) in cases {
+            assert_eq!(ev(source, input), expected, "{source}");
+            assert!(
+                evaluate(source, &invalid, &BTreeMap::new()).is_err(),
+                "{source}"
+            );
+        }
+        // tostring accepts every JSON type; its error case is invalid arity.
+        assert_eq!(
+            ev("tostring", json!({"a": [1, false]})),
+            json!(r#"{"a":[1,false]}"#)
+        );
+        assert_eq!(ev("tostring", json!("hello")), json!("hello"));
+        assert!(evaluate("tostring(.)", &json!(null), &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn function_boundaries_follow_jq_value_semantics() {
+        let cases = [
+            (
+                "map(select(. > 1) | . + 10)",
+                json!([3, 0, 2]),
+                json!([13, 12]),
+            ),
+            ("map(.)", json!({"b": 2, "a": 1}), json!([1, 2])),
+            ("map(.[])", json!([[2, 4], [], [3]]), json!([2, 4, 3])),
+            ("[select(false)]", json!(5), json!([])),
+            ("[select(0)]", json!(5), json!([5])),
+            ("length", json!(null), json!(0)),
+            ("length", json!(-4), json!(4)),
+            ("length", json!(u64::MAX), json!(u64::MAX)),
+            ("length", json!({"a": 1, "b": 2}), json!(2)),
+            ("length", json!([false, null]), json!(2)),
+            ("has(0)", json!([null]), json!(true)),
+            ("has(1)", json!([null]), json!(false)),
+            ("has(-1)", json!([null]), json!(false)),
+            ("has(\"missing\")", json!({}), json!(false)),
+            ("keys", json!([8, 3]), json!([0, 1])),
+            ("add", json!([]), json!(null)),
+            ("add", json!([null, 3, null, 5]), json!(8)),
+            ("add", json!(["a", "bc"]), json!("abc")),
+            ("add", json!([[2], [3, 4]]), json!([2, 3, 4])),
+            (
+                "add",
+                json!([{"a": 1}, {"a": 2, "b": 3}]),
+                json!({"a": 2, "b": 3}),
+            ),
+            ("add", json!({"a": 3, "b": 5}), json!(8)),
+            ("tonumber", json!(7), json!(7)),
+            ("tonumber", json!("+01"), json!(1)),
+            ("tonumber", json!(".5"), json!(0.5)),
+            ("split(\"\")", json!("é水"), json!(["é", "水"])),
+            ("split(\"\")", json!(""), json!([])),
+            ("split(\"-\")", json!(""), json!([])),
+            ("split(\"-\")", json!("-"), json!(["", ""])),
+            ("join(\"-\")", json!([]), json!("")),
+            ("startswith(\"ab\")", json!("zab"), json!(false)),
+            ("endswith(\"ab\")", json!("abz"), json!(false)),
+            ("contains(\"bc\")", json!("abcd"), json!(true)),
+            ("contains(1.0)", json!(1), json!(true)),
+            ("contains(-0.0)", json!(0), json!(true)),
+            ("contains(\"bd\")", json!("abcd"), json!(false)),
+            ("contains([2, 2])", json!([2]), json!(true)),
+            ("contains({a: null})", json!({}), json!(false)),
+            ("contains({a: \"x\"})", json!({"a": 1}), json!(false)),
+            ("contains([false])", json!([1, "a"]), json!(false)),
+        ];
+        for (source, input, expected) in cases {
+            assert_eq!(ev(source, input), expected, "{source}");
+        }
+        for (source, input) in [
+            ("has(0.5)", json!([])),
+            ("tonumber", json!(true)),
+            ("tonumber", json!("null")),
+            ("tonumber", json!("1e9999")),
+            ("tonumber", json!("NaN")),
+            ("tonumber", json!("inf")),
+            ("split(2)", json!("text")),
+            ("join(2)", json!([])),
+            ("startswith(2)", json!("text")),
+            ("endswith(2)", json!("text")),
+            ("add", json!([i64::MAX, 1])),
+        ] {
+            assert!(
+                evaluate(source, &input, &BTreeMap::new()).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditionals_and_defaults_are_lazy_and_preserve_the_input() {
+        assert_eq!(
+            ev("if .ok then .n else 1 / 0 end", json!({"ok": true, "n": 4})),
+            json!(4)
+        );
+        assert_eq!(ev("if . then 1 / 0 else 9 end", json!(false)), json!(9));
+        assert_eq!(
+            ev("if . then if . == 0 then 2 else 3 end else 4 end", json!(0)),
+            json!(2)
+        );
+        assert_eq!(
+            ev(
+                "map(if . then 1 else 2 end)",
+                json!([false, null, 0, "", [], {}])
+            ),
+            json!([2, 2, 1, 1, 1, 1])
+        );
+        assert_eq!(
+            ev(".n // .fallback // 9", json!({"n": false, "fallback": 3})),
+            json!(3)
+        );
+        assert_eq!(ev("0 // (1 / 0)", json!(null)), json!(0));
+        assert_eq!(ev(".missing // 8 / 2", json!({})), json!(4));
+        assert_eq!(
+            ev("[.[] // 7]", json!([false, null, 0, ""])),
+            json!([0, ""])
+        );
+        assert_eq!(ev("[.[] // 7]", json!([])), json!([7]));
+        assert_eq!(
+            ev("[.[] | . // 7]", json!([false, 2, null])),
+            json!([7, 2, 7])
+        );
+        assert_eq!(ev("[select(false)] // 7", json!(null)), json!([]));
+        for source in [
+            "if . then 1 end",
+            "if true then 1 else end",
+            "if true then .bad else 1 end",
+            "null // (1 / 0)",
+            "1 //",
+            "if",
+        ] {
+            assert!(
+                evaluate(source, &json!(2), &BTreeMap::new()).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn iteration_collects_streams_and_rejects_uncollected_results() {
+        assert_eq!(
+            ev(
+                "[.[] | select(.n > 1) | .n * 2]",
+                json!([{"n": 3}, {"n": 1}, {"n": 2}])
+            ),
+            json!([6, 4])
+        );
+        assert_eq!(ev("[.[] + 1]", json!([2, 5])), json!([3, 6]));
+        assert_eq!(
+            ev("[.[] | {n: ., label: tostring}]", json!([2, 5])),
+            json!([{"n": 2, "label": "2"}, {"n": 5, "label": "5"}])
+        );
+        assert_eq!(ev("[.[][]]", json!([[2, 4], [], [3]])), json!([2, 4, 3]));
+        assert_eq!(ev("[.[]]", json!({"b": 5, "a": 2})), json!([2, 5]));
+        assert_eq!(ev("[.[]]", json!([])), json!([]));
+        let vars = BTreeMap::from([("increment".to_string(), json!(3))]);
+        assert_eq!(
+            evaluate("map(. + $increment)", &json!([2, 5]), &vars).unwrap(),
+            json!([5, 8])
+        );
+        for (source, input) in [
+            (".[]", json!([2, 5])),
+            (".[]", json!([])),
+            ("[.[]]", json!(null)),
+            ("select(false)", json!(2)),
+        ] {
+            assert!(evaluate(source, &input, &vars).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn new_filters_work_in_a_workflow_and_fail_as_expression_faults() {
+        let definition = crate::Definition::from_yaml(
+            r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: expressions
+  version: '0.1.0'
+do:
+  - transform:
+      input:
+        from: '[.items[] | select(.enabled) | .name | ascii_downcase]'
+      set:
+        names: '${ . | join(",") }'
+        count: '${ length }'
+      output:
+        as: 'if .count > 0 then .names else "empty" end'
+"#,
+        )
+        .unwrap();
+        let outcome = crate::start(
+            &definition,
+            &json!({"items": [
+                {"enabled": true, "name": "ALPHA"},
+                {"enabled": false, "name": "IGNORED"},
+                {"enabled": true, "name": "Beta"}
+            ]}),
+        );
+        assert!(
+            matches!(outcome, crate::Outcome::Completed { output, .. } if output == json!("alpha,beta"))
+        );
+        let outcome = crate::start(&definition, &json!({"items": 3}));
+        let crate::Outcome::Faulted { fault, .. } = outcome else {
+            panic!("expected an expression fault")
+        };
+        assert_eq!(fault.status(), 400);
+        assert_eq!(fault.instance(), "/do/0/transform");
+        assert_eq!(
+            fault.error_type(),
+            "https://open-workflow-specification.org/spec/1.0.0/errors/expression"
+        );
+    }
+
+    #[test]
+    fn unsupported_syntax_and_wrong_arity_remain_errors() {
+        for source in [
+            "reduce .[]",
+            "sort",
+            "map()",
+            "length(.)",
+            "has()",
+            "has(1; 2)",
+            ".[]?",
+            "if true then 1 else 2 end trailing",
+        ] {
+            assert!(
+                evaluate(source, &json!([]), &BTreeMap::new()).is_err(),
+                "{source}"
+            );
+        }
     }
 }
