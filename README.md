@@ -2,7 +2,7 @@
 
 Tideloom is a Rust runtime for the [Serverless Workflow DSL](https://github.com/serverlessworkflow/specification) (Open Workflow Specification 1.0).
 
-This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. `drive` performs a blocked `call: http` and resumes until the workflow stops elsewhere. It does not talk to a broker or store a run. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md).
+This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. `drive` performs a blocked `call: http` and resumes until the workflow stops elsewhere. That is `tideloom-core`, and it is pure. `tideloom-runtime` holds the traits for everything with side effects: the instance store, the wake-up bus, activity executors, definitions, events, and the clock, composed by an `Engine`. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md); the runtime traits are described in [docs/runtime-architecture.md](docs/runtime-architecture.md); the work queue is [docs/milestone-m2-single-process-runtime.md](docs/milestone-m2-single-process-runtime.md). Contributors and coding agents start at [AGENTS.md](AGENTS.md).
 
 ## Build
 
@@ -55,7 +55,10 @@ let _boundary = task.is_block_boundary();
 - Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`). A retry pause includes the computed wait. See [Retry backoff](#retry-backoff).
 - `tideloom_core::resume` takes the definition, the continuation, and a `Resume` event: `Output` or `Fault` for an effectful task, `Release` for `wait`, `listen`, `fork`, and a retry backoff, or `Tick` when only the clock moved. Inline tasks after the block run until the next boundary. Inline tasks before it do not run again.
 - The execution key is projected from the frames: `for` indexes, `try` attempts, and `then` jump passes (`loop:0/attempt:1`, `pass:2`). Two visits of the same task in different iterations, attempts, or passes have different keys, so a `then` that jumps back to a `call: http` polls instead of looping on a stale result.
-- `fork` branches and `listen.foreach` are not walked.
+- `Block::detail()` is the pause-specific data a runner needs: the `wait` duration, the `fork` branches, the `run: workflow` target with its evaluated input, or the `listen` subscription (static `with` attributes only; expressions, `correlate`, and `until` fault at block creation).
+- `tideloom_core::start_at` runs one task as its own root, which is how a runner starts a `fork` branch as a separate instance. The task output is the run output; `Continuation::root_task` says which task it was.
+- `Continuation::schema` is the persistence format version (`tideloom_core::SCHEMA`). A continuation written with another version is refused on resume.
+- `listen.foreach` is not walked.
 
 Expressions are a closed subset used by `if`, `switch.when`, `for.in`, `while`, `input.from`, `output.as`, `export.as`, and `${ ... }` inside `set`: paths, literals, comparisons, arithmetic, `and` / `or` / `not`, arrays, objects, and `|`. Full jq is not implemented.
 
