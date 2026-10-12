@@ -5,6 +5,10 @@ use serde::Serialize;
 
 use crate::InstanceId;
 
+mod local;
+
+pub use local::LocalWakeup;
+
 /// Position in the signal log. Monotonic per bus.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,

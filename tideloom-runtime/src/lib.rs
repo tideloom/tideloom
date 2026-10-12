@@ -62,6 +62,7 @@ pub use store::MemoryStore;
 pub use store::StoreError;
 pub use wakeup::BusError;
 pub use wakeup::Hint;
+pub use wakeup::LocalWakeup;
 pub use wakeup::Offset;
 pub use wakeup::Signal;
 pub use wakeup::SignalStream;
