@@ -2,7 +2,7 @@
 
 Tideloom is a Rust runtime for the [Serverless Workflow DSL](https://github.com/serverlessworkflow/specification) (Open Workflow Specification 1.0).
 
-This repository builds a workflow file into an immutable definition tree and re-walks that tree from the root. Resume state is a result log, not a node stack. The walk runs control flow inline and returns the next blocking or effectful block. `drive` performs a blocked `call: http`, writes the result into that log, and walks again. It does not talk to a broker or store a run. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md).
+This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. `drive` performs a blocked `call: http` and resumes until the workflow stops elsewhere. It does not talk to a broker or store a run. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md).
 
 ## Build
 
@@ -46,27 +46,33 @@ let task = definition.get("/do/0/validateOrder").unwrap();
 let _boundary = task.is_block_boundary();
 ```
 
-## Walk
+## Start and resume
 
-`tideloom_core::walk` takes a definition, the workflow input, and a `ResultLog`. It always starts at the root.
+`tideloom_core::start` takes a definition and the workflow input and runs from the root.
 
 - `set`, `do`, `switch`, `for`, `raise`, `try` (until a retry backoff), and `call` of a `use.functions` entry run inline.
-- The walk stops at the next block boundary and returns a `Block`: position, execution key, pause reason, transformed input, `$context`, and whether the block is effectful.
+- The run stops at the next block boundary and returns `Outcome::Blocked { block, continuation }`. The `Block` has the position, execution key, pause reason, transformed input, `$context`, and whether the block is effectful. The `Continuation` is everything needed to continue: `$context`, one frame per enclosing control-flow task, and the pending block. It implements `Serialize` / `Deserialize`; store it as the instance state.
 - Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`). A retry pause includes the computed wait. See [Retry backoff](#retry-backoff).
-- An effectful output or fault is stored with `ResultLog::record_output` / `record_fault`, keyed by position plus the ancestor `for` indexes and `try` attempts (`loop:0/attempt:1`). A later walk skips that task and continues with the logged value. Only those entries are `task_execution` results.
-- `wait`, `listen`, `fork`, and a retry backoff are not effectful. `ResultLog::release` marks them finished so the next walk can pass them. `fork` branches and `listen.foreach` are not walked.
+- `tideloom_core::resume` takes the definition, the continuation, and a `Resume` event: `Output` or `Fault` for an effectful task, `Release` for `wait`, `listen`, `fork`, and a retry backoff, or `Tick` when only the clock moved. Inline tasks after the block run until the next boundary. Inline tasks before it do not run again.
+- The execution key is projected from the frames: `for` indexes, `try` attempts, and `then` jump passes (`loop:0/attempt:1`, `pass:2`). Two visits of the same task in different iterations, attempts, or passes have different keys, so a `then` that jumps back to a `call: http` polls instead of looping on a stale result.
+- `fork` branches and `listen.foreach` are not walked.
 
 Expressions are a closed subset used by `if`, `switch.when`, `for.in`, `while`, `input.from`, `output.as`, `export.as`, and `${ ... }` inside `set`: paths, literals, comparisons, arithmetic, `and` / `or` / `not`, arrays, objects, and `|`. Full jq is not implemented.
 
 ```rust
-let outcome = tideloom_core::walk(&definition, &input, &log);
+let Outcome::Blocked { block, continuation } = tideloom_core::start(&definition, &input) else {
+    return;
+};
+let stored = serde_json::to_vec(&continuation)?;
+let restored: Continuation = serde_json::from_slice(&stored)?;
+let outcome = tideloom_core::resume(&definition, restored, Resume::Output(output));
 ```
 
 ## Retry backoff
 
-When `catch.retry` wants another try, `walk` returns `Pause::Retry` and stops. It does not sleep. `attempt` is the zero-based try that just failed. `delay` is the wait before the next one.
+When `catch.retry` wants another try, the run returns `Pause::Retry` and stops. It does not sleep. `attempt` is the zero-based try that just failed. `delay` is the wait before the next one.
 
-`Pause::retry_at(started_at)` is `started_at + delay`. The runner keeps `started_at` from the moment it first observed that pause. A later walk with the same inputs returns the same delay; it does not move `started_at`. `ResultLog::release` on the pause key makes the next walk run the try body under the next attempt key (`attempt:1`, and so on).
+`Pause::retry_at(started_at)` is `started_at + delay`. The runner keeps `started_at` on the continuation with `Continuation::start_task`. The delay is computed once, when the pause is created, and stored on the continuation; a later `Resume::Tick` returns the same pause. `Resume::Release` on that continuation runs the try body under the next attempt key (`attempt:1`, and so on).
 
 | Backoff | Wait |
 | --- | --- |
@@ -74,25 +80,25 @@ When `catch.retry` wants another try, `walk` returns `Pause::Retry` and stops. I
 | `linear` | `delay + increment * attempt`. A missing `increment` defaults to `delay`, so the waits are `delay`, `2 * delay`, `3 * delay`, ... |
 | `exponential` | `delay * 2^attempt`, exponent capped at 32. The first retry waits `delay`, then the wait doubles. |
 
-A missing `delay` is 0, and the walk still pauses so the attempt key can advance on release. `delay` is an ISO 8601 string (`PT3S`; a year is 365 days and a month is 30 days), an object (`days`, `hours`, `minutes`, `seconds`, `milliseconds`), or a `${ ... }` expression that evaluates to an ISO 8601 string.
+A missing `delay` is 0, and the run still pauses so the attempt key can advance on release. `delay` is an ISO 8601 string (`PT3S`; a year is 365 days and a month is 30 days), an object (`days`, `hours`, `minutes`, `seconds`, `milliseconds`), or a `${ ... }` expression that evaluates to an ISO 8601 string.
 
-`jitter.from` and `jitter.to` are added after the backoff. `walk` uses `from`, so the delay does not change between walks. `walk_with` and `WalkOptions::with_jitter` pick another point: `JitterSample::FROM` is `from`, `JitterSample::TO` is `to`, and `JitterSample::new(parts_per_million)` is a point in between. Pass the same sample every time that pause is recomputed.
+`jitter.from` and `jitter.to` are added after the backoff. `start` and `resume` use `from`. `start_with`, `resume_with`, and `WalkOptions::with_jitter` pick another point: `JitterSample::FROM` is `from`, `JitterSample::TO` is `to`, and `JitterSample::new(parts_per_million)` is a point in between. The sample is read when the pause is created.
 
-`limit.attempt.count` is unchanged. `limit.attempt.duration` is how long one attempt's paused task may run, from `start_task` on that task. `limit.duration` is how long retries may continue, from `start_task` on the first retry pause. Both use `WalkOptions::with_now` and fault or stop with the same clock as timeouts; neither sleeps. Without `now`, or before the start is recorded, they are not enforced. `drive` returns the retry pause instead of waiting.
+`limit.attempt.count` is unchanged. `limit.attempt.duration` is how long one attempt's paused task may run, from the task start of that block. `limit.duration` is how long retries may continue, from the task start of the first retry pause. Both are checked on `Resume::Tick` against `WalkOptions::with_now` and fault or stop with the same clock as timeouts; neither sleeps. Without `now`, or before the start is recorded, they are not enforced. `drive` returns the retry pause instead of waiting.
 
 ## Timeouts
 
-`timeout.after` on the workflow or on a task is a duration: an ISO 8601 string, an object (`days`, `hours`, `minutes`, `seconds`, `milliseconds`), a `${ ... }` expression that evaluates to an ISO 8601 string, or the name of an entry in `use.timeouts`. The walk does not sleep.
+`timeout.after` on the workflow or on a task is a duration: an ISO 8601 string, an object (`days`, `hours`, `minutes`, `seconds`, `milliseconds`), a `${ ... }` expression that evaluates to an ISO 8601 string, or the name of an entry in `use.timeouts`. The run does not sleep.
 
-Record the start with `ResultLog::start_workflow` or `ResultLog::start_task` (the block key). The first instant stays. Pass that clock reading to `WalkOptions::with_now`. When `now` is at or past the start plus `after`, the walk returns a timeout fault: status 408, type `https://open-workflow-specification.org/spec/1.0.0/errors/timeout`. A workflow timeout is instance `/`. A task timeout is the task's JSON Pointer, so `try` can catch it. A logged output or a released pause is kept.
+Starts live on the continuation. `start_with` a `now` records the workflow start, and a new block records the task start; `Continuation::start_workflow` and `Continuation::start_task` set them when the run had no clock. The first instant stays. Pass the current clock reading to `WalkOptions::with_now` and resume with `Resume::Tick`. When `now` is at or past the start plus `after`, the run returns a timeout fault: status 408, type `https://open-workflow-specification.org/spec/1.0.0/errors/timeout`. A workflow timeout is instance `/` and is checked on every resume. A task timeout is the task's JSON Pointer, so `try` can catch it. An `Output` or `Release` that arrives after the deadline is kept.
 
-`Block::timeout` is the task duration. `Block::timeout_at(started_at)` is the deadline. `walk` without `now` still returns the block and does not enforce the deadline. `drive_with` uses the same clock and faults before it sends an HTTP call that has already timed out.
+`Block::timeout` is the task duration. `Block::timeout_at(started_at)` is the deadline. A resume without `now` still returns the block and does not enforce the deadline. `drive_from` ticks first and faults before it sends an HTTP call that has already timed out.
 
 `Fault::configuration`, `validation`, `authentication`, `authorization`, and `timeout` are the standard error types from the DSL, alongside the existing expression, communication, and runtime faults.
 
 ## HTTP call
 
-`tideloom_core::drive` re-walks until the workflow completes, faults, or stops on a block that is not `call: http`. For each HTTP activity it sends the request and stores the raw output with `ResultLog::record_output`, or the fault with `record_fault`. The next walk applies `output.as`, `export.as`, and `try`.
+`tideloom_core::drive` starts the workflow and resumes until it completes, faults, or stops on a block that is not `call: http`. For each HTTP activity it sends the request and resumes with `Resume::Output` or `Resume::Fault`, so `output.as`, `export.as`, and `try` see the result. `drive_from` does the same from a stored continuation.
 
 `with` accepts:
 
@@ -107,10 +113,10 @@ Record the start with `ResultLog::start_workflow` or `ResultLog::start_task` (th
 
 `content` is parsed JSON when the response content type is JSON, a string for other text, and null when the body is empty. `response` is `{ request, statusCode, headers, content }`. Status codes outside 200–299 become a communication fault and are not returned as output. Redirects are not followed.
 
-Not in this slice: `output: raw`, endpoint authentication, HTTPS, URI-template operators other than `{name}`, gRPC, OpenAPI, AsyncAPI, brokers, and a database. The HTTP client keeps its own 10 second cap. Workflow and task timeouts are the walk's clock, described above.
+Not in this slice: `output: raw`, endpoint authentication, HTTPS, URI-template operators other than `{name}`, gRPC, OpenAPI, AsyncAPI, brokers, and a database. The HTTP client keeps its own 10 second cap. Workflow and task timeouts are the run's clock, described above.
 
 ```rust
-let outcome = tideloom_core::drive(&definition, &input, &mut log);
+let outcome = tideloom_core::drive(&definition, &input);
 ```
 
 The workspace layout matches this repository's existing FastLabs-style shape: one library crate, `tideloom-core`, beside the virtual-workspace `Cargo.toml`, with `rustfmt.toml`, `taplo.toml`, and `.github/workflows/ci.yml`.

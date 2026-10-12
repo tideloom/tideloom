@@ -1,15 +1,17 @@
 use std::time::Duration;
 
 use serde_json::json;
+use tideloom_core::Continuation;
 use tideloom_core::Definition;
 use tideloom_core::Fault;
 use tideloom_core::Outcome;
-use tideloom_core::ResultLog;
+use tideloom_core::Resume;
 use tideloom_core::Timestamp;
 use tideloom_core::WalkOptions;
-use tideloom_core::drive_with;
-use tideloom_core::walk;
-use tideloom_core::walk_with;
+use tideloom_core::drive_from;
+use tideloom_core::resume_with;
+use tideloom_core::start;
+use tideloom_core::start_with;
 
 const TIMEOUT_TYPE: &str = "https://open-workflow-specification.org/spec/1.0.0/errors/timeout";
 
@@ -24,9 +26,12 @@ fn document(head: &str, tasks: &str) -> Definition {
     Definition::from_yaml(&yaml).unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn blocked(outcome: Outcome) -> tideloom_core::Block {
+fn blocked(outcome: Outcome) -> (tideloom_core::Block, Continuation) {
     match outcome {
-        Outcome::Blocked { block } => block,
+        Outcome::Blocked {
+            block,
+            continuation,
+        } => (block, continuation),
         other => panic!("expected a block, got {other:?}"),
     }
 }
@@ -88,20 +93,61 @@ fn a_workflow_timeout_faults_at_the_deadline_without_sleeping() {
 "#,
     );
     let started = Timestamp::from_millis(5_000);
-    let mut log = ResultLog::new();
-    log.start_workflow(started);
-    log.start_workflow(Timestamp::from_millis(9_000));
-    assert_eq!(log.workflow_started(), Some(started));
-
-    let waiting = blocked(walk_with(&definition, &json!({}), &log, at(5_000 + 29_999)));
+    let (waiting, mut continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(waiting.position(), "/do/0/pause");
     assert!(waiting.timeout().is_none());
+    assert_eq!(continuation.workflow_started(), None);
+    continuation.start_workflow(started);
+    continuation.start_workflow(Timestamp::from_millis(9_000));
+    assert_eq!(continuation.workflow_started(), Some(started));
 
-    let fault = faulted(walk_with(&definition, &json!({}), &log, at(5_000 + 30_000)));
+    let (waiting, continuation) = blocked(resume_with(
+        &definition,
+        continuation,
+        Resume::Tick,
+        at(5_000 + 29_999),
+    ));
+    assert_eq!(waiting.position(), "/do/0/pause");
+
+    let fault = faulted(resume_with(
+        &definition,
+        continuation,
+        Resume::Tick,
+        at(5_000 + 30_000),
+    ));
     assert_eq!(fault.error_type(), TIMEOUT_TYPE);
     assert_eq!(fault.status(), 408);
     assert_eq!(fault.instance(), "/");
     assert_eq!(fault.detail(), Some("timed out after 30000ms"));
+}
+
+#[test]
+fn start_with_a_clock_records_the_workflow_start() {
+    let definition = document(
+        "timeout:\n  after: PT1S\n",
+        r#"
+  - pause:
+      wait: {}
+"#,
+    );
+    let (_, continuation) = blocked(start_with(&definition, &json!({}), at(10)));
+    assert_eq!(
+        continuation.workflow_started(),
+        Some(Timestamp::from_millis(10))
+    );
+    let (_, continuation) = blocked(resume_with(
+        &definition,
+        continuation,
+        Resume::Tick,
+        at(1_009),
+    ));
+    let fault = faulted(resume_with(
+        &definition,
+        continuation,
+        Resume::Tick,
+        at(1_010),
+    ));
+    assert_eq!(fault.instance(), "/");
 }
 
 #[test]
@@ -115,35 +161,29 @@ use:
 timeout: quick
 "#,
         r#"
-  - paint:
-      set:
-        color: red
+  - pause:
+      wait: {}
 "#,
     );
-    let mut log = ResultLog::new();
-    log.start_workflow(Timestamp::from_millis(0));
-    let (output, _) = match walk_with(&named, &json!({}), &log, at(999)) {
-        Outcome::Completed { output, context } => (output, context),
-        other => panic!("expected completion, got {other:?}"),
-    };
-    assert_eq!(output["color"], "red");
-    let fault = faulted(walk_with(&named, &json!({}), &log, at(1_000)));
+    let (_, mut continuation) = blocked(start(&named, &json!({})));
+    continuation.start_workflow(Timestamp::from_millis(0));
+    let (_, continuation) = blocked(resume_with(&named, continuation, Resume::Tick, at(999)));
+    let fault = faulted(resume_with(&named, continuation, Resume::Tick, at(1_000)));
     assert_eq!(fault.instance(), "/");
 
     let expressed = document(
         "timeout:\n  after: ${ .limit }\n",
         r#"
-  - paint:
-      set:
-        color: red
+  - pause:
+      wait: {}
 "#,
     );
-    let mut log = ResultLog::new();
-    log.start_workflow(Timestamp::from_millis(10));
-    let fault = faulted(walk_with(
+    let (_, mut continuation) = blocked(start(&expressed, &json!({"limit": "PT2S"})));
+    continuation.start_workflow(Timestamp::from_millis(10));
+    let fault = faulted(resume_with(
         &expressed,
-        &json!({"limit": "PT2S"}),
-        &log,
+        continuation,
+        Resume::Tick,
         at(2_010),
     ));
     assert_eq!(fault.detail(), Some("timed out after 2000ms"));
@@ -174,30 +214,35 @@ fn a_task_timeout_is_caught_and_a_finished_call_is_kept() {
                 ok: true
 "#,
     );
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &log));
+    let (call, mut continuation) = blocked(start(&definition, &json!({})));
     assert_eq!(call.position(), "/do/0/attempt/try/0/callPay");
     assert_eq!(call.timeout(), Some(Duration::from_millis(5)));
     let started = Timestamp::from_millis(100);
     assert_eq!(call.timeout_at(started), Some(Timestamp::from_millis(105)));
-    log.start_task(call.key().clone(), started);
-    log.start_task(call.key().clone(), Timestamp::from_millis(1_000));
-    assert_eq!(log.task_started(call.key()), Some(started));
+    continuation.start_task(started);
+    continuation.start_task(Timestamp::from_millis(1_000));
+    assert_eq!(continuation.task_started(), Some(started));
 
-    let still = blocked(walk_with(&definition, &json!({}), &log, at(104)));
+    let (still, continuation) = blocked(resume_with(
+        &definition,
+        continuation,
+        Resume::Tick,
+        at(104),
+    ));
     assert_eq!(still.key(), call.key());
 
-    let (output, _) = match walk_with(&definition, &json!({}), &log, at(105)) {
+    let (output, _) = match resume_with(&definition, continuation.clone(), Resume::Tick, at(105)) {
         Outcome::Completed { output, context } => (output, context),
         other => panic!("expected the catch, got {other:?}"),
     };
     assert_eq!(output, json!({"ok": true}));
 
-    let mut done = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &done));
-    done.record_output(call.key().clone(), json!({"paid": true}));
-    done.start_task(call.key().clone(), started);
-    let (output, _) = match walk_with(&definition, &json!({}), &done, at(105)) {
+    let (output, _) = match resume_with(
+        &definition,
+        continuation,
+        Resume::Output(json!({"paid": true})),
+        at(105),
+    ) {
         Outcome::Completed { output, context } => (output, context),
         other => panic!("expected the recorded output, got {other:?}"),
     };
@@ -218,13 +263,11 @@ fn drive_faults_a_timed_out_call_before_connecting() {
           milliseconds: 1
 "#,
     );
-    let mut log = ResultLog::new();
-    let call = blocked(walk(&definition, &json!({}), &log));
-    log.start_task(call.key().clone(), Timestamp::from_millis(0));
-    let fault = faulted(drive_with(&definition, &json!({}), &mut log, at(1)));
+    let (_, mut continuation) = blocked(start(&definition, &json!({})));
+    continuation.start_task(Timestamp::from_millis(0));
+    let fault = faulted(drive_from(&definition, continuation, at(1)));
     assert_eq!(fault.error_type(), TIMEOUT_TYPE);
     assert_eq!(fault.instance(), "/do/0/callPay");
-    assert!(log.effect(call.key()).is_none());
 }
 
 #[test]
@@ -237,7 +280,7 @@ fn a_bad_timeout_faults_instead_of_pausing() {
       timeout: {}
 "#,
     );
-    let fault = faulted(walk(&missing, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&missing, &json!({})));
     assert_eq!(fault.instance(), "/do/0/pause");
     assert!(
         fault.detail().unwrap_or("").contains("timeout.after"),
@@ -252,7 +295,7 @@ fn a_bad_timeout_faults_instead_of_pausing() {
         color: red
 "#,
     );
-    let fault = faulted(walk(&unknown, &json!({}), &ResultLog::new()));
+    let fault = faulted(start(&unknown, &json!({})));
     assert_eq!(fault.instance(), "/");
     assert!(
         fault.detail().unwrap_or("").contains("unknown timeout"),
