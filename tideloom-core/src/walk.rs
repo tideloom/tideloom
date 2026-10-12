@@ -39,6 +39,8 @@ use crate::continuation::ForFrame;
 use crate::continuation::Frame;
 use crate::continuation::FunctionFrame;
 use crate::continuation::Pending;
+use crate::continuation::Root;
+use crate::continuation::SCHEMA;
 use crate::continuation::SeqFrame;
 use crate::continuation::TryFrame;
 use crate::continuation::TryPhase;
@@ -49,6 +51,12 @@ use crate::key::ExecutionKey;
 use crate::retry::duration_millis;
 use crate::retry::retry_spec;
 use crate::retry::wait_ms;
+use crate::spec::BlockDetail;
+use crate::spec::Branch;
+use crate::spec::ChildRef;
+use crate::spec::EventFilter;
+use crate::spec::ListenSpec;
+use crate::spec::ListenStrategy;
 
 /// Stop an inline loop that never reaches a block boundary.
 const MAX_INLINE_STEPS: u32 = 10_000;
@@ -100,6 +108,7 @@ pub struct Block {
     effectful: bool,
     kind: NodeKind,
     timeout: Option<Duration>,
+    detail: BlockDetail,
 }
 
 impl Block {
@@ -162,6 +171,13 @@ impl Block {
     #[must_use]
     pub fn timeout_at(&self, started_at: Timestamp) -> Option<Timestamp> {
         self.timeout.map(|after| started_at.saturating_add(after))
+    }
+
+    /// Pause-specific data: the `wait` duration, `fork` branches, the child
+    /// workflow, or the `listen` subscription.
+    #[must_use]
+    pub fn detail(&self) -> &BlockDetail {
+        &self.detail
     }
 }
 
@@ -340,6 +356,7 @@ pub fn start_with(definition: &Definition, input: &Value, options: WalkOptions) 
     let mut interpreter = Interpreter::new(
         definition,
         State {
+            root: Root::Workflow,
             workflow_input: input.clone(),
             context: Map::new(),
             frames: Vec::new(),
@@ -416,6 +433,8 @@ pub fn resume_with(
     options: WalkOptions,
 ) -> Outcome {
     let Continuation {
+        schema,
+        root,
         workflow_input,
         context,
         frames,
@@ -423,9 +442,19 @@ pub fn resume_with(
         workflow_started,
         task_started,
     } = continuation;
+    if schema != SCHEMA {
+        return Outcome::Faulted {
+            fault: Fault::configuration(
+                &pending.position,
+                format!("continuation schema {schema} is not supported, expected {SCHEMA}"),
+            ),
+            context: Value::Object(context),
+        };
+    }
     let mut interpreter = Interpreter::new(
         definition,
         State {
+            root,
             workflow_input,
             context,
             frames,
@@ -440,7 +469,50 @@ pub fn resume_with(
     interpreter.run(first)
 }
 
+/// Run one task of `definition` as its own root, for example a `fork` branch.
+///
+/// The task's transformed output is the run output. Workflow `input.from`,
+/// `output.as`, and `timeout` do not apply. A `then` that names a sibling
+/// faults, since the task has none here.
+#[must_use]
+pub fn start_at(definition: &Definition, position: &str, input: &Value) -> Outcome {
+    start_at_with(definition, position, input, WalkOptions::default())
+}
+
+/// [`start_at`] with an explicit jitter sample and clock reading.
+#[must_use]
+pub fn start_at_with(
+    definition: &Definition,
+    position: &str,
+    input: &Value,
+    options: WalkOptions,
+) -> Outcome {
+    let interpreter = Interpreter::new(
+        definition,
+        State {
+            root: Root::Task {
+                position: position.to_string(),
+            },
+            workflow_input: input.clone(),
+            context: Map::new(),
+            frames: Vec::new(),
+            workflow_started: options.now,
+            task_started: None,
+        },
+        options,
+    );
+    let first = interpreter.node(position).map(|node| Action::Enter {
+        node,
+        input: input.clone(),
+    });
+    interpreter.run(first)
+}
+
 /// What the interpreter does next.
+///
+/// `Stop` carries a whole `Block`; one is built per stop, so the variant size
+/// difference is accepted.
+#[allow(clippy::large_enum_variant)]
 enum Action<'a> {
     /// Run `node` with its raw input.
     Enter { node: &'a Node, input: Value },
@@ -462,6 +534,7 @@ enum Up {
     Released,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Stop {
     Completed { output: Value },
     Faulted { fault: Fault },
@@ -491,6 +564,7 @@ enum Decision {
 
 /// The parts of a run that survive a stop.
 struct State {
+    root: Root,
     workflow_input: Value,
     context: Map<String, Value>,
     frames: Vec<Frame>,
@@ -552,6 +626,8 @@ impl<'a> Interpreter<'a> {
             Stop::Blocked { block, pending } => Outcome::Blocked {
                 block,
                 continuation: Continuation {
+                    schema: SCHEMA,
+                    root: self.state.root,
                     workflow_input: self.state.workflow_input,
                     context: self.state.context,
                     frames: self.state.frames,
@@ -577,6 +653,21 @@ impl<'a> Interpreter<'a> {
     }
 
     fn deliver_to_root(&mut self, up: Up) -> Result<Action<'a>, Fault> {
+        if let Root::Task { position } = &self.state.root {
+            return match up {
+                Up::Task { output, directive } => match directive {
+                    Directive::Jump(name) => Err(Fault::runtime(
+                        position,
+                        format!("no sibling task `{name}`"),
+                    )),
+                    Directive::Continue | Directive::Exit | Directive::End => {
+                        Ok(Action::Stop(Stop::Completed { output }))
+                    }
+                },
+                Up::Fault(fault) => Ok(Action::Stop(Stop::Faulted { fault })),
+                Up::Seq(_) | Up::Released => Err(internal(position, "no frame to receive a list")),
+            };
+        }
         match up {
             Up::Seq(flow) => {
                 let raw = match flow {
@@ -783,6 +874,7 @@ impl<'a> Interpreter<'a> {
 
     fn block(&self, node: &Node, pending: &Pending) -> Result<Block, Fault> {
         let timeout = self.task_timeout(node, &pending.input)?;
+        let detail = self.detail(node, pending)?;
         Ok(Block {
             key: TaskKey::new(node.position(), self.execution_key()),
             name: node.name().map(str::to_string),
@@ -792,6 +884,89 @@ impl<'a> Interpreter<'a> {
             effectful: node.effectful(),
             kind: node.kind().clone(),
             timeout,
+            detail,
+        })
+    }
+
+    // ========================================
+    // Block detail
+    // ========================================
+
+    fn detail(&self, node: &Node, pending: &Pending) -> Result<BlockDetail, Fault> {
+        Ok(match pending.pause {
+            Pause::Activity | Pause::Retry { .. } => BlockDetail::None,
+            Pause::Timer => BlockDetail::Wait {
+                after: self.wait_after(node, &pending.input)?,
+            },
+            Pause::Join { .. } => BlockDetail::Branches(
+                node.children()
+                    .iter()
+                    .map(|child| Branch {
+                        position: child.position().to_string(),
+                        name: child.name().unwrap_or_default().to_string(),
+                    })
+                    .collect(),
+            ),
+            Pause::Child => BlockDetail::Child(self.child_ref(node, &pending.input)?),
+            Pause::Events => BlockDetail::Listen(listen_spec(node)?),
+        })
+    }
+
+    /// The `wait` duration. An empty `wait: {}` is zero.
+    fn wait_after(&self, node: &Node, input: &Value) -> Result<Duration, Fault> {
+        match node.body().get("wait") {
+            None => Ok(Duration::ZERO),
+            Some(Value::Object(object)) if object.is_empty() => Ok(Duration::ZERO),
+            Some(value) => {
+                let millis = self.duration_of(value, node.position(), Some(node), input)?;
+                Ok(Duration::from_millis(millis))
+            }
+        }
+    }
+
+    fn child_ref(&self, node: &Node, input: &Value) -> Result<ChildRef, Fault> {
+        let run = node
+            .body()
+            .get("run")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Fault::runtime(node.position(), "run task is missing `run`"))?;
+        let workflow = run
+            .get("workflow")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Fault::runtime(node.position(), "run.workflow must be an object"))?;
+        let field = |name: &str| -> Result<String, Fault> {
+            match workflow.get(name) {
+                Some(Value::String(text)) => Ok(text.clone()),
+                _ => Err(Fault::runtime(
+                    node.position(),
+                    format!("run.workflow.{name} must be a string"),
+                )),
+            }
+        };
+        let child_input = match workflow.get("input") {
+            None => input.clone(),
+            Some(template) => {
+                let vars = self.scope(Some(node), input, None);
+                evaluate_data(template, input, &vars)
+                    .map_err(|message| Fault::expression(node.position(), message))?
+            }
+        };
+        let await_result = match run.get("await") {
+            None => true,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                return Err(Fault::runtime(
+                    node.position(),
+                    "run.await must be a boolean",
+                ));
+            }
+        };
+        Ok(ChildRef {
+            namespace: field("namespace")?,
+            name: field("name")?,
+            version: field("version")?,
+            input: child_input,
+            await_result,
         })
     }
 
@@ -1682,6 +1857,98 @@ impl<'a> Interpreter<'a> {
         }
         Ok(())
     }
+}
+
+/// Static `listen.to` filters. Expressions, `correlate`, and `until` are not supported yet.
+fn listen_spec(node: &Node) -> Result<ListenSpec, Fault> {
+    let position = node.position();
+    let unsupported =
+        |what: &str| Fault::configuration(position, format!("listen {what} is not supported"));
+    let listen = node
+        .body()
+        .get("listen")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Fault::runtime(position, "listen task is missing `listen`"))?;
+    let read = match listen.get("read") {
+        None => "data".to_string(),
+        Some(Value::String(mode)) if matches!(mode.as_str(), "data" | "envelope" | "raw") => {
+            mode.clone()
+        }
+        Some(_) => {
+            return Err(Fault::runtime(
+                position,
+                "listen.read must be data, envelope, or raw",
+            ));
+        }
+    };
+    let to = listen
+        .get("to")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Fault::runtime(position, "listen.to must be an object"))?;
+    if to.contains_key("until") {
+        return Err(unsupported("to.until"));
+    }
+    let mut chosen = None;
+    for (key, strategy) in [
+        ("one", ListenStrategy::One),
+        ("any", ListenStrategy::Any),
+        ("all", ListenStrategy::All),
+    ] {
+        if let Some(value) = to.get(key) {
+            if chosen.is_some() {
+                return Err(Fault::runtime(
+                    position,
+                    "listen.to must set only one of one, any, or all",
+                ));
+            }
+            chosen = Some((key, strategy, value));
+        }
+    }
+    let Some((key, strategy, value)) = chosen else {
+        return Err(Fault::runtime(
+            position,
+            "listen.to must set one of one, any, or all",
+        ));
+    };
+    let raw_filters: Vec<&Value> = match (strategy, value) {
+        (ListenStrategy::One, Value::Object(_)) => vec![value],
+        (ListenStrategy::Any | ListenStrategy::All, Value::Array(items)) => items.iter().collect(),
+        _ => {
+            return Err(Fault::runtime(
+                position,
+                format!("listen.to.{key} has the wrong shape"),
+            ));
+        }
+    };
+    let mut filters = Vec::with_capacity(raw_filters.len());
+    for raw in raw_filters {
+        let filter = raw
+            .as_object()
+            .ok_or_else(|| Fault::runtime(position, "listen filter must be an object"))?;
+        if filter.contains_key("correlate") {
+            return Err(unsupported("correlate"));
+        }
+        let with = filter
+            .get("with")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Fault::runtime(position, "listen filter must have `with`"))?;
+        let mut attributes = BTreeMap::new();
+        for (name, value) in with {
+            let Value::String(text) = value else {
+                return Err(unsupported("filters with non-string attributes"));
+            };
+            if runtime_expression(text).is_some() {
+                return Err(unsupported("expression filters"));
+            }
+            attributes.insert(name.clone(), text.clone());
+        }
+        filters.push(EventFilter { attributes });
+    }
+    Ok(ListenSpec {
+        strategy,
+        filters,
+        read,
+    })
 }
 
 /// A `try` node's children are the `try` list followed by the `catch.do` list.

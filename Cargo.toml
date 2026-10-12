@@ -1,5 +1,5 @@
 [workspace]
-members = ["tideloom-core"]
+members = ["tideloom-core", "tideloom-runtime"]
 resolver = "2"
 
 [workspace.package]

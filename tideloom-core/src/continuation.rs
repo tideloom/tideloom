@@ -20,6 +20,9 @@ use crate::key::ExecutionKey;
 use crate::key::TaskKey;
 use crate::walk::Pause;
 
+/// Persistence format of [`Continuation`]. Bump it when a frame changes shape.
+pub const SCHEMA: u16 = 1;
+
 /// Which task list a [`SeqFrame`] runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Body {
@@ -137,6 +140,18 @@ impl Frame {
     }
 }
 
+/// What the run was started on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum Root {
+    /// The workflow itself: `input.from`, `output.as`, and `timeout` apply.
+    Workflow,
+    /// A single task, started with [`start_at`](crate::start_at). Its output is the run output.
+    Task {
+        /// JSON Pointer of the task.
+        position: String,
+    },
+}
+
 /// The block a run stopped on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Pending {
@@ -151,6 +166,8 @@ pub(crate) struct Pending {
 /// equal when they would resume identically.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Continuation {
+    pub(crate) schema: u16,
+    pub(crate) root: Root,
     pub(crate) workflow_input: Value,
     pub(crate) context: Map<String, Value>,
     pub(crate) frames: Vec<Frame>,
@@ -160,6 +177,23 @@ pub struct Continuation {
 }
 
 impl Continuation {
+    /// Persistence format this value was written with. See [`SCHEMA`].
+    #[must_use]
+    pub fn schema(&self) -> u16 {
+        self.schema
+    }
+
+    /// The task this run was started on with [`start_at`](crate::start_at), if any.
+    ///
+    /// `None` means the run started at the workflow root.
+    #[must_use]
+    pub fn root_task(&self) -> Option<&str> {
+        match &self.root {
+            Root::Workflow => None,
+            Root::Task { position } => Some(position),
+        }
+    }
+
     /// JSON Pointer of the pending block.
     #[must_use]
     pub fn position(&self) -> &str {
