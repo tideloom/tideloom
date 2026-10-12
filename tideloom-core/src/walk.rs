@@ -412,7 +412,7 @@ pub fn start_with(definition: &Definition, input: &Value, options: WalkOptions) 
 /// let Outcome::Completed { output, .. } = outcome else {
 ///     panic!("expected completion");
 /// };
-/// assert_eq!(output, serde_json::json!({"sent": true, "sealed": true}));
+/// assert_eq!(output, serde_json::json!({"sealed": true}));
 /// ```
 #[must_use]
 pub fn resume(definition: &Definition, continuation: Continuation, event: Resume) -> Outcome {
@@ -828,9 +828,11 @@ impl<'a> Interpreter<'a> {
                 "`set` must evaluate to an object",
             ));
         };
+        // The task output is exactly the evaluated `set` object. Input keys
+        // that were not assigned are not copied forward.
         let (output, directive) = self.done(
             node,
-            merge_object(input, assigned),
+            Value::Object(assigned),
             input,
             directive_of(node.then()),
         )?;
@@ -853,7 +855,11 @@ impl<'a> Interpreter<'a> {
                 return Ok(Action::Up(Up::Task { output, directive }));
             }
         }
-        Err(Fault::expression(node.position(), "no switch case matched"))
+        // No case matched. The switch finishes with its input and follows its
+        // own `then`, which is `continue` when the task omits one.
+        let (output, directive) =
+            self.done(node, input.clone(), input, directive_of(node.then()))?;
+        Ok(Action::Up(Up::Task { output, directive }))
     }
 
     fn block_at(
@@ -1379,9 +1385,8 @@ impl<'a> Interpreter<'a> {
                     "export.as must produce an object",
                 ));
             };
-            for (key, value) in exported {
-                self.state.context.insert(key, value);
-            }
+            // `export.as` replaces `$context`. Accumulate with `$context + {...}`.
+            self.state.context = exported;
         }
         Ok((output, directive))
     }
@@ -1987,17 +1992,6 @@ fn catch_directive(node: &Node) -> Directive {
         Some(Value::String(text)) => directive_of(&FlowDirective::parse(text)),
         _ => directive_of(node.then()),
     }
-}
-
-fn merge_object(input: &Value, assigned: Map<String, Value>) -> Value {
-    let mut base = match input {
-        Value::Object(object) => object.clone(),
-        _ => Map::new(),
-    };
-    for (key, value) in assigned {
-        base.insert(key, value);
-    }
-    Value::Object(base)
 }
 
 fn optional_string<'a>(

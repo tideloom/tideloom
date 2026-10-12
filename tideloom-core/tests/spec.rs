@@ -161,6 +161,7 @@ fn start_at_runs_a_branch_as_its_own_root() {
                       lane: ship
           - fly:
               set:
+                order: ${ .order }
                 lane: fly
 "#,
     );
@@ -186,7 +187,7 @@ fn start_at_runs_a_branch_as_its_own_root() {
     ) else {
         panic!("expected the branch to complete");
     };
-    assert_eq!(output, json!({"sent": true, "lane": "ship"}));
+    assert_eq!(output, json!({"lane": "ship"}));
 
     let Outcome::Completed { output, .. } = start_at(
         &definition,

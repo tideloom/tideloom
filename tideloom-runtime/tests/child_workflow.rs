@@ -161,6 +161,7 @@ fn receipt() -> Definition {
         r#"
   - stamp:
       set:
+        orderId: ${ .orderId }
         receipt: ${ .orderId }
 "#,
     )
@@ -184,6 +185,8 @@ fn an_awaited_child_completes_and_the_parent_continues_with_its_output() {
             orderId: ${ .id }
   - seal:
       set:
+        orderId: ${ .orderId }
+        receipt: ${ .receipt }
         sealed: ${ .receipt }
 "#,
         ),
@@ -194,7 +197,8 @@ fn an_awaited_child_completes_and_the_parent_continues_with_its_output() {
 
     let parent = block_on(harness.store.get(&id)).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(parent.status, Status::Completed);
-    // The child output replaces the parent input. `set` merges onto that.
+    // The child output replaces the parent input. `set` returns only the
+    // keys it assigns, so the seal task names the ones it keeps.
     assert_eq!(
         parent.output,
         Some(json!({"orderId": 7, "receipt": 7, "sealed": 7}))
@@ -205,8 +209,9 @@ fn an_awaited_child_completes_and_the_parent_continues_with_its_output() {
     assert_eq!(children.len(), 1);
     let child = &children[0];
     assert_eq!(child.status, Status::Completed);
-    // The child keeps the workflow input it was given. The parent input's
-    // `id` is not part of that object; `receipt` is computed from `orderId`.
+    // The child output is only the keys its `set` assigned. The parent
+    // input's `id` is not part of that object; `receipt` is computed from
+    // `orderId`.
     assert_eq!(child.output, Some(json!({"orderId": 7, "receipt": 7})));
     assert_eq!(child.input, json!({"orderId": 7}));
     assert!(
