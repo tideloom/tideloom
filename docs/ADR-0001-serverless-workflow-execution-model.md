@@ -8,6 +8,8 @@ Accepted
 
 修订：2026-10-12。实现曾以 `ResultLog` 从根重放来恢复（见备选 B），本次回到第 3 节的显式续体，并补上 `then` 跳转的 `pass` 计数。
 
+修订：2026-10-12（M2 MR-0）。第 9 节的三个 trait 落在独立 crate `tideloom-runtime`，`tideloom-core` 不依赖它们；续体带 `schema` 版本号；Open Question 1 定案为"标记未知，不自动重做"。里程碑拆分见 `docs/milestone-m2-single-process-runtime.md`。
+
 ## Context
 
 我们要实现一个 Serverless Workflow DSL v1.0 的运行时。最初的设想是把 YAML 编译成若干 Block，构建依赖树，把 Block 分发给 worker 执行并收集耗时。在对比 Airflow、Prefect、Dagster、DBOS、Temporal、Restate 以及 Lemline 之后，需要回答三个问题：
@@ -57,7 +59,7 @@ Block 定义为一次运行中，从一个恢复点开始、到下一个不可�
 
 ### 3. 状态层：显式续体 + 每个 Block 一次 checkpoint
 
-执行状态是一个显式的、可序列化的续体 `Continuation`：`$context`、每个外围控制流任务一帧、以及停下来的那个 Block。它是一个值，序列化后存进 `workflow_instance`，恢复时原样交回解释器，从停下的位置继续。不采用 replay 式恢复：replay 是宿主语言调用栈不可序列化时才需要付的代价，DSL 解释器的栈天生是数据，直接快照即可，也不必承担"inline 任务必须确定性"的约束。
+执行状态是一个显式的、可序列化的续体 `Continuation`：`$context`、每个外围控制流任务一帧、以及停下来的那个 Block。它是一个值，带 `schema` 版本号，序列化后存进 `workflow_instance`，恢复时原样交回解释器，从停下的位置继续。改变帧结构的变更必须同时提供从上一版本读取的路径，或说明为什么可以拒绝旧版本。不采用 replay 式恢复：replay 是宿主语言调用栈不可序列化时才需要付的代价，DSL 解释器的栈天生是数据，直接快照即可，也不必承担"inline 任务必须确定性"的约束。
 
 帧是封闭枚举，每种 composite 节点一个变体，只记"这一层接下来该干什么"：
 
@@ -125,6 +127,8 @@ HTTP、gRPC、shell、container 等执行能力的差异不体现在 Block 上�
 ### 9. 外部抽象：三个 trait 与组合方式
 
 实现语言为 Rust。引擎与外部世界的边界恰好是三个 trait：`InstanceStore`、`Wakeup`、`ActivityExecutor`，另加 `Clock` 用于测试。以下定义为规范性定义，后续实现以此为准。
+
+这三个 trait、`Commit` 与 `Engine` 放在独立 crate `tideloom-runtime`。`tideloom-core` 只含定义、续体与解释器，是纯函数，不依赖 tokio，不做 I/O，不读时钟；核心需要新能力时只扩展 `Pause` / `Block` / `Resume` / `Outcome` 四个类型。
 
 ```rust
 use std::collections::HashMap;
@@ -265,7 +269,7 @@ pub struct Engine {
 
 ## Open Questions
 
-1. 进行中的 activity 在 worker 崩溃后的默认策略：自动幂等重做，还是标记未知等待人工介入。这决定 `task_execution` 的状态机。
+1. ~~进行中的 activity 在 worker 崩溃后的默认策略：自动幂等重做，还是标记未知等待人工介入。这决定 `task_execution` 的状态机。~~ 已定案（M2 MR-0）：activity 执行前先提交一条 `pending` 的 `task_execution`，执行后再提交结果。崩溃后再次领取时若最近一条仍是 `pending`，执行器声明幂等则重做，否则实例置为 `Faulted`，detail 为 `activity outcome unknown`，等待人工介入。
 2. `$context` 的体积上限，以及超限后拒绝还是外置到对象存储。
 3. 内存等待阈值的初值与是否按暂停类型区分。
 
