@@ -41,6 +41,7 @@ pub use definitions::MemoryDefinitions;
 pub use engine::Engine;
 pub use engine::EngineError;
 pub use engine::EngineParts;
+pub use engine::StepCount;
 pub use events::CloudEvent;
 pub use events::EventError;
 pub use events::EventSink;

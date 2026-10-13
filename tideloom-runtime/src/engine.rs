@@ -15,6 +15,12 @@ use crate::TaskKind;
 use crate::Wakeup;
 use crate::WorkerId;
 
+mod join;
+mod step;
+mod translate;
+
+pub use step::StepCount;
+
 /// Why an engine step failed.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -35,6 +41,10 @@ pub enum EngineError {
     /// No executor is registered for a task kind.
     #[error("no executor for {0:?}")]
     NoExecutor(TaskKind),
+    /// A pause this engine does not run yet. Faulting the instance would hide
+    /// a missing milestone behind a workflow fault, so the step returns it.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Everything an [`Engine`] is built from.
@@ -63,12 +73,12 @@ pub struct EngineParts {
 
 /// Claims instances, runs the interpreter, and commits the result.
 ///
-/// One step is `claim` → decode the continuation → `start` / `resume` →
-/// translate the [`Outcome`](tideloom_core::Outcome) into a [`Commit`] →
-/// [`Engine::commit`] → `notify`. The step loop itself is milestone MR-3;
-/// this type fixes what it is built from and the one invariant every later
-/// MR shares: [`Engine::commit`] is the only place that calls
-/// [`InstanceStore::apply`] and [`Wakeup::commit_offset`], in that order.
+/// One step is `claim` → decode the continuation → `start` / `start_at` /
+/// `resume` → translate the [`Outcome`](tideloom_core::Outcome) into a
+/// [`Commit`] → [`Engine::commit`] → `notify`. [`Engine::commit`] is the only
+/// place that calls [`InstanceStore::apply`] and [`Wakeup::commit_offset`],
+/// in that order. A `fork` join spawns its branches in that commit and
+/// re-evaluates them from `children` when a branch finishes.
 pub struct Engine {
     worker: WorkerId,
     store: Arc<dyn InstanceStore>,
