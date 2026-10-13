@@ -158,10 +158,20 @@ fn translate_block(
             )));
         }
         Pause::Events => {
-            return Err(EngineError::Unsupported(format!(
-                "listen at {} is not handled yet",
-                block.position()
-            )));
+            // The step subscribes before applying this commit, then flips the
+            // instance to `Runnable` when the inbox already matches. While
+            // it does not, the instance stays `Waiting(Events)`, which
+            // `claim` does not return. A landed event is what makes it
+            // claimable again; the signal is only the hint.
+            if !matches!(block.detail(), BlockDetail::Listen(_)) {
+                return Err(EngineError::Continuation {
+                    instance: instance.to_string(),
+                    detail: "a listen block has no subscription".to_string(),
+                });
+            }
+            // Not claimable until the inbox matches. The step flips a
+            // satisfied listen to a due timer before this commit lands.
+            (Status::Waiting(WaitReason::Events), None, Vec::new())
         }
     };
     Ok(Translated {
