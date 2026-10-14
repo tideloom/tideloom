@@ -122,6 +122,9 @@ impl Engine {
         }
         let mut count = StepCount::default();
         for instance in &claimed {
+            // Before the step, so a listen that parks in this pass is known
+            // when `drive_until_idle` looks for a satisfied inbox.
+            self.remember(instance.id.clone());
             let observed = instance
                 .parent
                 .as_ref()
@@ -155,6 +158,13 @@ impl Engine {
             let count = self.run_once(clock.now()).await?;
             stepped += count.processed;
             if count.processed > 0 {
+                continue;
+            }
+            // A matching event only hints the bus. `claim` does not return
+            // `Waiting(Events)`, so a lost hint would leave a satisfied listen
+            // parked forever. Flip it to a due timer before deciding the loop
+            // is idle. The inbox, not the signal, is what this reads.
+            if self.release_satisfied_listens(clock.now()).await? {
                 continue;
             }
             let Some(next) = next_wake_at(self, clock.now()).await? else {
@@ -404,50 +414,9 @@ impl Engine {
             let event = journalled.event.unwrap_or(Resume::Tick);
             outcome = resume_with(definition, continuation.clone(), event, options);
         }
-        let events = match &outcome {
-            Outcome::Blocked { block, .. } if matches!(block.pause(), Pause::Events) => {
-                Some(block.detail().clone())
-            }
-            _ => None,
-        };
-        let prepared = prepare_child(
-            self.definitions().as_ref(),
-            instance,
-            definition,
-            outcome,
-            now,
-        )
-        .await?;
-        let commit = translate(
-            &instance.id,
-            version,
-            &instance.definition,
-            prepared.outcome,
-            prepared.spawn,
-            now,
-        )?;
-        if let Some(tideloom_core::BlockDetail::Listen(spec)) = events {
-            listen::subscribe(self.events_in().as_ref(), &instance.id, spec.clone())
-                .await
-                .map_err(|error| EngineError::Events(error.to_string()))?;
-            // Subscribe happens before the commit, so an emit in this same
-            // step is already in the inbox. Release now instead of parking
-            // on `Waiting(Events)`, which `claim` would never return.
-            let inbox = self
-                .events_in()
-                .inbox(&instance.id)
-                .await
-                .map_err(|error| EngineError::Events(error.to_string()))?;
-            if crate::LocalEventBus::satisfied(&spec, &inbox) {
-                // Due now, so the next `run_once` claims it and releases.
-                // An unsatisfied listen stays `Waiting(Events)`, which
-                // `claim` does not return, so `drive_until_idle` can stop.
-                let mut due = commit;
-                due.status = Status::Waiting(WaitReason::Timer);
-                due.wake_at = Some(now);
-                return Ok((due, Vec::new()));
-            }
-        }
+        let commit = self
+            .commit_stopped(instance, definition, outcome, version, now)
+            .await?;
         Ok((commit, Vec::new()))
     }
 
@@ -548,6 +517,29 @@ impl Engine {
             let event = journalled.event.unwrap_or(Resume::Tick);
             outcome = resume_with(definition, continuation.clone(), event, options);
         }
+        self.commit_stopped(instance, definition, outcome, version, now)
+            .await
+    }
+
+    /// Translate a stop, and subscribe when that stop is `listen`.
+    ///
+    /// `interpret` and `finish_inline` both end here. A listen that skipped
+    /// subscribe would park on `Waiting(Events)` and never see a later emit,
+    /// including one that already landed in the retained log.
+    async fn commit_stopped(
+        &self,
+        instance: &Instance,
+        definition: &Definition,
+        outcome: Outcome,
+        version: u64,
+        now: Timestamp,
+    ) -> Result<Commit, EngineError> {
+        let events = match &outcome {
+            Outcome::Blocked { block, .. } if matches!(block.pause(), Pause::Events) => {
+                Some(block.detail().clone())
+            }
+            _ => None,
+        };
         let prepared = prepare_child(
             self.definitions().as_ref(),
             instance,
@@ -556,14 +548,35 @@ impl Engine {
             now,
         )
         .await?;
-        translate(
+        let mut commit = translate(
             &instance.id,
             version,
             &instance.definition,
             prepared.outcome,
             prepared.spawn,
             now,
-        )
+        )?;
+        if let Some(tideloom_core::BlockDetail::Listen(spec)) = events {
+            listen::subscribe(self.events_in().as_ref(), &instance.id, spec.clone())
+                .await
+                .map_err(|error| EngineError::Events(error.to_string()))?;
+            // Subscribe happens before the commit, so an emit already in the
+            // retained log is in the inbox. Release now instead of parking
+            // on `Waiting(Events)`, which `claim` would never return.
+            let inbox = self
+                .events_in()
+                .inbox(&instance.id)
+                .await
+                .map_err(|error| EngineError::Events(error.to_string()))?;
+            if crate::LocalEventBus::satisfied(&spec, &inbox) {
+                // Due now, so the next `run_once` claims it and releases.
+                // An unsatisfied listen stays `Waiting(Events)`, which
+                // `claim` does not return.
+                commit.status = Status::Waiting(WaitReason::Timer);
+                commit.wake_at = Some(now);
+            }
+        }
+        Ok(commit)
     }
 
     /// A claimed listen either keeps waiting or resumes with the inbox.
@@ -1111,6 +1124,66 @@ impl Engine {
         commit.continuation = Some(bytes);
         commit.wake_at = Some(now);
         self.apply_step(commit).await
+    }
+
+    /// Make a satisfied `Waiting(Events)` instance claimable.
+    ///
+    /// `claim` does not return `Waiting(Events)`. A matching publish only
+    /// hints the bus, and a lost hint must still release: the inbox is the
+    /// source of truth. This flips each known listener whose inbox satisfies
+    /// its spec to a due timer, the same shape an already-satisfied subscribe
+    /// uses. The next claim runs `relisten` and acks after that commit.
+    ///
+    /// Returns whether any instance was flipped.
+    async fn release_satisfied_listens(&self, now: Timestamp) -> Result<bool, EngineError> {
+        let mut flipped = false;
+        for instance in known_instances(self).await? {
+            if instance.status != Status::Waiting(WaitReason::Events) {
+                continue;
+            }
+            let Some(bytes) = instance.continuation.as_deref() else {
+                continue;
+            };
+            let Ok(continuation) = decode(&instance.id, bytes) else {
+                continue;
+            };
+            if continuation.pause() != Pause::Events {
+                continue;
+            }
+            let definition = self.definitions().get(&instance.definition).await?;
+            let ticked = resume_with(
+                &definition,
+                continuation,
+                Resume::Tick,
+                WalkOptions::new().with_now(now),
+            );
+            let Outcome::Blocked { block, .. } = ticked else {
+                continue;
+            };
+            let tideloom_core::BlockDetail::Listen(spec) = block.detail() else {
+                continue;
+            };
+            let inbox = self
+                .events_in()
+                .inbox(&instance.id)
+                .await
+                .map_err(|error| EngineError::Events(error.to_string()))?;
+            if !crate::LocalEventBus::satisfied(spec, &inbox) {
+                continue;
+            }
+            let mut due = Commit::new(
+                instance.id.clone(),
+                instance.version,
+                Status::Waiting(WaitReason::Timer),
+                now,
+            );
+            due.continuation = instance.continuation.clone();
+            due.wake_at = Some(now);
+            if !self.apply_step(due).await? {
+                flipped = true;
+            }
+        }
+        Ok(flipped)
     }
 
     /// `apply` with no bus offset: a step is not triggered by a signal.

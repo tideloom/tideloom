@@ -11,7 +11,6 @@ use tideloom_core::Pause;
 use tideloom_core::Resume;
 use tideloom_core::Timestamp;
 use tideloom_core::WalkOptions;
-use tideloom_core::drive;
 use tideloom_core::resume;
 use tideloom_core::resume_with;
 use tideloom_core::start;
@@ -459,7 +458,7 @@ fn a_for_loop_retries_under_that_iteration_attempt_key() {
 }
 
 #[test]
-fn drive_returns_the_retry_pause_without_sleeping() {
+fn start_returns_the_retry_pause_without_sleeping() {
     let definition = sample(
         r#"
   - charge:
@@ -479,7 +478,7 @@ fn drive_returns_the_retry_pause_without_sleeping() {
 "#,
     );
     let started = Instant::now();
-    let (pause, _) = blocked(drive(&definition, &json!({})));
+    let (pause, _) = blocked(start(&definition, &json!({})));
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_retry(&pause, 0, Duration::from_secs(30));
 }

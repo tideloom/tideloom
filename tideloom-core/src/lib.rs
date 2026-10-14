@@ -6,8 +6,8 @@
 //! blocking or effectful block. The stop is a [`Continuation`]: the frames of
 //! every enclosing control-flow task plus the pending block. [`resume`] takes
 //! that value and a [`Resume`] event and continues from exactly there; nothing
-//! is replayed from the root. [`drive`] performs each blocked `call: http` and
-//! resumes until the workflow finishes. A `try` retry pause carries its
+//! is replayed from the root. [`http_call`] performs one blocked `call: http`.
+//! The runtime engine resumes with that result. A `try` retry pause carries its
 //! backoff delay. Workflow and task timeouts fault when a supplied clock
 //! passes a recorded start. Nothing here sleeps. The model is ADR-0001 in the
 //! repository `docs/` directory.
@@ -39,9 +39,6 @@ pub use error::BuildError;
 pub use fault::Fault;
 pub use hash::ContentHash;
 pub use hash::canonical_json;
-pub use http::drive;
-pub use http::drive_from;
-pub use http::drive_with;
 pub use http::http_call;
 pub use key::Counter;
 pub use key::ExecutionKey;

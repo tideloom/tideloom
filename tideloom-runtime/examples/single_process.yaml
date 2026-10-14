@@ -1,0 +1,122 @@
+# Copyright 2024 Tideloom Developers
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# M2 acceptance workflow. `examples/single_process.rs` runs this document and
+# the child workflow below through one `Engine`. `{base}` is the local HTTP
+# fixture the example substitutes before publishing the definition.
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: single-process
+  version: '1.0.0'
+do:
+  - prepare:
+      set:
+        order: ${ .order }
+        lane: open
+  - charge:
+      try:
+        - callPay:
+            call: http
+            with:
+              method: post
+              endpoint: '{base}/pay'
+              body:
+                order: ${ .order }
+      catch:
+        retry:
+          delay: PT1S
+          backoff:
+            constant: {}
+          limit:
+            attempt:
+              count: 1
+  - pause:
+      wait:
+        milliseconds: 5
+  - gather:
+      fork:
+        branches:
+          - east:
+              set:
+                lane: east
+          - west:
+              set:
+                lane: west
+  - race:
+      fork:
+        compete: true
+        branches:
+          - fast:
+              set:
+                winner: fast
+          - slow:
+              wait:
+                seconds: 30
+  - receipt:
+      run:
+        workflow:
+          namespace: default
+          name: receipt
+          version: '1.0.0'
+          input:
+            order: ${ $workflow.input.order }
+      output:
+        as: '{ order: .receipt, paid: true }'
+  - tell:
+      run:
+        workflow:
+          namespace: default
+          name: tell
+          version: '1.0.0'
+          input:
+            order: ${ $workflow.input.order }
+      output:
+        as: '{ order: .order, paid: true }'
+  - hear:
+      listen:
+        to:
+          one:
+            with:
+              type: io.example.paid
+              source: https://example.test/orders
+  - seal:
+      set:
+        order: ${ $workflow.input.order }
+        sealed: true
+---
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: receipt
+  version: '1.0.0'
+do:
+  - stamp:
+      set:
+        receipt: ${ .order }
+---
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: tell
+  version: '1.0.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: io.example.paid
+            data:
+              order: ${ .order }

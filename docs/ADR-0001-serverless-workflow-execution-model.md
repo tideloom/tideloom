@@ -10,6 +10,10 @@ Accepted
 
 修订：2026-10-12（M2 MR-0）。第 9 节的三个 trait 落在独立 crate `tideloom-runtime`，`tideloom-core` 不依赖它们；续体带 `schema` 版本号；Open Question 1 定案为"标记未知，不自动重做"。里程碑拆分见 `docs/milestone-m2-single-process-runtime.md`。
 
+修订：2026-10-14（M2 MR-9）。M2 完成。单进程运行时由 `Engine` 组合 `MemoryStore`、`LocalWakeup`、`MemoryDefinitions`、`LocalEventBus`、`ManualClock` / `SystemClock` 与 activity executor。验收是 `tideloom-runtime/examples/single_process.rs`：一个包含 `set`、`call: http`、`try` 重试、`wait`、cooperative `fork`、compete `fork`、`run: workflow` 和 `emit` → `listen` 的工作流，由 `Engine::drive_until_idle` 端到端跑完，时钟注入，进程不 sleep。核心的 `drive` / `drive_from` / `drive_with` 已删除；`call: http` 只剩一次请求的 `http_call`，由引擎 resume。
+
+M3 的入口条件：M2 的验收 example 在 `main` 上通过；`InstanceStore::apply` 与 `Wakeup::commit_offset` 仍只从 `Engine::commit` 调用；换 SQL 存储与多进程时不改解释器、不改 `Commit` 字段、不把 journal 读回执行路径。M3 从 SQL `InstanceStore` 与跨进程可重放 `Wakeup` 开始，trait 签名不变。
+
 ## Context
 
 我们要实现一个 Serverless Workflow DSL v1.0 的运行时。最初的设想是把 YAML 编译成若干 Block，构建依赖树，把 Block 分发给 worker 执行并收集耗时。在对比 Airflow、Prefect、Dagster、DBOS、Temporal、Restate 以及 Lemline 之后，需要回答三个问题：

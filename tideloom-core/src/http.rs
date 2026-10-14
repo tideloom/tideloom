@@ -1,8 +1,9 @@
-//! Execute `call: http` activities and resume the run with the result.
+//! Execute one blocked `call: http` activity.
 //!
 //! [`start`](crate::start) stops at the call. [`http_call`] performs that one
-//! request. [`drive`] resumes with the output or fault and continues until the
-//! workflow finishes, faults, or stops on a block that is not `call: http`.
+//! request and returns the raw output, before task `output.as`. The runtime
+//! engine resumes with that output or fault. This module does not walk past
+//! the call.
 //!
 //! This slice sends JSON. `endpoint` may be a string or `{ uri }`. Strings
 //! accept `${ ... }` interpolation, then simple `{name}` templates filled from
@@ -25,107 +26,15 @@ use serde_json::Value;
 
 use crate::Block;
 use crate::CallKind;
-use crate::Continuation;
 use crate::Definition;
 use crate::Fault;
 use crate::Node;
 use crate::NodeKind;
-use crate::Outcome;
 use crate::Pause;
-use crate::Resume;
 use crate::expr::evaluate_data;
-use crate::walk::WalkOptions;
-use crate::walk::resume_with;
-use crate::walk::start_with;
 
-const MAX_HTTP_CALLS: u32 = 10_000;
 const MAX_BODY: usize = 1024 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Start `definition` and perform each blocked `call: http` until it stops elsewhere.
-///
-/// Each call's raw output or fault resumes the run, so task `output.as`,
-/// `export.as`, and `try` see it. A pause that is not an HTTP activity is
-/// returned as [`Outcome::Blocked`] with its continuation. A `try` retry
-/// pause is one of those stops: this function does not sleep for the backoff.
-///
-/// # Examples
-///
-/// ```
-/// use tideloom_core::Definition;
-/// use tideloom_core::Outcome;
-/// use tideloom_core::drive;
-///
-/// let yaml = r#"
-/// document:
-///   dsl: '1.0.0'
-///   namespace: default
-///   name: paint
-///   version: '0.1.0'
-/// do:
-///   - setColor:
-///       set:
-///         color: red
-/// "#;
-/// let definition = Definition::from_yaml(yaml).unwrap();
-/// let Outcome::Completed { output, .. } = drive(&definition, &serde_json::json!({})) else {
-///     panic!("expected completion");
-/// };
-/// assert_eq!(output["color"], "red");
-/// ```
-#[must_use]
-pub fn drive(definition: &Definition, input: &Value) -> Outcome {
-    drive_with(definition, input, WalkOptions::default())
-}
-
-/// [`drive`] with the same clock and jitter inputs as [`start_with`](crate::start_with).
-#[must_use]
-pub fn drive_with(definition: &Definition, input: &Value, options: WalkOptions) -> Outcome {
-    drive_outcome(definition, start_with(definition, input, options), options)
-}
-
-/// Continue a stopped run, performing each blocked `call: http`.
-///
-/// Deadlines are checked first with [`Resume::Tick`], so a call that has
-/// already timed out at `options`'s `now` faults before it is sent.
-#[must_use]
-pub fn drive_from(
-    definition: &Definition,
-    continuation: Continuation,
-    options: WalkOptions,
-) -> Outcome {
-    let outcome = resume_with(definition, continuation, Resume::Tick, options);
-    drive_outcome(definition, outcome, options)
-}
-
-fn drive_outcome(definition: &Definition, mut outcome: Outcome, options: WalkOptions) -> Outcome {
-    let mut calls = 0u32;
-    loop {
-        match outcome {
-            Outcome::Blocked {
-                block,
-                continuation,
-            } if is_http_activity(&block) => {
-                calls += 1;
-                if calls > MAX_HTTP_CALLS {
-                    return Outcome::Faulted {
-                        fault: Fault::runtime(
-                            block.position(),
-                            format!("HTTP drive exceeded {MAX_HTTP_CALLS} calls"),
-                        ),
-                        context: block.context().clone(),
-                    };
-                }
-                let event = match http_call(definition, continuation.workflow_input(), &block) {
-                    Ok(output) => Resume::Output(output),
-                    Err(fault) => Resume::Fault(fault),
-                };
-                outcome = resume_with(definition, continuation, event, options);
-            }
-            other => return other,
-        }
-    }
-}
 
 /// Perform one blocked `call: http` activity.
 ///

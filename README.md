@@ -2,7 +2,7 @@
 
 Tideloom is a Rust runtime for the [Serverless Workflow DSL](https://github.com/serverlessworkflow/specification) (Open Workflow Specification 1.0).
 
-This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. `drive` performs a blocked `call: http` and resumes until the workflow stops elsewhere. That is `tideloom-core`, and it is pure. `tideloom-runtime` holds the traits for everything with side effects: the instance store, the wake-up bus, activity executors, definitions, events, and the clock, composed by an `Engine`. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md); the runtime traits are described in [docs/runtime-architecture.md](docs/runtime-architecture.md); the work queue is [docs/milestone-m2-single-process-runtime.md](docs/milestone-m2-single-process-runtime.md). Contributors and coding agents start at [AGENTS.md](AGENTS.md).
+This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. That is `tideloom-core`, and it is pure: a blocked `call: http` is one request via `http_call`, not a walk. `tideloom-runtime` holds the traits for everything with side effects: the instance store, the wake-up bus, activity executors, definitions, events, and the clock, composed by an `Engine`. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md); the runtime traits are described in [docs/runtime-architecture.md](docs/runtime-architecture.md); the work queue is [docs/milestone-m2-single-process-runtime.md](docs/milestone-m2-single-process-runtime.md). Contributors and coding agents start at [AGENTS.md](AGENTS.md).
 
 ## Build
 
@@ -11,7 +11,20 @@ Rust 1.90 or newer (edition 2024). `rust-toolchain.toml` selects stable.
 ```sh
 cargo test
 cargo build -p tideloom-core
+cargo run -p tideloom-runtime --example single_process
 ```
+
+## Run a workflow
+
+`Engine` is the single-process runner. It claims instances from an `InstanceStore`, resumes the continuation, and commits the result. Time comes from a `Clock`. A test injects `ManualClock` and calls `Engine::drive_until_idle`, which advances that clock to the next `wake_at` instead of sleeping.
+
+The acceptance workflow is `tideloom-runtime/examples/single_process.yaml`. One `Engine` runs it through `set`, `call: http`, a `try` retry, `wait`, a cooperative `fork`, a compete `fork`, `run: workflow`, and an `emit` that a later `listen` consumes. The HTTP call goes to a TCP listener in the same process through `http_call`. The child workflow is a second document in that file, published into `MemoryDefinitions` before the parent starts.
+
+```sh
+cargo run -p tideloom-runtime --example single_process
+```
+
+The process prints the parent output. `sealed` is true when every stop above completed. The example does not sleep.
 
 ## From a spec file to the immutable definition
 
@@ -115,7 +128,7 @@ A missing `delay` is 0, and the run still pauses so the attempt key can advance 
 
 `jitter.from` and `jitter.to` are added after the backoff. `start` and `resume` use `from`. `start_with`, `resume_with`, and `WalkOptions::with_jitter` pick another point: `JitterSample::FROM` is `from`, `JitterSample::TO` is `to`, and `JitterSample::new(parts_per_million)` is a point in between. The sample is read when the pause is created.
 
-`limit.attempt.count` is unchanged. `limit.attempt.duration` is how long one attempt's paused task may run, from the task start of that block. `limit.duration` is how long retries may continue, from the task start of the first retry pause. Both are checked on `Resume::Tick` against `WalkOptions::with_now` and fault or stop with the same clock as timeouts; neither sleeps. Without `now`, or before the start is recorded, they are not enforced. `drive` returns the retry pause instead of waiting.
+`limit.attempt.count` is unchanged. `limit.attempt.duration` is how long one attempt's paused task may run, from the task start of that block. `limit.duration` is how long retries may continue, from the task start of the first retry pause. Both are checked on `Resume::Tick` against `WalkOptions::with_now` and fault or stop with the same clock as timeouts; neither sleeps. Without `now`, or before the start is recorded, they are not enforced. `start` returns the retry pause instead of waiting. The runtime claims that instance again when `wake_at` is due.
 
 ## Timeouts
 
@@ -123,13 +136,13 @@ A missing `delay` is 0, and the run still pauses so the attempt key can advance 
 
 Starts live on the continuation. `start_with` a `now` records the workflow start, and a new block records the task start; `Continuation::start_workflow` and `Continuation::start_task` set them when the run had no clock. The first instant stays. Pass the current clock reading to `WalkOptions::with_now` and resume with `Resume::Tick`. When `now` is at or past the start plus `after`, the run returns a timeout fault: status 408, type `https://open-workflow-specification.org/spec/1.0.0/errors/timeout`. A workflow timeout is instance `/` and is checked on every resume. A task timeout is the task's JSON Pointer, so `try` can catch it. An `Output` or `Release` that arrives after the deadline is kept.
 
-`Block::timeout` is the task duration. `Block::timeout_at(started_at)` is the deadline. A resume without `now` still returns the block and does not enforce the deadline. `drive_from` ticks first and faults before it sends an HTTP call that has already timed out.
+`Block::timeout` is the task duration. `Block::timeout_at(started_at)` is the deadline. A resume without `now` still returns the block and does not enforce the deadline. The engine ticks first and faults before it sends an HTTP call that has already timed out.
 
 `Fault::configuration`, `validation`, `authentication`, `authorization`, and `timeout` are the standard error types from the DSL, alongside the existing expression, communication, and runtime faults.
 
 ## HTTP call
 
-`tideloom_core::drive` starts the workflow and resumes until it completes, faults, or stops on a block that is not `call: http`. For each HTTP activity it sends the request and resumes with `Resume::Output` or `Resume::Fault`, so `output.as`, `export.as`, and `try` see the result. `drive_from` does the same from a stored continuation.
+`tideloom_core::http_call` performs one blocked `call: http` and returns the raw output, before task `output.as`. The runtime engine resumes with `Resume::Output` or `Resume::Fault`, so `output.as`, `export.as`, and `try` see the result. It does not sleep for a retry backoff: that pause is claimed again when `wake_at` is due.
 
 `with` accepts:
 
@@ -147,7 +160,7 @@ Starts live on the continuation. `start_with` a `now` records the workflow start
 Not in this slice: `output: raw`, endpoint authentication, HTTPS, URI-template operators other than `{name}`, gRPC, OpenAPI, AsyncAPI, brokers, and a database. The HTTP client keeps its own 10 second cap. Workflow and task timeouts are the run's clock, described above.
 
 ```rust
-let outcome = tideloom_core::drive(&definition, &input);
+let outcome = tideloom_core::start(&definition, &input);
 ```
 
 The workspace layout matches this repository's existing FastLabs-style shape: one library crate, `tideloom-core`, beside the virtual-workspace `Cargo.toml`, with `rustfmt.toml`, `taplo.toml`, and `.github/workflows/ci.yml`.
