@@ -28,12 +28,14 @@ use tideloom_core::resume_with;
 use tideloom_core::start_at_with;
 use tideloom_core::start_with;
 
+use super::child::ChildDecision;
 use super::join::JoinDecision;
 use super::join::decide;
 use super::listen;
 use super::listen::ListenStep;
 use super::translate::decode;
 use super::translate::encode;
+use super::translate::prepare_child;
 use super::translate::translate;
 use crate::ActivityError;
 use crate::Clock;
@@ -273,6 +275,14 @@ impl Engine {
             commit
         };
         let conflict = self.apply_step(commit).await?;
+        if !conflict {
+            // Children created in this commit are not in the claimed set.
+            // Remember them before the next pass, including a child whose
+            // parent completed in the same step (`await: false`).
+            for child in self.store().children(&current.id).await? {
+                self.remember(child.id);
+            }
+        }
         if !conflict && !acked.is_empty() {
             // After the commit, never before. A conflict above leaves the
             // inbox intact so the next claim releases the same events.
@@ -282,9 +292,6 @@ impl Engine {
         }
         if !conflict {
             self.remember(current.id.clone());
-            for child in self.store().children(&current.id).await? {
-                self.remember(child.id);
-            }
         }
         if !conflict
             && terminal
@@ -321,6 +328,13 @@ impl Engine {
                 if matches!(continuation.pause(), Pause::Join { .. }) {
                     return Ok((
                         self.rejoin(instance, definition, continuation, now).await?,
+                        Vec::new(),
+                    ));
+                }
+                if matches!(continuation.pause(), Pause::Child) {
+                    return Ok((
+                        self.rechild(instance, definition, continuation, now)
+                            .await?,
                         Vec::new(),
                     ));
                 }
@@ -396,7 +410,22 @@ impl Engine {
             }
             _ => None,
         };
-        let commit = translate(&instance.id, version, &instance.definition, outcome, now)?;
+        let prepared = prepare_child(
+            self.definitions().as_ref(),
+            instance,
+            definition,
+            outcome,
+            now,
+        )
+        .await?;
+        let commit = translate(
+            &instance.id,
+            version,
+            &instance.definition,
+            prepared.outcome,
+            prepared.spawn,
+            now,
+        )?;
         if let Some(tideloom_core::BlockDetail::Listen(spec)) = events {
             listen::subscribe(self.events_in().as_ref(), &instance.id, spec.clone())
                 .await
@@ -444,6 +473,7 @@ impl Engine {
                     instance.version,
                     &instance.definition,
                     ticked,
+                    Vec::new(),
                     now,
                 )?,
                 Vec::new(),
@@ -460,6 +490,7 @@ impl Engine {
                     instance.version,
                     &instance.definition,
                     ticked,
+                    Vec::new(),
                     now,
                 )?,
                 Vec::new(),
@@ -517,7 +548,22 @@ impl Engine {
             let event = journalled.event.unwrap_or(Resume::Tick);
             outcome = resume_with(definition, continuation.clone(), event, options);
         }
-        translate(&instance.id, version, &instance.definition, outcome, now)
+        let prepared = prepare_child(
+            self.definitions().as_ref(),
+            instance,
+            definition,
+            outcome,
+            now,
+        )
+        .await?;
+        translate(
+            &instance.id,
+            version,
+            &instance.definition,
+            prepared.outcome,
+            prepared.spawn,
+            now,
+        )
     }
 
     /// A claimed listen either keeps waiting or resumes with the inbox.
@@ -544,11 +590,20 @@ impl Engine {
             continuation,
         } = ticked
         else {
+            let prepared = prepare_child(
+                self.definitions().as_ref(),
+                instance,
+                definition,
+                ticked,
+                now,
+            )
+            .await?;
             let commit = translate(
                 &instance.id,
                 instance.version,
                 &instance.definition,
-                ticked,
+                prepared.outcome,
+                prepared.spawn,
                 now,
             )?;
             return Ok((commit, Vec::new()));
@@ -565,11 +620,20 @@ impl Engine {
             Resume::Release(serde_json::Value::Array(release.events)),
             WalkOptions::new().with_now(now),
         );
+        let prepared = prepare_child(
+            self.definitions().as_ref(),
+            instance,
+            definition,
+            outcome,
+            now,
+        )
+        .await?;
         let commit = translate(
             &instance.id,
             instance.version,
             &instance.definition,
-            outcome,
+            prepared.outcome,
+            prepared.spawn,
             now,
         )?;
         // The caller commits, then acks these ids. Acking here would drop
@@ -740,11 +804,20 @@ impl Engine {
                     Resume::Release(output),
                     WalkOptions::new().with_now(now),
                 );
+                let prepared = prepare_child(
+                    self.definitions().as_ref(),
+                    instance,
+                    definition,
+                    outcome,
+                    now,
+                )
+                .await?;
                 let mut commit = translate(
                     &instance.id,
                     instance.version,
                     &instance.definition,
-                    outcome,
+                    prepared.outcome,
+                    prepared.spawn,
                     now,
                 )?;
                 commit.cancel = cancel;
@@ -958,8 +1031,45 @@ impl Engine {
         Ok(commit)
     }
 
-    /// Flip a `Waiting(Join)` parent back to `Runnable` so the next claim
-    /// re-evaluates it.
+    /// Re-evaluate a `Waiting(Child)` parent from its child workflow.
+    ///
+    /// The same path a join uses: read `children`, decide, resume. A child
+    /// workflow is effectful, so the resume is `Output` or `Fault`, and a
+    /// surrounding `try` can catch the fault. A fork join faults the parent
+    /// status instead, because a fork is an error boundary.
+    async fn rechild(
+        &self,
+        instance: &Instance,
+        definition: &Definition,
+        continuation: Continuation,
+        now: Timestamp,
+    ) -> Result<Commit, EngineError> {
+        let children = self.store().children(&instance.id).await?;
+        match super::child::decide(&children) {
+            ChildDecision::Pending => Ok(still_child(instance, &continuation, now)?),
+            ChildDecision::Output { output } => {
+                let outcome = resume_with(
+                    definition,
+                    continuation,
+                    Resume::Output(output),
+                    WalkOptions::new().with_now(now),
+                );
+                self.finish_inline(instance, definition, outcome, now).await
+            }
+            ChildDecision::Fault { fault } => {
+                let outcome = resume_with(
+                    definition,
+                    continuation,
+                    Resume::Fault(fault),
+                    WalkOptions::new().with_now(now),
+                );
+                self.finish_inline(instance, definition, outcome, now).await
+            }
+        }
+    }
+
+    /// Flip a `Waiting(Join)` or `Waiting(Child)` parent back to `Runnable`
+    /// so the next claim re-evaluates it.
     ///
     /// The child's terminal commit has already landed. A version conflict
     /// means another child released the parent first; the next claim
@@ -975,19 +1085,25 @@ impl Engine {
             Err(StoreError::NotFound(_)) => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        // A parent that is no longer `Waiting(Join)` was released by a
-        // sibling that committed first. The second finisher still attempts
-        // the release against the version it observed before either commit,
-        // so `apply` rejects it. That conflict is the record that two
-        // children finished together and only one release landed.
-        if parent.status != Status::Waiting(WaitReason::Join) && parent.status != Status::Runnable {
+        // A parent that is no longer waiting was released by a sibling that
+        // committed first. The second finisher still attempts the release
+        // against the version it observed before either commit, so `apply`
+        // rejects it. That conflict is the record that two children finished
+        // together and only one release landed. A `run: workflow` parent has
+        // one child, so the second release does not arise, but the same CAS
+        // is what makes a repeated `ChildDone` a no-op.
+        let waiting = matches!(
+            parent.status,
+            Status::Waiting(WaitReason::Join) | Status::Waiting(WaitReason::Child)
+        );
+        if !waiting && parent.status != Status::Runnable {
             return Ok(false);
         }
         let Some(bytes) = parent.continuation.clone() else {
             return Ok(false);
         };
         let continuation = decode(&parent.id, &bytes)?;
-        if !matches!(continuation.pause(), Pause::Join { .. }) {
+        if !matches!(continuation.pause(), Pause::Join { .. } | Pause::Child) {
             return Ok(false);
         }
         let version = observed_version.unwrap_or(parent.version);
@@ -1122,10 +1238,27 @@ fn still_waiting(
     continuation: &Continuation,
     now: Timestamp,
 ) -> Result<Commit, EngineError> {
+    parked(instance, continuation, WaitReason::Join, now)
+}
+
+fn still_child(
+    instance: &Instance,
+    continuation: &Continuation,
+    now: Timestamp,
+) -> Result<Commit, EngineError> {
+    parked(instance, continuation, WaitReason::Child, now)
+}
+
+fn parked(
+    instance: &Instance,
+    continuation: &Continuation,
+    reason: WaitReason,
+    now: Timestamp,
+) -> Result<Commit, EngineError> {
     let mut commit = Commit::new(
         instance.id.clone(),
         instance.version,
-        Status::Waiting(WaitReason::Join),
+        Status::Waiting(reason),
         now,
     );
     commit.continuation = Some(encode(&instance.id, continuation)?);

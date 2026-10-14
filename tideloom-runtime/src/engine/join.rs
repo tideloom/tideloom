@@ -1,9 +1,14 @@
-//! Re-evaluate a `fork` join from the child rows.
+//! Re-evaluate a waiting parent from the child rows.
 //!
 //! The waiting condition is not stored. Whoever claims the parent reads
 //! `children` and decides again. Two children finishing at once each produce
 //! a commit against the same parent version; `apply` keeps one and the other
 //! is a version conflict, which the engine drops.
+//!
+//! A `fork` join and a `run: workflow` parent share that path. The join
+//! decision ignores children whose `branch` is `None`; the child-workflow
+//! decision in [`super::child`] ignores children whose `branch` is `Some`.
+//! A terminal child releases the parent either way.
 
 use serde_json::Value;
 use tideloom_core::Fault;

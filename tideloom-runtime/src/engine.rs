@@ -16,6 +16,7 @@ use crate::TaskKind;
 use crate::Wakeup;
 use crate::WorkerId;
 
+mod child;
 mod join;
 mod step;
 mod translate;
@@ -90,7 +91,9 @@ pub struct EngineParts {
 /// `(instance, key, attempt)` row. [`Engine::commit`] is the only place that
 /// calls [`InstanceStore::apply`] and [`Wakeup::commit_offset`], in that
 /// order. A `fork` join spawns its branches in that commit and re-evaluates
-/// them from `children` when a branch finishes.
+/// them from `children` when a branch finishes. `run: workflow` spawns one
+/// child the same way, with `parent.branch = None`, and releases the parent
+/// through that same path.
 pub struct Engine {
     worker: WorkerId,
     store: Arc<dyn InstanceStore>,

@@ -2,7 +2,9 @@
 //!
 //! Activity outcomes are applied in the step loop before they get here, so a
 //! block that reaches `translate` is a pause the engine cannot finish inline:
-//! a timer, a retry backoff, a join, a child workflow, or a listen.
+//! a timer, a retry backoff, a join, a child workflow, or a listen. A child
+//! workflow is resolved before this function runs: the step calls
+//! [`prepare_child`] so `DefinitionSource::latest` can pin the child's key.
 
 use std::time::Duration;
 
@@ -10,18 +12,26 @@ use serde_json::Value;
 use tideloom_core::Block;
 use tideloom_core::BlockDetail;
 use tideloom_core::Continuation;
+use tideloom_core::Definition;
 use tideloom_core::Fault;
 use tideloom_core::Outcome;
 use tideloom_core::Pause;
+use tideloom_core::Resume;
 use tideloom_core::Timestamp;
+use tideloom_core::WalkOptions;
+use tideloom_core::resume_with;
 
+use super::child::ChildStart;
 use crate::Commit;
 use crate::DefinitionKey;
+use crate::DefinitionSource;
 use crate::EngineError;
+use crate::Instance;
 use crate::InstanceId;
 use crate::ParentRef;
 use crate::SpawnChild;
 use crate::Status;
+use crate::StoreError;
 use crate::WaitReason;
 
 /// What `translate` decided, before the step fills in the CAS guard.
@@ -36,7 +46,8 @@ pub struct Translated {
     pub output: Option<Value>,
     /// Fault when `Faulted`.
     pub fault: Option<Fault>,
-    /// Children created in the same commit. Only a join fills this.
+    /// Children created in the same commit: a join's branches, or a
+    /// `run: workflow` child.
     pub spawn_children: Vec<SpawnChild>,
 }
 
@@ -52,14 +63,15 @@ pub struct Translated {
 /// # Errors
 ///
 /// A continuation that will not serialize is an [`EngineError::Continuation`].
-/// A pause the engine cannot act on yet (a child workflow, a listen) is an
-/// [`EngineError::Unsupported`]: those waits belong to later milestone work,
-/// and treating them as a timer would lose the subscription.
+/// A child workflow must already have been resolved by [`prepare_child`].
+/// Reaching `Pause::Child` here means that step was skipped. `spawn` is the
+/// child that resolution produced; other pauses pass an empty list.
 pub fn translate(
     instance: &InstanceId,
     expected_version: u64,
     definition: &DefinitionKey,
     outcome: Outcome,
+    spawn: Vec<SpawnChild>,
     now: Timestamp,
 ) -> Result<Commit, EngineError> {
     let translated = match outcome {
@@ -69,7 +81,9 @@ pub fn translate(
             wake_at: None,
             output: Some(output),
             fault: None,
-            spawn_children: Vec::new(),
+            // `await: false` completes the parent in the same step that
+            // creates the child. The child still has to be spawned.
+            spawn_children: spawn,
         },
         Outcome::Faulted { fault, .. } => Translated {
             status: Status::Faulted,
@@ -77,12 +91,12 @@ pub fn translate(
             wake_at: None,
             output: None,
             fault: Some(fault),
-            spawn_children: Vec::new(),
+            spawn_children: spawn,
         },
         Outcome::Blocked {
             block,
             continuation,
-        } => translate_block(instance, definition, &block, &continuation, now)?,
+        } => translate_block(instance, definition, &block, &continuation, &spawn, now)?,
     };
     let mut commit = Commit::new(instance.clone(), expected_version, translated.status, now);
     commit.continuation = translated.continuation;
@@ -93,11 +107,106 @@ pub fn translate(
     Ok(commit)
 }
 
+/// An outcome plus the child a `run: workflow` resolution attached to it.
+pub struct Prepared {
+    /// What `translate` turns into a commit.
+    pub outcome: Outcome,
+    /// The child to create in that commit. Empty when the outcome spawned none.
+    pub spawn: Vec<SpawnChild>,
+}
+
+/// Resolve a `run: workflow` block into the outcome `translate` should see.
+///
+/// `await: true` keeps the child pause and returns the child to spawn, so the
+/// parent parks on `Waiting(Child)`. `await: false` resumes the parent with
+/// the child id and still returns that child. An unpublished target becomes
+/// [`Resume::Fault`], which a surrounding `try` can catch. A non-child outcome
+/// is returned with an empty spawn list.
+///
+/// # Errors
+///
+/// A definition lookup that is not "not published" is an [`EngineError`].
+pub async fn prepare_child(
+    definitions: &dyn DefinitionSource,
+    instance: &Instance,
+    definition: &Definition,
+    outcome: Outcome,
+    now: Timestamp,
+) -> Result<Prepared, EngineError> {
+    let Outcome::Blocked {
+        block,
+        continuation,
+    } = &outcome
+    else {
+        return Ok(Prepared {
+            outcome,
+            spawn: Vec::new(),
+        });
+    };
+    if block.pause() != Pause::Child {
+        return Ok(Prepared {
+            outcome,
+            spawn: Vec::new(),
+        });
+    }
+    let started = super::child::start(definitions, &instance.id, block.position(), block.detail())
+        .await
+        .map_err(child_lookup)?;
+    match started {
+        ChildStart::Await { child } => Ok(Prepared {
+            outcome,
+            spawn: vec![child],
+        }),
+        ChildStart::Fire { child, resume } => {
+            let resumed = resume_with(
+                definition,
+                continuation.clone(),
+                resume,
+                WalkOptions::new().with_now(now),
+            );
+            // The resume may itself stop on another child. Resolve that one
+            // too, and keep this child in the same commit.
+            let mut prepared = Box::pin(prepare_child(
+                definitions,
+                instance,
+                definition,
+                resumed,
+                now,
+            ))
+            .await?;
+            prepared.spawn.insert(0, child);
+            Ok(prepared)
+        }
+        ChildStart::Unpublished { fault } => {
+            let resumed = resume_with(
+                definition,
+                continuation.clone(),
+                Resume::Fault(fault),
+                WalkOptions::new().with_now(now),
+            );
+            // A caught configuration fault may continue into another child.
+            Box::pin(prepare_child(
+                definitions,
+                instance,
+                definition,
+                resumed,
+                now,
+            ))
+            .await
+        }
+    }
+}
+
+fn child_lookup(error: StoreError) -> EngineError {
+    EngineError::Store(error)
+}
+
 fn translate_block(
     instance: &InstanceId,
     definition: &DefinitionKey,
     block: &Block,
     continuation: &Continuation,
+    spawn: &[SpawnChild],
     now: Timestamp,
 ) -> Result<Translated, EngineError> {
     let (status, wake_at, spawn_children) = match block.pause() {
@@ -150,18 +259,21 @@ fn translate_block(
                 .collect();
             (Status::Waiting(WaitReason::Join), None, children)
         }
+        Pause::Child => {
+            if spawn.is_empty() {
+                return Err(EngineError::Unsupported(format!(
+                    "run: workflow at {} was not resolved before translate",
+                    block.position()
+                )));
+            }
+            (Status::Waiting(WaitReason::Child), None, spawn.to_vec())
+        }
         // `claim` only returns `Runnable` and a due `Waiting(Timer)`. An
         // activity that this step did not run — a fresh branch, so a compete
         // winner in the same pass can cancel it first — waits as a due timer
         // and is claimed again immediately. `Waiting(Activity)` would never
         // be claimed back.
         Pause::Activity => (Status::Waiting(WaitReason::Timer), Some(now), Vec::new()),
-        Pause::Child => {
-            return Err(EngineError::Unsupported(format!(
-                "run: workflow at {} is not handled yet",
-                block.position()
-            )));
-        }
         Pause::Events => {
             // The step subscribes before applying this commit, then flips the
             // instance to `Runnable` when the inbox already matches. While
