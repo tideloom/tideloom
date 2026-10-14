@@ -8,7 +8,6 @@ use tideloom_core::Outcome;
 use tideloom_core::Resume;
 use tideloom_core::Timestamp;
 use tideloom_core::WalkOptions;
-use tideloom_core::drive_from;
 use tideloom_core::resume_with;
 use tideloom_core::start;
 use tideloom_core::start_with;
@@ -250,7 +249,7 @@ fn a_task_timeout_is_caught_and_a_finished_call_is_kept() {
 }
 
 #[test]
-fn drive_faults_a_timed_out_call_before_connecting() {
+fn a_tick_faults_a_timed_out_call_before_a_runner_connects() {
     let definition = sample(
         r#"
   - callPay:
@@ -265,7 +264,8 @@ fn drive_faults_a_timed_out_call_before_connecting() {
     );
     let (_, mut continuation) = blocked(start(&definition, &json!({})));
     continuation.start_task(Timestamp::from_millis(0));
-    let fault = faulted(drive_from(&definition, continuation, at(1)));
+    // A tick at the deadline faults before any runner would send the call.
+    let fault = faulted(resume_with(&definition, continuation, Resume::Tick, at(1)));
     assert_eq!(fault.error_type(), TIMEOUT_TYPE);
     assert_eq!(fault.instance(), "/do/0/callPay");
 }

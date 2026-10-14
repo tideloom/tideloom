@@ -1,13 +1,16 @@
-//! `call: http` against a real listener on 127.0.0.1.
+//! `call: http` against a real listener on 127.0.0.1, driven by `Engine`.
 //!
-//! The server is a TCP socket in this process. The workflow uses the library
-//! HTTP client; nothing here replaces that client with a fake.
+//! The server is a TCP socket in this process. No HTTP executor is registered,
+//! so the engine sends through `tideloom_core::http_call`. Nothing here
+//! replaces that client with a fake. A stored continuation is resumed by
+//! claiming the instance again, not by a core driver.
 
 use std::io::Read;
 use std::io::Write;
 use std::net::Shutdown;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -16,13 +19,21 @@ use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
-use tideloom_core::Continuation;
 use tideloom_core::Definition;
-use tideloom_core::Outcome;
-use tideloom_core::WalkOptions;
-use tideloom_core::drive;
-use tideloom_core::drive_from;
-use tideloom_core::start;
+use tideloom_core::Fault;
+use tideloom_runtime::Clock;
+use tideloom_runtime::Engine;
+use tideloom_runtime::EngineParts;
+use tideloom_runtime::Instance;
+use tideloom_runtime::InstanceId;
+use tideloom_runtime::InstanceStore;
+use tideloom_runtime::LocalWakeup;
+use tideloom_runtime::ManualClock;
+use tideloom_runtime::MemoryDefinitions;
+use tideloom_runtime::MemoryStore;
+use tideloom_runtime::Status;
+use tideloom_runtime::Wakeup;
+use tideloom_runtime::WorkerId;
 
 const COMMUNICATION: &str =
     "https://open-workflow-specification.org/spec/1.0.0/errors/communication";
@@ -71,22 +82,86 @@ fn definition(tasks: &str) -> Definition {
     Definition::from_yaml(&yaml).unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn run(tasks: &str, input: Value) -> Outcome {
-    drive(&definition(tasks), &input)
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(future)
+}
+
+/// Publish `tasks`, create one instance, and drive it to a terminal status.
+fn drive(tasks: &str, input: Value) -> tideloom_runtime::Instance {
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition(tasks));
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(8).expect("8")));
+    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let engine = Engine::new(EngineParts {
+        worker: WorkerId("http-call".to_string()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
+        definitions,
+        executors: Vec::new(),
+        events_out: Arc::new(Discard),
+        events_in: Arc::new(Discard),
+        clock: Arc::new(ManualClock::at(clock.now())),
+    });
+    let instance = Instance::new(key, None, input, clock.now());
+    let id = instance.id.clone();
+    block_on(store.create(instance)).unwrap_or_else(|error| panic!("{error}"));
+    block_on(engine.drive_until_idle(&clock)).unwrap_or_else(|error| panic!("{error}"));
+    block_on(store.get(&id)).unwrap_or_else(|error| panic!("{error}"))
+}
+
+struct Discard;
+
+#[async_trait::async_trait]
+impl tideloom_runtime::EventSink for Discard {
+    async fn publish(
+        &self,
+        _: tideloom_runtime::CloudEvent,
+    ) -> Result<(), tideloom_runtime::EventError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl tideloom_runtime::EventSource for Discard {
+    async fn subscribe(
+        &self,
+        _: &InstanceId,
+        _: tideloom_core::ListenSpec,
+    ) -> Result<(), tideloom_runtime::EventError> {
+        Ok(())
+    }
+
+    async fn unsubscribe(&self, _: &InstanceId) -> Result<(), tideloom_runtime::EventError> {
+        Ok(())
+    }
+
+    async fn inbox(
+        &self,
+        _: &InstanceId,
+    ) -> Result<Vec<tideloom_runtime::CloudEvent>, tideloom_runtime::EventError> {
+        Ok(Vec::new())
+    }
+
+    async fn ack(&self, _: &InstanceId, _: &[String]) -> Result<(), tideloom_runtime::EventError> {
+        Ok(())
+    }
 }
 
 fn completed(tasks: &str, input: Value) -> Value {
-    match run(tasks, input) {
-        Outcome::Completed { output, .. } => output,
-        other => panic!("expected completion, got {other:?}"),
-    }
+    let instance = drive(tasks, input);
+    assert_eq!(instance.status, Status::Completed, "{instance:?}");
+    instance.output.unwrap_or(Value::Null)
 }
 
-fn faulted(tasks: &str, input: Value) -> tideloom_core::Fault {
-    match run(tasks, input) {
-        Outcome::Faulted { fault, .. } => fault,
-        other => panic!("expected a fault, got {other:?}"),
-    }
+fn faulted(tasks: &str, input: Value) -> Fault {
+    let instance = drive(tasks, input);
+    assert_eq!(instance.status, Status::Faulted, "{instance:?}");
+    instance.fault.expect("fault")
 }
 
 fn header<'a>(headers: &'a Value, name: &str) -> &'a Value {
@@ -142,20 +217,44 @@ fn a_stored_continuation_resumes_without_repeating_the_call() {
 "#,
         base = server.base
     );
-    let definition = definition(&tasks);
-    let Outcome::Blocked { continuation, .. } = start(&definition, &json!({})) else {
-        panic!("expected the call to block");
-    };
-    assert_eq!(server.hits(), 0);
-    let stored = serde_json::to_vec(&continuation).unwrap_or_else(|error| panic!("{error}"));
-    let restored: Continuation =
-        serde_json::from_slice(&stored).unwrap_or_else(|error| panic!("{error}"));
-    let Outcome::Completed { output, .. } =
-        drive_from(&definition, restored, WalkOptions::default())
-    else {
-        panic!("expected completion");
-    };
-    assert_eq!(output["stamped"], true);
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition(&tasks));
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(8).expect("8")));
+    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let engine = Engine::new(EngineParts {
+        worker: WorkerId("http-call".to_string()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: wakeup as Arc<dyn Wakeup>,
+        definitions,
+        executors: Vec::new(),
+        events_out: Arc::new(Discard),
+        events_in: Arc::new(Discard),
+        clock: Arc::new(ManualClock::at(clock.now())),
+    });
+    let instance = Instance::new(key, None, json!({}), clock.now());
+    let id = instance.id.clone();
+    block_on(store.create(instance)).unwrap_or_else(|error| panic!("{error}"));
+    // One claim journals Pending, sends the request, then upserts Output on
+    // the same attempt. A second drive must not send again.
+    block_on(engine.run_once(clock.now())).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(server.hits(), 1);
+    let steps = block_on(store.steps(&id)).unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.outcome, tideloom_runtime::StepOutcome::Output(_))),
+        "the call outcome is stored, {steps:?}"
+    );
+    block_on(engine.drive_until_idle(&clock)).unwrap_or_else(|error| panic!("{error}"));
+    let done = block_on(store.get(&id)).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(done.status, Status::Completed, "{done:?}");
+    assert_eq!(
+        done.output
+            .as_ref()
+            .and_then(|output| output.get("stamped")),
+        Some(&json!(true))
+    );
     assert_eq!(server.hits(), 1);
 }
 
@@ -467,8 +566,8 @@ fn an_object_template_value_does_not_connect() {
 }
 
 #[test]
-fn drive_leaves_a_non_http_activity_blocked() {
-    let outcome = run(
+fn an_emit_without_an_executor_faults_instead_of_calling_http() {
+    let instance = drive(
         r#"
   - notify:
       emit:
@@ -479,15 +578,12 @@ fn drive_leaves_a_non_http_activity_blocked() {
 "#,
         json!({}),
     );
-    let Outcome::Blocked {
-        block,
-        continuation,
-    } = outcome
-    else {
-        panic!("expected a block");
-    };
-    assert_eq!(block.position(), "/do/0/notify");
-    assert_eq!(continuation.position(), "/do/0/notify");
+    assert_eq!(instance.status, Status::Faulted, "{instance:?}");
+    let fault = instance.fault.expect("fault");
+    assert!(
+        fault.detail().unwrap_or("").contains("no executor"),
+        "{fault}"
+    );
 }
 
 fn respond(mut stream: TcpStream) -> std::io::Result<()> {
