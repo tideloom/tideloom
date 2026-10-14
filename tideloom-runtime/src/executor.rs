@@ -12,8 +12,12 @@ use crate::DefinitionKey;
 use crate::InstanceId;
 
 mod emit;
+mod http;
+mod log;
 
 pub use emit::EmitExecutor;
+pub use http::HttpExecutor;
+pub use log::LogExecutor;
 
 /// Which executor an effectful task is routed to.
 ///

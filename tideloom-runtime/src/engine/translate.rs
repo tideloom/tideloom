@@ -108,13 +108,18 @@ fn translate_block(
             };
             (
                 Status::Waiting(WaitReason::Timer),
-                Some(add_duration(now, after)),
+                // A zero wait is still a stop. `claim` treats `wake_at <= now`
+                // as due, so parking at `now` would be claimed again in the
+                // same instant and the step would never idle. A fresh fork
+                // branch is not a timer: it parks as a due timer below so the
+                // next pass can claim it.
+                Some(park_until(now, after)),
                 Vec::new(),
             )
         }
         Pause::Retry { delay, .. } => (
             Status::Waiting(WaitReason::Timer),
-            Some(add_duration(now, delay)),
+            Some(park_until(now, delay)),
             Vec::new(),
         ),
         Pause::Join { .. } => {
@@ -182,6 +187,20 @@ fn translate_block(
         fault: None,
         spawn_children,
     })
+}
+
+/// When a timer or a retry may be claimed again.
+///
+/// `claim` treats `wake_at <= now` as due. A zero duration is a real stop, so
+/// it parks one millisecond later; otherwise the same pass would claim it
+/// again and never idle. A positive duration is added to `now` as written.
+fn park_until(now: Timestamp, delay: Duration) -> Timestamp {
+    let delay = if delay.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        delay
+    };
+    add_duration(now, delay)
 }
 
 fn add_duration(start: Timestamp, delay: Duration) -> Timestamp {
