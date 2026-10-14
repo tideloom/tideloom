@@ -20,6 +20,7 @@ mod step;
 mod translate;
 
 pub use step::StepCount;
+pub use step::UNKNOWN_DETAIL;
 
 /// Listen subscription, inbox check, and ack. The step calls these from the
 /// Events branch of translate and after claim.
@@ -82,10 +83,12 @@ pub struct EngineParts {
 ///
 /// One step is `claim` → decode the continuation → `start` / `start_at` /
 /// `resume` → translate the [`Outcome`](tideloom_core::Outcome) into a
-/// [`Commit`] → [`Engine::commit`] → `notify`. [`Engine::commit`] is the only
-/// place that calls [`InstanceStore::apply`] and [`Wakeup::commit_offset`],
-/// in that order. A `fork` join spawns its branches in that commit and
-/// re-evaluates them from `children` when a branch finishes.
+/// [`Commit`] → [`Engine::commit`] → `notify`. An activity commits twice
+/// around the executor: `Pending`, then the outcome upserted on the same
+/// `(instance, key, attempt)` row. [`Engine::commit`] is the only place that
+/// calls [`InstanceStore::apply`] and [`Wakeup::commit_offset`], in that
+/// order. A `fork` join spawns its branches in that commit and re-evaluates
+/// them from `children` when a branch finishes.
 pub struct Engine {
     worker: WorkerId,
     store: Arc<dyn InstanceStore>,

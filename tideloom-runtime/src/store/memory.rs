@@ -14,6 +14,7 @@ use crate::Instance;
 use crate::InstanceId;
 use crate::Lease;
 use crate::Status;
+use crate::StepOutcome;
 use crate::StepResult;
 use crate::WaitReason;
 use crate::WorkerId;
@@ -38,6 +39,26 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Move a held lease into the past so [`InstanceStore::sweep`] lists it.
+    ///
+    /// Tests use this to stand in for a dead worker. The status, continuation,
+    /// and journal are left as the crash committed them. A missing instance or
+    /// a missing lease is left alone.
+    pub fn lapse_lease(&self, id: &InstanceId, until: Timestamp) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(instance) = state.instances.get_mut(id) else {
+            return;
+        };
+        if let Some(lease) = instance.lease.as_mut() {
+            lease.until = until;
+        }
+        if instance.status == Status::Waiting(WaitReason::Activity) {
+            instance.status = Status::Running;
+        }
     }
 }
 
@@ -102,6 +123,7 @@ impl InstanceStore for MemoryStore {
                 instance.lease = Some(Lease {
                     worker: worker.clone(),
                     until,
+                    open_attempt: None,
                 });
                 instance.clone()
             })
@@ -148,6 +170,8 @@ impl InstanceStore for MemoryStore {
         instance.updated_at = commit.at;
         if commit.release_lease {
             instance.lease = None;
+        } else if let Some(lease) = instance.lease.as_mut() {
+            lease.open_attempt = open_attempt_after(&commit.step_results, lease.open_attempt);
         }
         state.instances.insert(instance.id.clone(), instance);
         for child in commit.spawn_children {
@@ -259,4 +283,21 @@ impl InstanceStore for MemoryStore {
         });
         Ok(steps)
     }
+}
+
+/// The attempt a held lease should remember after this commit's journal rows.
+fn open_attempt_after(steps: &[StepResult], current: Option<u32>) -> Option<u32> {
+    let mut open = current;
+    for step in steps {
+        match &step.outcome {
+            StepOutcome::Pending => open = Some(step.attempt),
+            StepOutcome::Output(_) | StepOutcome::Fault(_) | StepOutcome::Unknown
+                if open == Some(step.attempt) =>
+            {
+                open = None;
+            }
+            StepOutcome::Output(_) | StepOutcome::Fault(_) | StepOutcome::Unknown => {}
+        }
+    }
+    open
 }

@@ -18,7 +18,7 @@
 //! [`MemoryDefinitions`]).
 //!
 //! [`engine`] is public so milestone MRs can add step helpers beside
-//! [`Engine`](engine::Engine) without a new crate path.
+//! [`Engine`] without a new crate path.
 
 #![warn(missing_docs)]
 
@@ -27,7 +27,7 @@ mod commit;
 mod definitions;
 /// The engine, its step loop, and the listen helpers that loop calls.
 ///
-/// [`Engine`](engine::Engine) is the composition root. [`engine::listen`] is
+/// [`Engine`] is the composition root. [`engine::listen`] is
 /// the Events branch of translate and the post-claim inbox check.
 pub mod engine;
 mod events;
@@ -49,6 +49,7 @@ pub use engine::Engine;
 pub use engine::EngineError;
 pub use engine::EngineParts;
 pub use engine::StepCount;
+pub use engine::UNKNOWN_DETAIL;
 pub use events::CloudEvent;
 pub use events::EventError;
 pub use events::EventSink;

@@ -64,10 +64,13 @@ the `ListenSpec`.
         event is Tick after a claim; Output/Fault after an executor; Release
         after a timer, a join, a child, or an inbox
    d. loop while outcome is Blocked(Activity):
-        write StepResult::Pending            ← engine.commit
-        output = executor.execute(task)
-        write StepResult::{Output|Fault}
+        write StepResult::Pending            ← engine.commit, lease held
+        output = executor.execute(task)      (call: http uses core::http_call)
+        upsert StepResult::{Output|Fault}    ← same (instance, key, attempt)
         outcome = core::resume(..., Output|Fault)
+      a still-Pending row on the next claim is re-run at attempt + 1 only
+      when the executor is idempotent; otherwise the instance is Faulted and
+      the row is upserted to Unknown
    e. commit = translate(outcome):
         Completed            → status Completed, output, continuation None
         Faulted              → status Faulted, fault, continuation None
