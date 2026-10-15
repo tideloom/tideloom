@@ -21,8 +21,9 @@ Tideloom is a Rust runtime for the Serverless Workflow DSL 1.0.
   function; the resume state is an explicit, serializable `Continuation`.
   Nothing is replayed from the root. See ADR-0001.
 - Two crates:
-  - `tideloom-core`: definitions, continuation, interpreter, expressions,
-    the HTTP call. Pure. No tokio, no I/O, no clock.
+  - `tideloom-core`: definitions, continuation, interpreter, expressions.
+    The HTTP client still lives here until M3 MR-H4 moves it. No tokio, no
+    clock.
   - `tideloom-runtime`: everything with side effects. Store, wake-up bus,
     executors, definition source, events, clock, and the `Engine` that
     composes them. Traits first, implementations in their own PRs.
@@ -32,7 +33,9 @@ Tideloom is a Rust runtime for the Serverless Workflow DSL 1.0.
 - `docs/ADR-0001-serverless-workflow-execution-model.md`: why the model is
   what it is. Status Accepted. Amend it with a dated revision line when a
   decision changes; never rewrite history.
-- `docs/milestone-m2-single-process-runtime.md`: the current milestone,
+- `docs/milestone-m2-single-process-runtime.md`: the completed single-process
+  milestone. Historical; do not reopen it.
+- `docs/milestone-m3-postgres-and-two-workers.md`: the current milestone,
   split into PRs with boundaries, dependencies, and the files each one owns.
   This is the work queue.
 - `docs/runtime-architecture.md`: how the runtime traits fit together, the
@@ -54,7 +57,7 @@ tideloom/
 │   ├── src/expr.rs            # the expression subset
 │   ├── src/retry.rs           # backoff, jitter, durations, Timestamp
 │   ├── src/fault.rs           # RFC 7807 faults
-│   ├── src/http.rs            # call: http and the test-only `drive`
+│   ├── src/http.rs            # call: http; M3 MR-H4 moves this out of core
 │   └── tests/                 # one file per concern, see below
 ├── tideloom-runtime/
 │   ├── src/instance.rs        # Instance, InstanceId, Status, WaitReason
@@ -107,15 +110,17 @@ The milestone document lists the PRs. For each one:
 
 1. Check its dependency row. Do not start a PR whose dependency is not
    merged unless the row says it can run in parallel.
-2. Branch from `main` as `m2/<number>-<short-name>`. Title the PR
-   `M2 MR-<number>: <short name>`.
+2. Branch from `main` as `m3/<number>-<short-name>`. Title the PR
+   `M3 MR-<number>: <short name>`. M2 used `m2/` and `M2 MR-`; that queue
+   is closed.
 3. Touch only the files the ownership table assigns to that PR. If you need
    a trait or a core type changed, open a separate, tiny PR for that change
    first and say which MR needs it.
 4. Add the test file the milestone names. Tests inject the clock and never
    sleep.
-5. The PR description has two mandatory sections, even if both say "none":
-   "Core API changes" and "Persistence format changes".
+5. The PR description has three mandatory sections, even if each says "none":
+   "Core API changes", "Persistence format changes", and "Trait signature
+   changes".
 6. Run the full check before pushing (below). CI runs the same.
 
 ## Build and test commands
@@ -144,8 +149,9 @@ grep -E "test result|FAILED|panicked" /tmp/tideloom-<topic>.log
 - `tideloom-core/tests/spec.rs`: `BlockDetail`, `start_at`, schema checks.
 - `tideloom-core/tests/retry.rs`, `retry_limit.rs`, `timeout.rs`: policies
   and deadlines, driven by `Resume::Tick` with an injected `now`.
-- `tideloom-core/tests/http_call.rs`: `call: http` against a local TCP
-  fixture; no mocks of the client.
+- `tideloom-runtime/tests/http_call.rs`: `call: http` against a local TCP
+  fixture; no mocks of the client. The client still lives in
+  `tideloom-core/src/http.rs` until M3 MR-H4 moves it.
 - `tideloom-runtime/tests/contract.rs`: trait object safety, helpers,
   task routing. Milestone PRs add `memory_store.rs`, `local_wakeup.rs`,
   `engine.rs`, `journal.rs`, `fork.rs`, `child_workflow.rs`, `listen.rs`.
@@ -175,5 +181,9 @@ Test naming reads as a sentence: `a_jump_back_through_an_effectful_task_gets_a_n
 - `listen` filters are static strings only. Expressions, `correlate`, and
   `until` fault at block creation with a configuration fault; they are
   milestone work, not bugs.
-- `drive` / `drive_from` in the core are a test-only in-process driver for
-  HTTP calls. The engine replaces them; MR-9 deletes them.
+- `InstanceId::new` reads the wall clock through `Uuid::now_v7`. Ids carry
+  no deadline, so they do not go through `Clock`. Event ids are document or
+  executor values, likewise not clock readings.
+- Events are not retained for a subscription that does not exist yet. The
+  M2 `LocalEventBus` replays a retained log into a new inbox; M3 MR-H6
+  removes that replay. A lost event before `subscribe` is lost.
