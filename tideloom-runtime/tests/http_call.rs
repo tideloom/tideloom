@@ -189,15 +189,13 @@ fn content_output_feeds_the_next_walk() {
         output: content
   - stamp:
       set:
+        id: ${{ .id }}
         stamped: true
 "#,
         base = server.base
     );
     let output = completed(&tasks, json!({}));
-    assert_eq!(
-        output,
-        json!({"id": "milou", "name": "milou", "status": "pending", "stamped": true})
-    );
+    assert_eq!(output, json!({"id": "milou", "stamped": true}));
     assert_eq!(server.hits(), 1);
 }
 
@@ -484,7 +482,7 @@ fn a_false_if_does_not_call() {
         base = server.base
     );
     let output = completed(&tasks, json!({"go": false}));
-    assert_eq!(output, json!({"go": false, "ran": true}));
+    assert_eq!(output, json!({"ran": true}));
     assert_eq!(server.hits(), 0);
 }
 

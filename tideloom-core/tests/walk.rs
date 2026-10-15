@@ -60,7 +60,37 @@ fn sets_run_inline_to_completion() {
 "#,
     );
     let (output, _) = completed(start(&definition, &json!({})));
-    assert_eq!(output, json!({"color": "red", "sealed": true}));
+    assert_eq!(output, json!({"sealed": true}));
+}
+
+#[test]
+fn set_output_contains_only_the_assigned_keys() {
+    let definition = sample(
+        r#"
+  - setShape:
+      set:
+        shape: circle
+        size: ${ .configuration.size }
+        fill: ${ .configuration.fill }
+"#,
+    );
+    let (output, _) = completed(start(
+        &definition,
+        &json!({
+            "configuration": {
+                "size": { "width": 6, "height": 6 },
+                "fill": { "red": 69, "green": 69, "blue": 69 }
+            }
+        }),
+    ));
+    assert_eq!(
+        output,
+        json!({
+            "shape": "circle",
+            "size": { "width": 6, "height": 6 },
+            "fill": { "red": 69, "green": 69, "blue": 69 }
+        })
+    );
 }
 
 #[test]
@@ -112,7 +142,7 @@ fn an_output_resumes_the_tasks_after_the_block() {
         continuation,
         Resume::Output(json!({"sent": true})),
     ));
-    assert_eq!(output, json!({"sent": true, "sealed": true}));
+    assert_eq!(output, json!({"sealed": true}));
 }
 
 #[test]
@@ -200,7 +230,7 @@ fn a_continuation_round_trips_through_json() {
         restored,
         Resume::Output(json!({"paid": true})),
     ));
-    assert_eq!(output, json!({"paid": true, "sealed": true}));
+    assert_eq!(output, json!({"sealed": true}));
 }
 
 #[test]
@@ -251,7 +281,7 @@ fn wait_is_a_timer_until_it_is_released() {
         continuation,
         Resume::Release(json!({"held": true})),
     ));
-    assert_eq!(output, json!({"held": true, "sealed": true}));
+    assert_eq!(output, json!({"sealed": true}));
 }
 
 #[test]
@@ -519,6 +549,37 @@ fn switch_jumps_to_the_matching_sibling() {
 }
 
 #[test]
+fn switch_with_no_matching_case_follows_its_own_then() {
+    let definition = sample(
+        r#"
+  - switchColor:
+      switch:
+        - red:
+            when: .color == "red"
+            then: setRed
+        - green:
+            when: .color == "green"
+            then: setGreen
+        - blue:
+            when: .color == "blue"
+            then: setBlue
+      then: end
+  - setRed:
+      set:
+        colors: '${ .colors + [ "red" ] }'
+  - setGreen:
+      set:
+        colors: '${ .colors + [ "green" ] }'
+  - setBlue:
+      set:
+        colors: '${ .colors + [ "blue" ] }'
+"#,
+    );
+    let (output, _) = completed(start(&definition, &json!({"color": "yellow"})));
+    assert_eq!(output, json!({"color": "yellow"}));
+}
+
+#[test]
 fn a_jump_back_through_an_effectful_task_gets_a_new_pass_key() {
     let definition = sample(
         r#"
@@ -625,6 +686,7 @@ fn exit_leaves_the_nested_do() {
                     n: 2
         - after:
             set:
+              n: ${ .n }
               tail: true
 "#,
     );
@@ -648,7 +710,7 @@ use:
 "#,
     );
     let (output, _) = completed(start(&definition, &json!({"n": 1})));
-    assert_eq!(output, json!({"n": 1, "ok": true}));
+    assert_eq!(output, json!({"ok": true}));
 }
 
 #[test]
@@ -680,6 +742,7 @@ use:
         as: .pinged
   - after:
       set:
+        ok: ${ .ok }
         tail: true
 "#,
     );
@@ -723,7 +786,7 @@ fn fork_stops_for_the_join_and_does_not_run_branches() {
         continuation,
         Resume::Release(json!({"winner": "ship"})),
     ));
-    assert_eq!(output, json!({"winner": "ship", "joined": true}));
+    assert_eq!(output, json!({"joined": true}));
 }
 
 #[test]
@@ -754,7 +817,7 @@ fn listen_is_an_event_pause_and_foreach_is_not_walked() {
         continuation,
         Resume::Release(json!({"events": 1})),
     ));
-    assert_eq!(output, json!({"events": 1, "done": true}));
+    assert_eq!(output, json!({"done": true}));
 }
 
 #[test]
@@ -805,7 +868,7 @@ fn if_false_skips_an_effectful_task() {
 "#,
     );
     let (output, _) = completed(start(&definition, &json!({"go": false})));
-    assert_eq!(output, json!({"go": false, "ran": true}));
+    assert_eq!(output, json!({"ran": true}));
     let (block, _) = blocked(start(&definition, &json!({"go": true})));
     assert_eq!(block.position(), "/do/0/maybe");
 }
@@ -844,8 +907,32 @@ fn export_as_is_visible_to_later_tasks() {
 "#,
     );
     let (output, context) = completed(start(&definition, &json!({})));
-    assert_eq!(output, json!({"color": "red", "seen": "red"}));
+    assert_eq!(output, json!({"seen": "red"}));
     assert_eq!(context, json!({"color": "red"}));
+}
+
+#[test]
+fn export_as_replaces_the_context() {
+    let definition = sample(
+        r#"
+  - first:
+      set:
+        n: 1
+      export:
+        as: '{ a: 1, b: 1 }'
+  - second:
+      set:
+        n: 2
+      export:
+        as: '{ b: 2 }'
+  - later:
+      set:
+        seen: ${ $context }
+"#,
+    );
+    let (output, context) = completed(start(&definition, &json!({})));
+    assert_eq!(context, json!({"b": 2}));
+    assert_eq!(output, json!({"seen": {"b": 2}}));
 }
 
 #[test]
@@ -886,7 +973,7 @@ fn workflow_and_task_input_from_transform_data() {
         &definition,
         &json!({"order": {"id": 7}, "extra": true}),
     ));
-    assert_eq!(output, json!({"id": 7, "seen": 7}));
+    assert_eq!(output, json!({"seen": 7}));
 
     let definition = sample(
         r#"
@@ -894,11 +981,11 @@ fn workflow_and_task_input_from_transform_data() {
       input:
         from: .inner
       set:
-        n: 1
+        n: ${ .a }
 "#,
     );
     let (output, _) = completed(start(&definition, &json!({"inner": {"a": 1}, "b": 2})));
-    assert_eq!(output, json!({"a": 1, "n": 1}));
+    assert_eq!(output, json!({"n": 1}));
 }
 
 #[test]
