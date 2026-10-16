@@ -365,17 +365,24 @@ fn two_branches_finishing_together_release_the_parent_once() {
         let children = harness.store.children(&id).await.unwrap();
         assert_eq!(children.len(), 2);
 
-        // Both children are claimed and finished in one pass. Each terminal
-        // commit tries to release the parent; the second loses the CAS.
+        // Both children are claimed and finished in one pass. Each release
+        // reads the parent as it is now. The second writes `Runnable` again;
+        // `rejoin` re-reads the children, so that second release is idempotent
+        // and is not a version conflict.
         let second = harness.engine.run_once(harness.clock.now()).await.unwrap();
         assert_eq!(second.processed, 2);
-        // Each finished child releases the parent. The second release reads
-        // the version the first already wrote, so `apply` rejects it.
-        assert_eq!(second.conflicts, 1, "the second release must lose the CAS");
+        assert_eq!(
+            second.conflicts, 0,
+            "a second release of a Runnable parent is idempotent"
+        );
         let parent = harness.store.get(&id).await.unwrap();
         assert_eq!(parent.status, Status::Runnable, "{parent:?}");
-        // Spawn bumped the version to 1. Exactly one release bumps it to 2.
-        assert_eq!(parent.version, 2, "spawn, then exactly one release");
+        // Spawn bumped the version to 1. Each release reads the current
+        // version and writes `Runnable` again, so both land.
+        assert_eq!(
+            parent.version, 3,
+            "spawn, then one release per finished branch"
+        );
 
         // Re-evaluate. A second release must not produce a second output.
         harness.drive().await;
@@ -524,5 +531,128 @@ fn a_cancelled_branch_is_claimed_and_not_resumed() {
         assert!(again.iter().all(|instance| instance.id != slow.id));
         assert_eq!(*calls.lock().unwrap(), 0);
         let _ = Clock::now(&harness.clock);
+    });
+}
+
+/// The early branch is a `set` and finishes in the pass that starts the fork.
+/// That release makes the parent claimable again. The late branch is a `wait`
+/// and is still running when the parent is claimed in the same later pass,
+/// so `rejoin` reparks the parent. The late branch then finishes in that pass
+/// and must release the reparked row. A claim-time version snapshot would
+/// lose that CAS and leave the parent `Waiting(Join)` with no `wake_at`.
+#[test]
+fn a_late_branch_releases_a_parent_that_was_reparked_in_the_same_pass() {
+    let harness = Harness::new(definition(
+        r#"
+  - gather:
+      fork:
+        branches:
+          - early:
+              set:
+                lane: early
+          - late:
+              do:
+                - hold:
+                    wait: PT5S
+                - mark:
+                    set:
+                      lane: late
+  - after:
+      set:
+        joined: true
+"#,
+    ));
+    block_on(async {
+        let id = harness.start().await;
+        // Pass 1: spawn both branches and park the parent on the join.
+        let spawned = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        assert_eq!(spawned.processed, 1);
+        let parent = harness.store.get(&id).await.unwrap();
+        assert_eq!(parent.status, Status::Waiting(WaitReason::Join));
+
+        // Pass 2: the early branch finishes and releases the parent. The late
+        // branch parks on its wait, which is not due yet.
+        let early = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        assert!(early.processed >= 2, "{early:?}");
+        let parent = harness.store.get(&id).await.unwrap();
+        assert_eq!(parent.status, Status::Runnable, "{parent:?}");
+        let children = harness.store.children(&id).await.unwrap();
+        assert_eq!(children[0].status, Status::Completed);
+        assert_eq!(children[1].status, Status::Waiting(WaitReason::Timer));
+
+        // Pass 3: the parent is claimed with the now-due late branch. Rejoin
+        // sees the late branch still waiting and reparks; the late branch
+        // then completes and must release that new row.
+        harness.clock.set(at(1_000 + 5_000));
+        let late = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        assert!(late.processed >= 2, "{late:?}");
+        assert_eq!(
+            late.conflicts, 0,
+            "the late release must land on the reparked parent"
+        );
+        let parent = harness.store.get(&id).await.unwrap();
+        assert_ne!(
+            parent.status,
+            Status::Waiting(WaitReason::Join),
+            "a reparked parent must not stay waiting after the late branch finishes: {parent:?}"
+        );
+        assert!(
+            parent.wake_at.is_some() || parent.status.is_terminal(),
+            "the parent must be claimable or already finished: {parent:?}"
+        );
+
+        harness.drive().await;
+        let parent = harness.store.get(&id).await.unwrap();
+        assert_eq!(parent.status, Status::Completed, "{parent:?}");
+        assert_eq!(parent.output, Some(json!({"joined": true})));
+    });
+}
+
+/// A branch's first activity runs in the pass that starts the branch, not in
+/// a later claim that only existed to unpark it.
+#[test]
+fn a_branch_runs_its_first_activity_in_the_pass_that_starts_it() {
+    let calls = Arc::new(Mutex::new(0u32));
+    let harness = Harness::with_executor(
+        definition(
+            r#"
+  - gather:
+      fork:
+        branches:
+          - work:
+              call: http
+"#,
+        ),
+        Arc::new(CountingExecutor {
+            calls: Arc::clone(&calls),
+        }),
+    );
+    block_on(async {
+        let id = harness.start().await;
+        // The parent reaches the fork and spawns the branch.
+        let spawned = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        assert_eq!(spawned.processed, 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "the parent step does not run the branch"
+        );
+        let children = harness.store.children(&id).await.unwrap();
+        assert_eq!(children.len(), 1);
+        assert!(
+            children[0].continuation.is_none(),
+            "the branch has not started"
+        );
+
+        // The next pass claims the fresh branch and runs its activity.
+        let started = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        assert_eq!(started.processed, 1, "{started:?}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "the first activity runs in the pass that starts the branch"
+        );
+        let child = harness.store.get(&children[0].id).await.unwrap();
+        assert_eq!(child.status, Status::Completed, "{child:?}");
     });
 }
