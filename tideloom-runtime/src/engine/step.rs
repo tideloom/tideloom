@@ -109,27 +109,12 @@ impl Engine {
                     CLAIM_LIMIT,
                 )
                 .await?;
-        // Parent versions at claim time. A child that finishes later
-        // releases against this snapshot, so a sibling that already
-        // released loses the CAS instead of releasing again.
-        let mut parent_versions = std::collections::HashMap::new();
-        for instance in &claimed {
-            if let Some(parent) = &instance.parent {
-                parent_versions
-                    .entry(parent.id.clone())
-                    .or_insert(parent_row_version(self, &parent.id).await?);
-            }
-        }
         let mut count = StepCount::default();
         for instance in &claimed {
             // Before the step, so a listen that parks in this pass is known
             // when `drive_until_idle` looks for a satisfied inbox.
             self.remember(instance.id.clone());
-            let observed = instance
-                .parent
-                .as_ref()
-                .and_then(|parent| parent_versions.get(&parent.id).copied());
-            if self.step_observed(instance.clone(), now, observed).await? {
+            if self.step(instance.clone(), now).await? {
                 count.conflicts += 1;
             }
             count.processed += 1;
@@ -252,15 +237,6 @@ impl Engine {
     /// A store or bus failure. Interpreter and executor failures are written
     /// as a fault commit instead of returned.
     pub async fn step(&self, instance: Instance, now: Timestamp) -> Result<bool, EngineError> {
-        self.step_observed(instance, now, None).await
-    }
-
-    async fn step_observed(
-        &self,
-        instance: Instance,
-        now: Timestamp,
-        parent_version: Option<u64>,
-    ) -> Result<bool, EngineError> {
         self.remember(instance.id.clone());
         if instance.status == Status::Cancelled || instance.status.is_terminal() {
             return Ok(false);
@@ -312,10 +288,10 @@ impl Engine {
             self.wakeup()
                 .notify(parent.id.clone(), Hint::ChildDone(current.id.clone()))
                 .await?;
-            let release_conflict = self.release_parent(&parent.id, parent_version, now).await?;
-            if release_conflict {
-                return Ok(true);
-            }
+            // Releasing reads the parent's current version. A sibling that
+            // already released, or a rejoin that reparked the parent in this
+            // pass, is not a conflict: the next claim re-evaluates either way.
+            self.release_parent(&parent.id, now).await?;
         }
         Ok(conflict)
     }
@@ -371,15 +347,6 @@ impl Engine {
         } = &outcome
         {
             if block.pause() != Pause::Activity {
-                break;
-            }
-            // A fresh fork branch stops on its first activity without running
-            // the executor. A compete winner claimed in the same pass cancels
-            // it in its own commit, and the cancelled branch is never claimed
-            // again. A branch that survives runs the executor on the next
-            // claim, when its continuation is already stored. A root instance
-            // is not a branch, so its activity runs in this step.
-            if instance.continuation.is_none() && instance.parent.is_some() {
                 break;
             }
             if activities >= MAX_ACTIVITIES {
@@ -633,22 +600,11 @@ impl Engine {
             Resume::Release(serde_json::Value::Array(release.events)),
             WalkOptions::new().with_now(now),
         );
-        let prepared = prepare_child(
-            self.definitions().as_ref(),
-            instance,
-            definition,
-            outcome,
-            now,
-        )
-        .await?;
-        let commit = translate(
-            &instance.id,
-            instance.version,
-            &instance.definition,
-            prepared.outcome,
-            prepared.spawn,
-            now,
-        )?;
+        // Same finish as a timer release: an activity immediately after the
+        // listen runs in this step instead of parking as a due timer.
+        let commit = self
+            .finish_inline(instance, definition, outcome, now)
+            .await?;
         // The caller commits, then acks these ids. Acking here would drop
         // the events if that commit lost the CAS.
         Ok((commit, release.ids))
@@ -817,22 +773,12 @@ impl Engine {
                     Resume::Release(output),
                     WalkOptions::new().with_now(now),
                 );
-                let prepared = prepare_child(
-                    self.definitions().as_ref(),
-                    instance,
-                    definition,
-                    outcome,
-                    now,
-                )
-                .await?;
-                let mut commit = translate(
-                    &instance.id,
-                    instance.version,
-                    &instance.definition,
-                    prepared.outcome,
-                    prepared.spawn,
-                    now,
-                )?;
+                // Same finish as a child-workflow release. `translate` alone
+                // would park the next activity as a due timer and leave it
+                // for the following claim.
+                let mut commit = self
+                    .finish_inline(instance, definition, outcome, now)
+                    .await?;
                 commit.cancel = cancel;
                 Ok(commit)
             }
@@ -1084,13 +1030,16 @@ impl Engine {
     /// Flip a `Waiting(Join)` or `Waiting(Child)` parent back to `Runnable`
     /// so the next claim re-evaluates it.
     ///
-    /// The child's terminal commit has already landed. A version conflict
-    /// means another child released the parent first; the next claim
-    /// re-evaluates from the children either way, so the conflict is dropped.
+    /// The child's terminal commit has already landed. The release reads the
+    /// parent now and CAS-es that version, not the version from claim time.
+    /// A sibling that finished earlier in this pass may already have released
+    /// the parent and stepped it back to `Waiting(Join)`; that new row is the
+    /// one this release must flip. Releasing a parent that is already
+    /// `Runnable` writes `Runnable` again. `rejoin` re-reads `children`, so
+    /// the second release is idempotent and is not reported as a conflict.
     async fn release_parent(
         &self,
         parent: &InstanceId,
-        observed_version: Option<u64>,
         now: Timestamp,
     ) -> Result<bool, EngineError> {
         let parent = match self.store().get(parent).await {
@@ -1098,20 +1047,6 @@ impl Engine {
             Err(StoreError::NotFound(_)) => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        // A parent that is no longer waiting was released by a sibling that
-        // committed first. The second finisher still attempts the release
-        // against the version it observed before either commit, so `apply`
-        // rejects it. That conflict is the record that two children finished
-        // together and only one release landed. A `run: workflow` parent has
-        // one child, so the second release does not arise, but the same CAS
-        // is what makes a repeated `ChildDone` a no-op.
-        let waiting = matches!(
-            parent.status,
-            Status::Waiting(WaitReason::Join) | Status::Waiting(WaitReason::Child)
-        );
-        if !waiting && parent.status != Status::Runnable {
-            return Ok(false);
-        }
         let Some(bytes) = parent.continuation.clone() else {
             return Ok(false);
         };
@@ -1119,8 +1054,13 @@ impl Engine {
         if !matches!(continuation.pause(), Pause::Join { .. } | Pause::Child) {
             return Ok(false);
         }
-        let version = observed_version.unwrap_or(parent.version);
-        let mut commit = Commit::new(parent.id, version, Status::Runnable, now);
+        // A parent that has already moved on — completed, faulted, cancelled,
+        // or parked on a later pause — is not this join. A join that this
+        // pass reparked is still `Waiting(Join)` and must be released.
+        if parent.status.is_terminal() {
+            return Ok(false);
+        }
+        let mut commit = Commit::new(parent.id, parent.version, Status::Runnable, now);
         commit.continuation = Some(bytes);
         commit.wake_at = Some(now);
         self.apply_step(commit).await
@@ -1280,13 +1220,6 @@ impl Engine {
             }
         }
         Ok(())
-    }
-}
-
-async fn parent_row_version(engine: &Engine, id: &InstanceId) -> Result<u64, EngineError> {
-    match engine.store().get(id).await {
-        Ok(parent) => Ok(parent.version),
-        Err(error) => Err(error.into()),
     }
 }
 

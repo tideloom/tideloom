@@ -219,9 +219,7 @@ fn translate_block(
                 Status::Waiting(WaitReason::Timer),
                 // A zero wait is still a stop. `claim` treats `wake_at <= now`
                 // as due, so parking at `now` would be claimed again in the
-                // same instant and the step would never idle. A fresh fork
-                // branch is not a timer: it parks as a due timer below so the
-                // next pass can claim it.
+                // same instant and the step would never idle.
                 Some(park_until(now, after)),
                 Vec::new(),
             )
@@ -268,12 +266,15 @@ fn translate_block(
             }
             (Status::Waiting(WaitReason::Child), None, spawn.to_vec())
         }
-        // `claim` only returns `Runnable` and a due `Waiting(Timer)`. An
-        // activity that this step did not run — a fresh branch, so a compete
-        // winner in the same pass can cancel it first — waits as a due timer
-        // and is claimed again immediately. `Waiting(Activity)` would never
-        // be claimed back.
-        Pause::Activity => (Status::Waiting(WaitReason::Timer), Some(now), Vec::new()),
+        // The step runs activities before `translate`. Reaching one here is a
+        // runner contract violation, same as a child workflow that was not
+        // resolved: parking it would hide the skipped executor behind a timer.
+        Pause::Activity => {
+            return Err(EngineError::Unsupported(format!(
+                "activity at {} reached translate without running",
+                block.position()
+            )));
+        }
         Pause::Events => {
             // The step subscribes before applying this commit, then flips the
             // instance to `Runnable` when the inbox already matches. While
