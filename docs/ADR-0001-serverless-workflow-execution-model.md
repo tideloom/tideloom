@@ -12,7 +12,7 @@ Accepted
 
 修订：2026-10-14（M2 MR-9）。M2 完成。单进程运行时由 `Engine` 组合 `MemoryStore`、`LocalWakeup`、`MemoryDefinitions`、`LocalEventBus`、`ManualClock` / `SystemClock` 与 activity executor。验收是 `tideloom-runtime/examples/single_process.rs`：一个包含 `set`、`call: http`、`try` 重试、`wait`、cooperative `fork`、compete `fork`、`run: workflow` 和 `emit` → `listen` 的工作流，由 `Engine::drive_until_idle` 端到端跑完，时钟注入，进程不 sleep。核心的 `drive` / `drive_from` / `drive_with` 已删除；`call: http` 只剩一次请求的 `http_call`，由引擎 resume。
 
-M3 的入口条件：M2 的验收 example 在 `main` 上通过；`InstanceStore::apply` 与 `Wakeup::commit_offset` 仍只从 `Engine::commit` 调用；换 SQL 存储与多进程时不改解释器、不改 `Commit` 字段、不把 journal 读回执行路径。M3 从 SQL `InstanceStore` 与跨进程可重放 `Wakeup` 开始，trait 签名不变。
+修订：2026-10-15（M3 MR-0）。M2 合入后的审查表明，直接换 SQL 会把单进程实现里的几处结构问题固化成表结构。M3 因此先做 H 段加固，再做 S 段 SQL。入口条件改为：H 段结束时 `Instance` 带 `root_task` 与 `in_flight`，不再把分支起点藏进 `input`，不再用 `Lease.open_attempt` 或 `Waiting(Activity)` 表达进行中的 activity；`Engine` 读自己的 `Clock`，不再持有进程内 `known` 列表。trait 签名允许在对应 MR 里追加方法（`latest_step`、`wake`、`next_due`、`release_leases`，以及 `EventSink::publish` 返回本次投递的实例），不改 `apply` 与 `commit_offset` 的调用点。`Continuation` 的帧与 `SCHEMA` 不变。里程碑拆分见 `docs/milestone-m3-postgres-and-two-workers.md`。
 
 ## Context
 
