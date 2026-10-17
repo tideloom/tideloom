@@ -27,6 +27,12 @@ pub enum BlockDetail {
     Child(ChildRef),
     /// `listen`: what to subscribe to.
     Listen(ListenSpec),
+    /// `emit`: `emit.event.with` evaluated when the block was created.
+    ///
+    /// The scope is the same as `set`: `.`, `$input`, `$context`, `$workflow`,
+    /// and `$task`. The executor turns this value into a CloudEvent; it does
+    /// not evaluate the document again.
+    Emit(Value),
 }
 
 /// One `fork` branch.

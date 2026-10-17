@@ -83,8 +83,8 @@ impl Harness {
         let wakeup = Arc::new(DroppingWakeup::new());
         let clock = ManualClock::at(at(1_000));
         let calls = Arc::new(AtomicUsize::new(0));
-        // Registered, so the retry test replaces `http_call`. A workflow that
-        // does not register one still uses the core client.
+        // Registered, so the retry test replaces the HTTP transport. An
+        // unregistered HTTP task faults like any other missing executor.
         let executors: Vec<Arc<dyn ActivityExecutor>> =
             vec![Arc::new(CountingHttp::new(Arc::clone(&calls)))];
         let engine = engine_for(

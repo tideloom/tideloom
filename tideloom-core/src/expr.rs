@@ -6,8 +6,8 @@
 //!
 //! `set` strings are literals unless they contain `${ ... }`. A string whose
 //! whole value is one interpolation becomes that value. Other interpolations
-//! are text. `if`, `when`, `for.in`, `while`, `input.from`, `output.as`, and
-//! `export.as` are expressions, not interpolated strings.
+//! are text. `if`, `when`, `for.in`, `while`, `input.from`, `output.as`,
+//! `export.as`, and `emit.event.with` are evaluated through [`evaluate_data`].
 
 use std::collections::BTreeMap;
 
@@ -31,7 +31,21 @@ pub(crate) fn evaluate(
     Ok(values.remove(0))
 }
 
-pub(crate) fn evaluate_data(
+/// Evaluate `${ ... }` inside a JSON value, as `set` and `emit.event.with` do.
+///
+/// A string whose whole value is one interpolation keeps its JSON type. Other
+/// interpolations become text. Objects and arrays are walked. A value with no
+/// interpolation is cloned.
+///
+/// `dot` is `.`. `vars` holds `$input`, `$context`, `$workflow`, `$task`, and
+/// any frame bindings. A missing binding is an expression error from the
+/// subset, not a silent null.
+///
+/// # Errors
+///
+/// Returns the subset's expression error when a string cannot be evaluated or
+/// does not produce one value.
+pub fn evaluate_data(
     value: &Value,
     dot: &Value,
     vars: &BTreeMap<String, Value>,
