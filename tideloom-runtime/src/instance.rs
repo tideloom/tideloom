@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tideloom_core::Fault;
+use tideloom_core::TaskKey;
 use tideloom_core::Timestamp;
 use uuid::Uuid;
 
@@ -69,12 +70,14 @@ pub struct DefinitionKey {
 }
 
 /// Why an instance is not runnable right now.
+///
+/// An effectful task in progress is not a wait. The instance stays `Running`
+/// with a live lease and [`Instance::in_flight`] set. A lapsed lease is what
+/// the sweeper sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaitReason {
     /// `wait` or a retry backoff. `Instance::wake_at` says when.
     Timer,
-    /// An effectful task is running in an executor.
-    Activity,
     /// `fork`: child instances are running. Their terminal commits wake the parent.
     Join,
     /// `run: workflow`: one child instance is running.
@@ -123,20 +126,29 @@ pub struct ParentRef {
 }
 
 /// A worker's exclusive hold on an instance.
+///
+/// A lease is only who holds the instance and until when. The open activity,
+/// if any, is [`Instance::in_flight`], not a field of the lease.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     /// Who holds it.
     pub worker: WorkerId,
     /// When it lapses. A sweeper returns lapsed instances to `Runnable`.
     pub until: Timestamp,
-    /// Journal attempt this hold has opened and not finished.
-    ///
-    /// The store sets it from a `Pending` row committed while the lease is
-    /// held, and clears it when that attempt's outcome is upserted. A step
-    /// that still holds the lease continues the attempt. A new claim does not
-    /// carry it, so a crash is not mistaken for the second commit.
-    #[serde(default)]
-    pub open_attempt: Option<u32>,
+}
+
+/// The activity a worker has opened and not finished.
+///
+/// The engine writes this when it commits the `Pending` journal row and
+/// clears it when that attempt's outcome lands. It names the row a recovery
+/// claim should read; it does not replace that row. A crash leaves it set
+/// with the lease still held, so the sweeper can find the instance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlight {
+    /// Position plus execution key of the open activity.
+    pub key: TaskKey,
+    /// Journal attempt the `Pending` row was written at.
+    pub attempt: u32,
 }
 
 /// One workflow instance as the store keeps it.
@@ -162,6 +174,17 @@ pub struct Instance {
     pub lease: Option<Lease>,
     /// Earliest instant a `Waiting(Timer)` instance may be claimed.
     pub wake_at: Option<Timestamp>,
+    /// Task position to start at, for a `fork` branch. `None` starts at the root.
+    ///
+    /// The branch input is [`Instance::input`] unchanged. The position does
+    /// not ride along inside that value.
+    pub root_task: Option<String>,
+    /// The activity this instance has opened and not finished, if any.
+    ///
+    /// Set while the instance is `Running` and the executor has not returned.
+    /// A recovery claim reads `InstanceStore::latest_step` for this key; the
+    /// journal row, not this field, decides whether the outcome is unknown.
+    pub in_flight: Option<InFlight>,
     /// Workflow input, kept for `run: workflow` children and diagnostics.
     pub input: Value,
     /// Output once `Completed`.
@@ -192,6 +215,8 @@ impl Instance {
             version: 0,
             lease: None,
             wake_at: Some(created_at),
+            root_task: None,
+            in_flight: None,
             input,
             output: None,
             fault: None,

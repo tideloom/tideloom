@@ -249,10 +249,10 @@ fn translate_block(
                         id: instance.clone(),
                         branch: Some(index),
                     },
-                    // The position rides along so `start_at` knows which task
-                    // is the branch root. `branch_input` strips it before the
-                    // branch evaluates anything.
-                    input: super::step::branch_input(block.input(), &branch.position),
+                    // The fork input is the branch input. The position is a
+                    // column, not a key hidden inside that value.
+                    input: block.input().clone(),
+                    root_task: Some(branch.position.clone()),
                 })
                 .collect();
             (Status::Waiting(WaitReason::Join), None, children)

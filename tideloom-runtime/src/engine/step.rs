@@ -43,6 +43,7 @@ use crate::Commit;
 use crate::Engine;
 use crate::EngineError;
 use crate::Hint;
+use crate::InFlight;
 use crate::Instance;
 use crate::InstanceId;
 use crate::ManualClock;
@@ -114,7 +115,12 @@ impl Engine {
             // Before the step, so a listen that parks in this pass is known
             // when `drive_until_idle` looks for a satisfied inbox.
             self.remember(instance.id.clone());
-            if self.step(instance.clone(), now).await? {
+            // A claim is a new hold. `in_flight` on that row was written by
+            // the hold the sweeper just released, not by this one. `step`
+            // re-reads after the claim has replaced the lease, so the flag
+            // has to travel with this copy.
+            let recovering = instance.in_flight.is_some();
+            if self.step_claimed(instance.clone(), now, recovering).await? {
                 count.conflicts += 1;
             }
             count.processed += 1;
@@ -167,11 +173,12 @@ impl Engine {
 
     /// Run one claimed instance until its `Pending` journal row is committed.
     ///
-    /// The executor has not run. The lease stays held, with `open_attempt`
-    /// set, so a later [`Engine::step`] of the same instance finishes the
-    /// attempt instead of treating it as a crash. Tests use this to stand in
-    /// for a worker that died between the two commits: lapse the lease, then
-    /// `run_once`.
+    /// The executor has not run. The instance stays `Running`, the lease stays
+    /// held, and `in_flight` names the open attempt, so a later
+    /// [`Engine::step`] of the same instance finishes it instead of treating
+    /// it as a crash. Tests stand in for a dead worker by advancing the clock
+    /// past the lease and calling `run_once`: the sweeper returns the expired
+    /// `Running` row, and the next claim reads `latest_step`.
     ///
     /// # Errors
     ///
@@ -216,6 +223,7 @@ impl Engine {
                 current.version,
                 now,
                 true,
+                false,
             )
             .await?;
         let Some(commit) = journalled.done else {
@@ -237,6 +245,17 @@ impl Engine {
     /// A store or bus failure. Interpreter and executor failures are written
     /// as a fault commit instead of returned.
     pub async fn step(&self, instance: Instance, now: Timestamp) -> Result<bool, EngineError> {
+        // A direct step of a row that still holds its lease continues an
+        // open attempt. `run_once` passes the pre-claim lease instead.
+        self.step_claimed(instance, now, false).await
+    }
+
+    async fn step_claimed(
+        &self,
+        instance: Instance,
+        now: Timestamp,
+        recovering: bool,
+    ) -> Result<bool, EngineError> {
         self.remember(instance.id.clone());
         if instance.status == Status::Cancelled || instance.status.is_terminal() {
             return Ok(false);
@@ -248,7 +267,7 @@ impl Engine {
             return Ok(false);
         }
         let definition = self.definitions().get(&current.definition).await?;
-        let result = self.interpret(&current, &definition, now).await;
+        let result = self.interpret(&current, &definition, now, recovering).await;
         let (commit, acked) = match result {
             Ok(commit) => commit,
             Err(error) => (fault_commit(&current, now, &error)?, Vec::new()),
@@ -301,6 +320,7 @@ impl Engine {
         instance: &Instance,
         definition: &Definition,
         now: Timestamp,
+        recovering: bool,
     ) -> Result<(Commit, Vec<String>), EngineError> {
         let options = WalkOptions::new().with_now(now);
         let mut outcome = match &instance.continuation {
@@ -372,6 +392,7 @@ impl Engine {
                     version,
                     now,
                     false,
+                    recovering,
                 )
                 .await?;
             if let Some(commit) = journalled.done {
@@ -474,6 +495,7 @@ impl Engine {
                     continuation,
                     version,
                     now,
+                    false,
                     false,
                 )
                 .await?;
@@ -612,10 +634,12 @@ impl Engine {
 
     /// Journal one activity, then run it unless `cut` stops after `Pending`.
     ///
-    /// The pending commit keeps the lease. The outcome upserts the same
-    /// `(instance, key, attempt)` row. A `Pending` row whose attempt is not on
-    /// this lease is a crash: an idempotent executor runs again at
-    /// `attempt + 1`, and any other executor faults the instance.
+    /// The pending commit keeps the lease and sets `in_flight`. The outcome
+    /// upserts the same `(instance, key, attempt)` row and clears `in_flight`.
+    /// A recovered claim whose `in_flight` names a still-`Pending` row is a
+    /// crash: an idempotent executor runs again at `attempt + 1`, and any
+    /// other executor faults the instance. `in_flight` only names the row;
+    /// [`InstanceStore::latest_step`] is what says it is still pending.
     #[allow(clippy::too_many_arguments)]
     async fn run_journalled(
         &self,
@@ -626,6 +650,7 @@ impl Engine {
         version: u64,
         now: Timestamp,
         after_pending: bool,
+        recovering: bool,
     ) -> Result<Journalled, EngineError> {
         let Some(kind) = TaskKind::of(block.kind()) else {
             return Ok(Journalled::resume(Resume::Fault(Fault::runtime(
@@ -633,15 +658,8 @@ impl Engine {
                 "effectful task has no executor kind",
             ))));
         };
-        let held = instance
-            .lease
-            .as_ref()
-            .filter(|lease| lease.worker == *self.worker())
-            .and_then(|lease| lease.open_attempt);
-        match self
-            .open_attempt(&instance.id, block.key(), kind, held)
-            .await?
-        {
+        let held = held_attempt(instance, block.key(), recovering);
+        match self.open_attempt(instance, block.key(), kind, held).await? {
             OpenAttempt::Unknown { pending } => {
                 let fault = Fault::runtime(block.position(), UNKNOWN_DETAIL);
                 let mut unknown = pending;
@@ -649,6 +667,7 @@ impl Engine {
                 unknown.outcome = StepOutcome::Unknown;
                 unknown.finished_at = now;
                 let mut commit = faulted_at(&instance.id, version, now, fault);
+                commit.in_flight = None;
                 commit.step_results.push(unknown);
                 Ok(Journalled::finished(commit))
             }
@@ -665,17 +684,17 @@ impl Engine {
                         now,
                     );
                     if after_pending {
-                        // This cut is the pending commit. A follow-up commit
-                        // would replace Waiting(Activity) and clear the open
-                        // attempt the next step of this hold continues.
-                        let mut commit = Commit::new(
-                            instance.id.clone(),
-                            version,
-                            Status::Waiting(WaitReason::Activity),
-                            now,
-                        );
+                        // This cut is the pending commit. A follow-up would
+                        // clear `in_flight`, and the next step of this hold
+                        // would treat the open attempt as a crash.
+                        let mut commit =
+                            Commit::new(instance.id.clone(), version, Status::Running, now);
                         commit.continuation = Some(encode(&instance.id, continuation)?);
                         commit.release_lease = false;
+                        commit.in_flight = Some(InFlight {
+                            key: block.key().clone(),
+                            attempt,
+                        });
                         commit.step_results.push(pending);
                         return Ok(Journalled::finished(commit));
                     }
@@ -684,7 +703,11 @@ impl Engine {
                         version,
                         continuation,
                         pending,
-                        Status::Waiting(WaitReason::Activity),
+                        Status::Running,
+                        Some(InFlight {
+                            key: block.key().clone(),
+                            attempt,
+                        }),
                     )
                     .await?;
                     version += 1;
@@ -720,6 +743,7 @@ impl Engine {
                     continuation,
                     activity_row(instance, block, kind, attempt, finished, started_at, now),
                     Status::Running,
+                    None,
                 )
                 .await?;
                 Ok(Journalled {
@@ -733,22 +757,21 @@ impl Engine {
 
     /// Start a run that has no continuation yet.
     ///
-    /// A `fork` branch carries its task position in the instance input under
-    /// [`BRANCH_POSITION`], written when the parent spawned it. The visible
-    /// workflow input is everything else. `start_at` makes that task the
-    /// root, so a fault inside the branch stops at the branch and does not
-    /// walk the parent's `try`.
+    /// A `fork` branch stores its task position on [`Instance::root_task`].
+    /// `start_at` makes that task the root, so a fault inside the branch
+    /// stops at the branch and does not walk the parent's `try`. The input
+    /// is [`Instance::input`] as stored; nothing is stripped from it.
     fn begin(
         &self,
         instance: &Instance,
         definition: &Definition,
         options: WalkOptions,
     ) -> Result<Outcome, EngineError> {
-        match branch_start(&instance.input) {
+        match instance.root_task.as_deref() {
             Some(position) => Ok(start_at_with(
                 definition,
-                &position,
-                &visible_input(&instance.input),
+                position,
+                &instance.input,
                 options,
             )),
             None => Ok(start_with(definition, &instance.input, options)),
@@ -850,24 +873,33 @@ impl Engine {
 
     async fn open_attempt(
         &self,
-        instance: &InstanceId,
+        instance: &Instance,
         key: &TaskKey,
         kind: TaskKind,
         held_attempt: Option<u32>,
     ) -> Result<OpenAttempt, EngineError> {
-        let steps = self.store().steps(instance).await?;
-        let latest = steps.iter().rev().find(|step| &step.key == key);
-        let Some(latest) = latest else {
+        // No open activity: either the first visit, or a finished one. The
+        // latest row, not a scan of the journal, says which.
+        let Some(open) = instance.in_flight.as_ref().filter(|open| &open.key == key) else {
+            let latest = self.store().latest_step(&instance.id, key).await?;
+            return Ok(OpenAttempt::Run {
+                attempt: latest.map_or(0, |step| step.attempt.saturating_add(1)),
+            });
+        };
+        let Some(latest) = self.store().latest_step(&instance.id, key).await? else {
+            // `in_flight` names a row that is not there. Treat it as a first
+            // visit rather than inventing an attempt the journal never wrote.
             return Ok(OpenAttempt::Run { attempt: 0 });
         };
-        if !matches!(latest.outcome, StepOutcome::Pending) {
+        if !matches!(latest.outcome, StepOutcome::Pending) || latest.attempt != open.attempt {
             return Ok(OpenAttempt::Run {
                 attempt: latest.attempt.saturating_add(1),
             });
         }
         // This hold already wrote Pending and has not finished. Continue it.
-        // A new claim does not carry `open_attempt`, so a Pending row then is
-        // a crash, not the second half of this call.
+        // A recovered claim still carries `in_flight`, but its lease is gone
+        // or belongs to the worker that died, so `held_attempt` is empty and
+        // the Pending row is a crash, not the second half of this call.
         if held_attempt == Some(latest.attempt) {
             return Ok(OpenAttempt::Run {
                 attempt: latest.attempt,
@@ -878,9 +910,7 @@ impl Engine {
                 attempt: latest.attempt.saturating_add(1),
             });
         }
-        Ok(OpenAttempt::Unknown {
-            pending: latest.clone(),
-        })
+        Ok(OpenAttempt::Unknown { pending: latest })
     }
 
     async fn started_at_of(
@@ -890,11 +920,9 @@ impl Engine {
         attempt: u32,
         now: Timestamp,
     ) -> Result<Timestamp, EngineError> {
-        let steps = self.store().steps(instance).await?;
-        Ok(steps
-            .iter()
-            .rev()
-            .find(|step| &step.key == key && step.attempt == attempt)
+        let latest = self.store().latest_step(instance, key).await?;
+        Ok(latest
+            .filter(|step| step.attempt == attempt)
             .map(|step| step.started_at)
             .unwrap_or(now))
     }
@@ -906,10 +934,12 @@ impl Engine {
         continuation: &Continuation,
         step: StepResult,
         status: Status,
+        in_flight: Option<InFlight>,
     ) -> Result<(), EngineError> {
         let mut commit = Commit::new(instance.clone(), version, status, step.finished_at);
         commit.continuation = Some(encode(instance, continuation)?);
         commit.release_lease = false;
+        commit.in_flight = in_flight;
         commit.step_results.push(step);
         self.apply_step(commit).await?;
         Ok(())
@@ -927,6 +957,12 @@ impl Engine {
             commit.wake_at = Some(now);
             commit.output = instance.output;
             commit.fault = instance.fault;
+            // The open activity survives the sweep. The next claim reads
+            // `latest_step` for this key; clearing it here would hide the crash.
+            // The lease does not survive: a recovered claim must not look like
+            // the hold that wrote `Pending`.
+            commit.in_flight = instance.in_flight;
+            commit.release_lease = true;
             self.apply_step(commit).await?;
         }
         Ok(())
@@ -1300,6 +1336,21 @@ impl Journalled {
     }
 }
 
+/// The attempt this hold already opened, unless the claim is a recovery.
+///
+/// A claim is a new hold, and it keeps `in_flight`. That field was written
+/// by the hold the sweeper released. The re-read inside `step` already has
+/// the new lease, so it cannot tell the two holds apart; `recovering` is
+/// that fact, carried from the claimed copy. `in_flight` still only names
+/// the row `latest_step` must read.
+fn held_attempt(instance: &Instance, key: &TaskKey, recovering: bool) -> Option<u32> {
+    if recovering {
+        return None;
+    }
+    let open = instance.in_flight.as_ref()?;
+    (&open.key == key).then_some(open.attempt)
+}
+
 /// What the latest journal row for this key says the executor should do.
 #[allow(clippy::large_enum_variant)]
 enum OpenAttempt {
@@ -1354,6 +1405,7 @@ fn still_running(
     let mut commit = Commit::new(instance.id.clone(), version, Status::Running, now);
     commit.continuation = Some(encode(&instance.id, continuation)?);
     commit.release_lease = false;
+    commit.in_flight = instance.in_flight.clone();
     Ok(commit)
 }
 
@@ -1390,50 +1442,4 @@ fn rewrap(error: &EngineError) -> EngineError {
         EngineError::Unsupported(detail) => EngineError::Unsupported(detail.clone()),
         EngineError::Events(detail) => EngineError::Events(detail.clone()),
     }
-}
-
-/// Input key under which a spawned branch carries its task position.
-///
-/// `SpawnChild` has no position field, and MR-5 does not change that type.
-/// The position has to travel with the child or `start_at` has nothing to
-/// start. It is stripped before the branch runs, so a workflow that reads
-/// its input does not see it. The key is a JSON Pointer, which a workflow
-/// input object cannot collide with: pointers start with `/` or are empty,
-/// and this key does not.
-pub const BRANCH_POSITION: &str = "\u{0}tideloom.branch";
-
-/// Attach a branch position to the fork input. A non-object input is wrapped
-/// so the position has somewhere to live, and unwrapped again on start.
-#[must_use]
-pub fn branch_input(input: &Value, position: &str) -> Value {
-    match input {
-        Value::Object(fields) => {
-            let mut fields = fields.clone();
-            fields.insert(
-                BRANCH_POSITION.to_string(),
-                Value::String(position.to_string()),
-            );
-            Value::Object(fields)
-        }
-        other => serde_json::json!({
-            BRANCH_POSITION: position,
-            "\u{0}tideloom.input": other,
-        }),
-    }
-}
-
-fn branch_start(input: &Value) -> Option<String> {
-    input.get(BRANCH_POSITION)?.as_str().map(str::to_string)
-}
-
-fn visible_input(input: &Value) -> Value {
-    let Some(fields) = input.as_object() else {
-        return input.clone();
-    };
-    if let Some(wrapped) = fields.get("\u{0}tideloom.input") {
-        return wrapped.clone();
-    }
-    let mut fields = fields.clone();
-    fields.remove(BRANCH_POSITION);
-    Value::Object(fields)
 }

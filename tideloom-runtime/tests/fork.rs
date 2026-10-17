@@ -656,3 +656,62 @@ fn a_branch_runs_its_first_activity_in_the_pass_that_starts_it() {
         assert_eq!(child.status, Status::Completed, "{child:?}");
     });
 }
+
+/// A branch stores the fork input as its own input. The task it starts at is
+/// `root_task`, not a key hidden in that value.
+#[test]
+fn a_branch_keeps_the_parent_input_and_records_its_position() {
+    let harness = Harness::new(definition(
+        r#"
+  - gather:
+      fork:
+        branches:
+          - left:
+              set:
+                lane: left
+          - right:
+              set:
+                lane: right
+"#,
+    ));
+    block_on(async {
+        let input = json!({"order": "A-9", "nested": {"n": 1}});
+        let instance = Instance::new(
+            harness.key.clone(),
+            None,
+            input.clone(),
+            harness.clock.now(),
+        );
+        let id = instance.id.clone();
+        harness.store.create(instance).await.unwrap();
+
+        let spawned = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        assert_eq!(spawned.processed, 1);
+        let parent = harness.store.get(&id).await.unwrap();
+        assert!(parent.root_task.is_none(), "{parent:?}");
+        assert_eq!(parent.input, input);
+
+        let children = harness.store.children(&id).await.unwrap();
+        assert_eq!(children.len(), 2);
+        let positions: Vec<_> = children
+            .iter()
+            .map(|child| child.root_task.clone())
+            .collect();
+        assert!(
+            positions.iter().all(|position| position.is_some()),
+            "{positions:?}"
+        );
+        assert_ne!(positions[0], positions[1]);
+        for child in &children {
+            assert_eq!(
+                child.input, input,
+                "a branch input is the parent input, byte for byte"
+            );
+            assert!(
+                !child.input.to_string().contains("tideloom.branch"),
+                "the position must not ride inside the input: {}",
+                child.input
+            );
+        }
+    });
+}

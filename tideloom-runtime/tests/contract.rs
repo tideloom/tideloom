@@ -69,6 +69,10 @@ fn a_new_instance_is_runnable_now() {
     let commit = Commit::new(instance.id.clone(), 0, Status::Completed, created);
     assert!(commit.release_lease);
     assert!(commit.step_results.is_empty());
+    assert!(commit.in_flight.is_none());
+    assert!(instance.root_task.is_none());
+    assert!(instance.in_flight.is_none());
+    assert!(instance.lease.is_none());
 }
 
 #[test]

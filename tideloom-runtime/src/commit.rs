@@ -6,6 +6,7 @@ use tideloom_core::TaskKey;
 use tideloom_core::Timestamp;
 
 use crate::DefinitionKey;
+use crate::InFlight;
 use crate::InstanceId;
 use crate::ParentRef;
 use crate::Status;
@@ -59,8 +60,11 @@ pub struct SpawnChild {
     pub definition: DefinitionKey,
     /// Who it belongs to.
     pub parent: ParentRef,
-    /// Child input.
+    /// Child input. A branch's input is the fork input, not a wrapped copy.
     pub input: Value,
+    /// Task position a `fork` branch starts at. `None` starts a child workflow
+    /// at its own root.
+    pub root_task: Option<String>,
 }
 
 /// Everything one engine step changes, applied atomically or not at all.
@@ -94,6 +98,13 @@ pub struct Commit {
     pub cancel: Vec<InstanceId>,
     /// Whether to release the lease. `false` keeps it for an immediate next step.
     pub release_lease: bool,
+    /// The activity this commit leaves open.
+    ///
+    /// `Some` when the commit writes that activity's `Pending` row. `None`
+    /// when it writes the attempt's outcome, or when the step is not an
+    /// activity. The store copies this onto the instance; it does not derive
+    /// it from [`Commit::step_results`].
+    pub in_flight: Option<InFlight>,
     /// When the commit was built.
     pub at: Timestamp,
 }
@@ -114,6 +125,7 @@ impl Commit {
             spawn_children: Vec::new(),
             cancel: Vec::new(),
             release_lease: true,
+            in_flight: None,
             at,
         }
     }

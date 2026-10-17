@@ -415,11 +415,9 @@ fn a_dropped_signal_still_finishes_after_the_sweeper() {
         "the wait commit releases the lease"
     );
 
-    // The worker died holding nothing, but a later claim can still lapse.
-    // Force a live lease into the past and drop every signal the sweeper
-    // would have sent. The next pass reads the store.
-    harness.store.lapse_lease(&id, at(1));
-    // Re-claim so a lease exists, then kill the worker.
+    // The wait is not due yet, so a claim takes nothing. Arm a lease at the
+    // deadline, then move the clock past it without stepping. `notify_due`
+    // reads the store's sweep; the bus drops the hint it sends.
     let claimed =
         run(harness
             .store
@@ -429,8 +427,6 @@ fn a_dropped_signal_still_finishes_after_the_sweeper() {
         claimed.is_empty(),
         "the wait is not due yet, so claim takes nothing"
     );
-    // Arm a lease by claiming at the deadline, then lapse it without stepping
-    // and without delivering the sweeper's hint.
     harness.clock.set(waiting.wake_at.expect("wait"));
     let held = run(harness.store.claim(
         harness.engine.worker(),
@@ -440,7 +436,8 @@ fn a_dropped_signal_still_finishes_after_the_sweeper() {
     ))
     .unwrap();
     assert_eq!(held.len(), 1);
-    harness.store.lapse_lease(&id, at(1));
+    let lease_until = held[0].lease.as_ref().expect("claimed lease").until;
+    harness.clock.set(at(lease_until.millis() + 1));
     let swept = block_on(tideloom_runtime::notify_due(
         &harness.engine,
         harness.clock.now(),
