@@ -522,3 +522,36 @@ async fn a_filter_matches_only_when_every_attribute_is_equal() {
         "a shared type is not enough when source differs"
     );
 }
+
+/// `$task.name` and `${ .items | length }` are evaluated by the interpreter,
+/// not by a private emit evaluator. The old evaluator rejected both.
+#[tokio::test]
+async fn emit_uses_task_name_and_a_length_filter() {
+    let yaml = r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: paint
+  version: '0.1.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: ${ $task.name }
+            data:
+              count: ${ .items | length }
+"#;
+    let definition = Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}"));
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition);
+    let bus = Arc::new(LocalEventBus::new());
+    let executor = EmitExecutor::new(bus, definitions);
+    let output = executor
+        .execute(execution(key, json!({"items": [1, 2, 3]})))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(output["type"], "notify");
+    assert_eq!(output["data"]["count"], 3);
+}

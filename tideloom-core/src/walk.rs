@@ -174,7 +174,7 @@ impl Block {
     }
 
     /// Pause-specific data: the `wait` duration, `fork` branches, the child
-    /// workflow, or the `listen` subscription.
+    /// workflow, the `listen` subscription, or the evaluated `emit` payload.
     #[must_use]
     pub fn detail(&self) -> &BlockDetail {
         &self.detail
@@ -467,6 +467,37 @@ pub fn resume_with(
         .workflow_timeout()
         .and_then(|()| interpreter.apply(pending, event));
     interpreter.run(first)
+}
+
+/// The `$input`, `$context`, `$workflow`, and `$task` scope of an `emit`.
+///
+/// This is the scope [`BlockDetail::Emit`] is evaluated in, minus bindings
+/// from enclosing `for` frames. Those bindings exist only while the
+/// interpreter is walking. A runner that has the block uses that evaluated
+/// value; this is for an executor that has the node and the three scopes.
+#[must_use]
+pub fn emit_scope(
+    node: &Node,
+    input: &Value,
+    context: &Value,
+    workflow_input: &Value,
+) -> BTreeMap<String, Value> {
+    let mut map = BTreeMap::new();
+    map.insert("context".to_string(), context.clone());
+    map.insert("input".to_string(), input.clone());
+    map.insert(
+        "workflow".to_string(),
+        serde_json::json!({ "input": workflow_input }),
+    );
+    map.insert(
+        "task".to_string(),
+        serde_json::json!({
+            "name": node.name(),
+            "reference": node.position(),
+            "input": input,
+        }),
+    );
+    map
 }
 
 /// Run one task of `definition` as its own root, for example a `fork` branch.
@@ -900,6 +931,9 @@ impl<'a> Interpreter<'a> {
 
     fn detail(&self, node: &Node, pending: &Pending) -> Result<BlockDetail, Fault> {
         Ok(match pending.pause {
+            Pause::Activity if matches!(node.kind(), NodeKind::Emit) => {
+                BlockDetail::Emit(self.emit_with(node, &pending.input)?)
+            }
             Pause::Activity | Pause::Retry { .. } => BlockDetail::None,
             Pause::Timer => BlockDetail::Wait {
                 after: self.wait_after(node, &pending.input)?,
@@ -916,6 +950,30 @@ impl<'a> Interpreter<'a> {
             Pause::Child => BlockDetail::Child(self.child_ref(node, &pending.input)?),
             Pause::Events => BlockDetail::Listen(listen_spec(node)?),
         })
+    }
+
+    /// `emit.event.with`, evaluated in the same scope as `set`.
+    ///
+    /// A missing `with` is an empty object: `emit: {}` is a block, and the
+    /// executor reports the missing `source` and `type`. A non-object `with`
+    /// is a runtime fault. Frame bindings ride along. An executor that only
+    /// has the node calls [`emit_scope`], which is this scope without those
+    /// bindings.
+    fn emit_with(&self, node: &Node, input: &Value) -> Result<Value, Fault> {
+        let with = node
+            .body()
+            .pointer("/emit/event/with")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if !with.is_object() {
+            return Err(Fault::runtime(
+                node.position(),
+                "emit.event.with must be an object",
+            ));
+        }
+        let vars = self.scope(Some(node), input, None);
+        evaluate_data(&with, input, &vars)
+            .map_err(|message| Fault::expression(node.position(), message))
     }
 
     /// The `wait` duration. An empty `wait: {}` is zero.

@@ -13,11 +13,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tideloom_core::Block;
-use tideloom_core::CallKind;
 use tideloom_core::Continuation;
 use tideloom_core::Definition;
 use tideloom_core::Fault;
-use tideloom_core::NodeKind;
 use tideloom_core::Outcome;
 use tideloom_core::Pause;
 use tideloom_core::Resume;
@@ -217,7 +215,6 @@ impl Engine {
         let journalled = self
             .run_journalled(
                 &current,
-                &definition,
                 &block,
                 &continuation,
                 current.version,
@@ -386,7 +383,6 @@ impl Engine {
             let journalled = self
                 .run_journalled(
                     instance,
-                    definition,
                     block,
                     continuation,
                     version,
@@ -488,16 +484,7 @@ impl Engine {
             }
             activities += 1;
             let journalled = self
-                .run_journalled(
-                    instance,
-                    definition,
-                    block,
-                    continuation,
-                    version,
-                    now,
-                    false,
-                    false,
-                )
+                .run_journalled(instance, block, continuation, version, now, false, false)
                 .await?;
             if let Some(commit) = journalled.done {
                 return Ok(commit);
@@ -644,7 +631,6 @@ impl Engine {
     async fn run_journalled(
         &self,
         instance: &Instance,
-        definition: &Definition,
         block: &Block,
         continuation: &Continuation,
         version: u64,
@@ -720,7 +706,7 @@ impl Engine {
                     )?));
                 }
                 let event = match self
-                    .execute(instance, definition, block, continuation, kind, attempt)
+                    .execute(instance, block, continuation, kind, attempt)
                     .await?
                 {
                     Ok(output) => Resume::Output(output),
@@ -822,30 +808,11 @@ impl Engine {
     async fn execute(
         &self,
         instance: &Instance,
-        definition: &Definition,
         block: &Block,
         continuation: &Continuation,
         kind: TaskKind,
         attempt: u32,
     ) -> Result<Result<Value, Fault>, EngineError> {
-        // The core client needs the interpreter block, which an executor trait
-        // method does not receive. It runs when no HTTP executor is registered.
-        // A registered one — a test double, or a later transport — receives
-        // the `TaskExecution` and replaces that client.
-        if kind == TaskKind::Http
-            && self.executor(kind).is_none()
-            && matches!(block.kind(), NodeKind::Call(CallKind::Http))
-        {
-            return Ok(
-                crate::HttpExecutor::call(definition, continuation.workflow_input(), block)
-                    .map_err(|error| match error {
-                        crate::ActivityError::Fault(fault) => fault,
-                        crate::ActivityError::Executor(detail) => {
-                            Fault::runtime(block.position(), detail)
-                        }
-                    }),
-            );
-        }
         let Some(executor) = self.executor(kind) else {
             return Ok(Err(Fault::runtime(
                 block.position(),
@@ -1361,12 +1328,9 @@ enum OpenAttempt {
 }
 
 fn activity_idempotent(engine: &Engine, kind: TaskKind) -> bool {
-    match kind {
-        TaskKind::Http => false,
-        other => engine
-            .executor(other)
-            .is_some_and(|executor| executor.idempotent()),
-    }
+    engine
+        .executor(kind)
+        .is_some_and(|executor| executor.idempotent())
 }
 
 fn activity_row(
