@@ -40,7 +40,6 @@ use tideloom_runtime::StepOutcome;
 use tideloom_runtime::TaskExecution;
 use tideloom_runtime::TaskKind;
 use tideloom_runtime::UNKNOWN_DETAIL;
-use tideloom_runtime::WaitReason;
 use tideloom_runtime::Wakeup;
 use tideloom_runtime::WorkerId;
 
@@ -250,7 +249,11 @@ fn an_http_call_upserts_pending_into_output_on_the_same_attempt() {
         "pending commit must precede the call"
     );
     let held = run(store.get(&InstanceId::from_string("http"))).unwrap();
-    assert_eq!(held.status, Status::Waiting(WaitReason::Activity));
+    assert_eq!(held.status, Status::Running);
+    assert!(
+        held.in_flight.is_some(),
+        "the open attempt is the instance's in_flight, not a wait reason"
+    );
     assert!(
         held.lease.is_some(),
         "the lease stays held across the two commits"
@@ -289,10 +292,11 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_http_call() {
     let claimed = claim_one(&store, now);
     run(engine.step_until_pending(claimed, now)).unwrap();
     // The worker died here: Pending is committed, the call was not made, the
-    // lease is still held. Lapse it and let run_once sweep, then claim.
-    store.lapse_lease(&id, at(1));
-
-    let recovered = run(engine.run_once(at(5_000))).unwrap();
+    // lease is still held. Advance past that lease; run_once sweeps the
+    // Running row and claims it again.
+    let crashed = run(store.get(&id)).unwrap();
+    let until = crashed.lease.expect("held lease").until;
+    let recovered = run(engine.run_once(at(until.millis() + 1))).unwrap();
     assert!(
         recovered.processed >= 1,
         "the lapsed instance must be claimed again"
@@ -339,9 +343,11 @@ fn a_crash_between_the_two_commits_reruns_an_idempotent_executor_at_attempt_one(
     let claimed = claim_one(&store, now);
     run(engine.step_until_pending(claimed, now)).unwrap();
     assert_eq!(executor.hits(), 0);
-    store.lapse_lease(&id, at(1));
+    let crashed = run(store.get(&id)).unwrap();
+    assert_eq!(crashed.status, Status::Running);
+    let until = crashed.lease.expect("held lease").until;
 
-    let recovered = run(engine.run_once(at(6_000))).unwrap();
+    let recovered = run(engine.run_once(at(until.millis() + 1))).unwrap();
     assert!(recovered.processed >= 1);
     assert_eq!(
         executor.hits(),
@@ -381,9 +387,10 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_executor() {
     let now = at(4_000);
     let claimed = claim_one(&store, now);
     run(engine.step_until_pending(claimed, now)).unwrap();
-    store.lapse_lease(&id, at(1));
+    let crashed = run(store.get(&id)).unwrap();
+    let until = crashed.lease.as_ref().expect("held lease").until;
 
-    let recovered = run(engine.run_once(at(7_000))).unwrap();
+    let recovered = run(engine.run_once(at(until.millis() + 1))).unwrap();
     assert!(recovered.processed >= 1);
     assert_eq!(
         executor.hits(),

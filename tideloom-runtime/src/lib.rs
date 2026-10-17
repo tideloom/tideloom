@@ -65,6 +65,7 @@ pub use executor::LogExecutor;
 pub use executor::TaskExecution;
 pub use executor::TaskKind;
 pub use instance::DefinitionKey;
+pub use instance::InFlight;
 pub use instance::Instance;
 pub use instance::InstanceId;
 pub use instance::Lease;

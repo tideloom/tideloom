@@ -14,7 +14,6 @@ use crate::Instance;
 use crate::InstanceId;
 use crate::Lease;
 use crate::Status;
-use crate::StepOutcome;
 use crate::StepResult;
 use crate::WaitReason;
 use crate::WorkerId;
@@ -39,26 +38,6 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Move a held lease into the past so [`InstanceStore::sweep`] lists it.
-    ///
-    /// Tests use this to stand in for a dead worker. The status, continuation,
-    /// and journal are left as the crash committed them. A missing instance or
-    /// a missing lease is left alone.
-    pub fn lapse_lease(&self, id: &InstanceId, until: Timestamp) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        let Some(instance) = state.instances.get_mut(id) else {
-            return;
-        };
-        if let Some(lease) = instance.lease.as_mut() {
-            lease.until = until;
-        }
-        if instance.status == Status::Waiting(WaitReason::Activity) {
-            instance.status = Status::Running;
-        }
     }
 }
 
@@ -115,7 +94,7 @@ impl InstanceStore for MemoryStore {
             })
             .collect();
         ready.sort_by(|left, right| (left.wake_at, &left.id).cmp(&(right.wake_at, &right.id)));
-        Ok(ready
+        let claimed: Vec<_> = ready
             .into_iter()
             .take(limit)
             .map(|instance| {
@@ -123,11 +102,11 @@ impl InstanceStore for MemoryStore {
                 instance.lease = Some(Lease {
                     worker: worker.clone(),
                     until,
-                    open_attempt: None,
                 });
                 instance.clone()
             })
-            .collect())
+            .collect();
+        Ok(claimed)
     }
 
     async fn apply(&self, commit: Commit) -> Result<(), StoreError> {
@@ -168,10 +147,9 @@ impl InstanceStore for MemoryStore {
         instance.fault = commit.fault;
         instance.version += 1;
         instance.updated_at = commit.at;
+        instance.in_flight = commit.in_flight;
         if commit.release_lease {
             instance.lease = None;
-        } else if let Some(lease) = instance.lease.as_mut() {
-            lease.open_attempt = open_attempt_after(&commit.step_results, lease.open_attempt);
         }
         state.instances.insert(instance.id.clone(), instance);
         for child in commit.spawn_children {
@@ -186,6 +164,8 @@ impl InstanceStore for MemoryStore {
                     version: 0,
                     lease: None,
                     wake_at: Some(commit.at),
+                    root_task: child.root_task,
+                    in_flight: None,
                     input: child.input,
                     output: None,
                     fault: None,
@@ -283,21 +263,24 @@ impl InstanceStore for MemoryStore {
         });
         Ok(steps)
     }
-}
 
-/// The attempt a held lease should remember after this commit's journal rows.
-fn open_attempt_after(steps: &[StepResult], current: Option<u32>) -> Option<u32> {
-    let mut open = current;
-    for step in steps {
-        match &step.outcome {
-            StepOutcome::Pending => open = Some(step.attempt),
-            StepOutcome::Output(_) | StepOutcome::Fault(_) | StepOutcome::Unknown
-                if open == Some(step.attempt) =>
-            {
-                open = None;
-            }
-            StepOutcome::Output(_) | StepOutcome::Fault(_) | StepOutcome::Unknown => {}
+    async fn latest_step(
+        &self,
+        instance: &InstanceId,
+        key: &TaskKey,
+    ) -> Result<Option<StepResult>, StoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut latest = None;
+        for (_, step) in state
+            .journal
+            .range((instance.clone(), key.clone(), 0)..)
+            .take_while(|((id, step_key, _), _)| id == instance && step_key == key)
+        {
+            latest = Some(step.clone());
         }
+        Ok(latest)
     }
-    open
 }

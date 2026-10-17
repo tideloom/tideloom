@@ -103,6 +103,9 @@ fn planned(parent: &InstanceId, definition: DefinitionKey, child: &ChildRef) -> 
             branch: None,
         },
         input: child.input.clone(),
+        // A child workflow starts at its own root. A fork branch is the
+        // caller that sets `root_task`.
+        root_task: None,
     };
     if child.await_result {
         ChildStart::Await { child: spawned }

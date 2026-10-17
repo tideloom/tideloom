@@ -80,6 +80,7 @@ fn child(parent: &Instance, id: &str, branch: Option<usize>) -> SpawnChild {
             branch,
         },
         input: json!({"child": id}),
+        root_task: None,
     }
 }
 
@@ -136,13 +137,6 @@ fn claims_are_due_ordered_limited_and_exclude_live_leases_and_other_waits() {
         ),
         ("leased", 1, Status::Runnable, Some(1), Some(11)),
         ("running", 1, Status::Running, Some(1), Some(9)),
-        (
-            "activity",
-            1,
-            Status::Waiting(WaitReason::Activity),
-            Some(1),
-            None,
-        ),
         ("join", 1, Status::Waiting(WaitReason::Join), Some(1), None),
         (
             "child",
@@ -168,7 +162,6 @@ fn claims_are_due_ordered_limited_and_exclude_live_leases_and_other_waits() {
         value.lease = lease_until.map(|until| Lease {
             worker: WorkerId("old".into()),
             until: at(until),
-            open_attempt: None,
         });
         run(store.create(value.clone())).unwrap();
         expected.push(value);
@@ -193,7 +186,6 @@ fn claims_are_due_ordered_limited_and_exclude_live_leases_and_other_waits() {
             Some(Lease {
                 worker: worker.clone(),
                 until: at(20),
-                open_attempt: None,
             })
         );
         assert_eq!(&run(store.get(&value.id)).unwrap(), value);
@@ -234,6 +226,68 @@ fn two_workers_claiming_together_only_get_one_instance_between_them() {
 }
 
 #[test]
+fn sweep_returns_a_running_activity_whose_lease_expired() {
+    let store = MemoryStore::new();
+    let mut running = instance("in-flight", 0);
+    running.status = Status::Running;
+    running.lease = Some(Lease {
+        worker: WorkerId("dead".into()),
+        until: at(9),
+    });
+    running.in_flight = Some(InFlight {
+        key: TaskKey::new("/do/0/notify", ExecutionKey::empty()),
+        attempt: 0,
+    });
+    let mut parked = instance("waiting-activity-is-not-a-status", 1);
+    parked.status = Status::Waiting(WaitReason::Timer);
+    parked.lease = Some(Lease {
+        worker: WorkerId("dead".into()),
+        until: at(9),
+    });
+    run(store.create(running.clone())).unwrap();
+    run(store.create(parked.clone())).unwrap();
+
+    assert_eq!(
+        run(store.sweep(at(10))).unwrap(),
+        vec![InstanceId::from_string("in-flight")]
+    );
+    assert_eq!(run(store.get(&running.id)).unwrap(), running);
+    assert_eq!(run(store.get(&parked.id)).unwrap(), parked);
+}
+
+#[test]
+fn latest_step_returns_the_highest_attempt_for_one_key() {
+    let store = Arc::new(MemoryStore::new());
+    let engine = engine(&store);
+    let first = instance("first", 0);
+    run(store.create(first.clone())).unwrap();
+    let early = step(&first.id, "/do/9/early", 0, 10);
+    let retry = step(&first.id, "/do/9/early", 1, 20);
+    let other = step(&first.id, "/do/0/late", 3, 5);
+    let mut commit = Commit::new(first.id.clone(), 0, Status::Running, at(30));
+    commit.step_results = vec![retry.clone(), other.clone(), early];
+    run(engine.commit(commit, None)).unwrap();
+
+    let key = TaskKey::new("/do/9/early", ExecutionKey::empty());
+    assert_eq!(
+        run(store.latest_step(&first.id, &key)).unwrap(),
+        Some(retry)
+    );
+    assert_eq!(
+        run(store.latest_step(
+            &first.id,
+            &TaskKey::new("/do/missing", ExecutionKey::empty())
+        ))
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        run(store.latest_step(&InstanceId::from_string("missing"), &key)).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn sweep_is_read_only_and_only_lists_running_leases_strictly_before_the_cutoff() {
     let store = MemoryStore::new();
     let mut originals = Vec::new();
@@ -251,7 +305,6 @@ fn sweep_is_read_only_and_only_lists_running_leases_strictly_before_the_cutoff()
         value.lease = until.map(|until| Lease {
             worker: WorkerId("old".into()),
             until: at(until),
-            open_attempt: None,
         });
         run(store.create(value.clone())).unwrap();
         originals.push(value);
@@ -420,7 +473,6 @@ fn cancellation_skips_terminal_instances_and_invalidates_in_flight_commits() {
         value.lease = Some(Lease {
             worker: WorkerId("old".into()),
             until: at(50),
-            open_attempt: None,
         });
         run(store.create(value.clone())).unwrap();
         originals.push(value);

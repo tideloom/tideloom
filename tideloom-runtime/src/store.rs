@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tideloom_core::TaskKey;
 use tideloom_core::Timestamp;
 
 use crate::Commit;
@@ -78,5 +79,19 @@ pub trait InstanceStore: Send + Sync {
     async fn children(&self, parent: &InstanceId) -> Result<Vec<Instance>, StoreError>;
 
     /// Journal rows of one instance, oldest first.
+    ///
+    /// Tests and operators read this. The engine does not: recovery asks
+    /// [`InstanceStore::latest_step`] for the one key [`crate::InFlight`] names.
     async fn steps(&self, instance: &InstanceId) -> Result<Vec<StepResult>, StoreError>;
+
+    /// The newest journal row for one key, if any.
+    ///
+    /// Newest is the highest `attempt`. A missing instance returns an empty
+    /// result, the same as [`InstanceStore::steps`]. The engine uses this to
+    /// decide whether a recovered activity is still `Pending`.
+    async fn latest_step(
+        &self,
+        instance: &InstanceId,
+        key: &TaskKey,
+    ) -> Result<Option<StepResult>, StoreError>;
 }
