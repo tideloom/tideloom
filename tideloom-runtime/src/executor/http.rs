@@ -1,17 +1,16 @@
-//! `call: http` through the core client.
+//! `call: http` as an activity executor.
 //!
-//! The interpreter builds the request. This executor only runs it and returns
-//! the raw output, before `output.as`. It is not idempotent: a retried call
-//! is a second request, and a crash between the journal commits faults the
-//! instance instead of sending again.
+//! The interpreter stops at the call and leaves the request unevaluated. This
+//! executor builds it from the task input, `$context`, and `$workflow.input`,
+//! sends it, and returns the raw output, before `output.as`. It is not
+//! idempotent: a crash between the journal commits faults the instance instead
+//! of sending the request again. A GET that was already sent is still a second
+//! request if recovery re-runs it.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tideloom_core::Block;
-use tideloom_core::Definition;
-use tideloom_core::Fault;
 
 use crate::ActivityError;
 use crate::ActivityExecutor;
@@ -19,34 +18,21 @@ use crate::DefinitionSource;
 use crate::TaskExecution;
 use crate::TaskKind;
 
-/// Performs `call: http` with [`tideloom_core::http_call`].
+mod call;
+
+/// Performs `call: http`.
 ///
-/// The engine calls [`HttpExecutor::call`] when no HTTP executor is registered,
-/// because that path still has the interpreter's [`Block`]. Registering one
-/// replaces the client: the engine then calls [`ActivityExecutor::execute`].
-/// `execute` cannot rebuild the block, so this type's `execute` faults rather
-/// than sending a request the block would not have sent.
+/// The engine routes `TaskKind::Http` here like any other kind. There is no
+/// fallback that sends the request when this executor is missing.
 pub struct HttpExecutor {
     definitions: Arc<dyn DefinitionSource>,
 }
 
 impl HttpExecutor {
-    /// Resolve the call node from `definitions` when a caller has only the key.
+    /// Resolve the call node from `definitions`.
     #[must_use]
     pub fn new(definitions: Arc<dyn DefinitionSource>) -> Self {
         Self { definitions }
-    }
-
-    /// Run one blocked HTTP call.
-    ///
-    /// `workflow_input` is `$workflow.input`. Task input and `$context` come
-    /// from `block`.
-    pub fn call(
-        definition: &Definition,
-        workflow_input: &Value,
-        block: &Block,
-    ) -> Result<Value, ActivityError> {
-        tideloom_core::http_call(definition, workflow_input, block).map_err(ActivityError::Fault)
     }
 }
 
@@ -56,15 +42,62 @@ impl ActivityExecutor for HttpExecutor {
         TaskKind::Http
     }
 
+    fn idempotent(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, task: TaskExecution) -> Result<Value, ActivityError> {
-        let _ = self
+        let definition = self
             .definitions
             .get(&task.definition)
             .await
             .map_err(|error| ActivityError::Executor(error.to_string()))?;
-        Err(ActivityError::Fault(Fault::runtime(
-            task.key.position(),
-            "call: http is sent from the interpreter block; leave the HTTP executor unregistered",
-        )))
+        let node = definition.get(task.key.position()).ok_or_else(|| {
+            ActivityError::Executor(format!(
+                "HTTP call {} is not in the definition",
+                task.key.position()
+            ))
+        })?;
+        call::call(node, &task.input, &task.continuation).map_err(ActivityError::Fault)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::call::expand_template;
+
+    #[test]
+    fn simple_template_uses_top_level_task_input() {
+        let input = json!({"petId": "1", "pet.id": "literal", "pet": {"id": "nested"}});
+        let uri = expand_template(
+            "http://example.test/pets/{pet.id}?missing={absent}",
+            &input,
+            "/do/0/call",
+        )
+        .unwrap();
+        assert_eq!(uri, "http://example.test/pets/literal?missing=");
+    }
+
+    #[test]
+    fn template_encodes_scalars_and_rejects_objects() {
+        let uri = expand_template(
+            "http://example.test/{n}/{ok}/{q}",
+            &json!({"n": 3, "ok": true, "q": "a b&c"}),
+            "/p",
+        )
+        .unwrap();
+        assert_eq!(uri, "http://example.test/3/true/a%20b%26c");
+        let error = expand_template(
+            "http://example.test/{pet}",
+            &json!({"pet": {"id": 1}}),
+            "/p",
+        )
+        .unwrap_err();
+        assert_eq!(error.status(), 400);
+        let error =
+            expand_template("http://example.test/{+q}", &json!({"q": "a"}), "/p").unwrap_err();
+        assert!(error.detail().unwrap().contains("simple"));
     }
 }

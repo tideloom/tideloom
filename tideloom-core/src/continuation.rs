@@ -6,6 +6,7 @@
 //! back to [`resume`](crate::resume) with what happened. Nothing is replayed
 //! from the root.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Deserialize;
@@ -239,6 +240,38 @@ impl Continuation {
     #[must_use]
     pub fn workflow_input(&self) -> &Value {
         &self.workflow_input
+    }
+
+    /// Expression scope of the pending task, including enclosing frame bindings.
+    ///
+    /// This is the scope `set` uses: `.` is `input`, and the map holds `$input`,
+    /// `$context`, `$workflow`, `$task`, plus `$item` / `$index` from a `for`
+    /// and `$error` from a `try`. An executor that evaluates its own fields,
+    /// such as HTTP `with`, uses this. An `emit` payload is already evaluated
+    /// and lives on [`crate::Block::detail`].
+    #[must_use]
+    pub fn scope(&self, node: &crate::Node, input: &Value) -> BTreeMap<String, Value> {
+        let mut map = BTreeMap::new();
+        map.insert("context".to_string(), Value::Object(self.context.clone()));
+        map.insert("input".to_string(), input.clone());
+        map.insert(
+            "workflow".to_string(),
+            serde_json::json!({ "input": self.workflow_input }),
+        );
+        map.insert(
+            "task".to_string(),
+            serde_json::json!({
+                "name": node.name(),
+                "reference": node.position(),
+                "input": input,
+            }),
+        );
+        let mut bindings = Map::new();
+        for frame in &self.frames {
+            frame.bindings(&mut bindings);
+        }
+        map.extend(bindings);
+        map
     }
 
     /// `$context` at the stop.

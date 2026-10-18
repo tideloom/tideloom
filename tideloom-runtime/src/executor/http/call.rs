@@ -1,9 +1,8 @@
-//! Execute one blocked `call: http` activity.
+//! Build and send one `call: http` request.
 //!
-//! [`start`](crate::start) stops at the call. [`http_call`] performs that one
-//! request and returns the raw output, before task `output.as`. The runtime
-//! engine resumes with that output or fault. This module does not walk past
-//! the call.
+//! The interpreter stops at the call. This module performs that one request
+//! and returns the raw output, before task `output.as`. It does not walk past
+//! the call. The engine reaches it through [`super::HttpExecutor`].
 //!
 //! This slice sends JSON. `endpoint` may be a string or `{ uri }`. Strings
 //! accept `${ ... }` interpolation, then simple `{name}` templates filled from
@@ -13,70 +12,46 @@
 //!
 //! Not in this slice: `output: raw`, endpoint authentication, HTTPS,
 //! URI-template operators other than `{name}`, and `$item` / `$index`
-//! inside `with` (those bindings are not on the block). Task and workflow
+//! inside `with` (those bindings are not on the task). Task and workflow
 //! timeouts are enforced by the interpreter, not by shortening this client's
 //! cap.
 
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::time::Duration;
 
 use serde_json::Map;
 use serde_json::Value;
-
-use crate::Block;
-use crate::CallKind;
-use crate::Definition;
-use crate::Fault;
-use crate::Node;
-use crate::NodeKind;
-use crate::Pause;
-use crate::expr::evaluate_data;
+use tideloom_core::Continuation;
+use tideloom_core::Fault;
+use tideloom_core::Node;
+use tideloom_core::evaluate_data;
 
 const MAX_BODY: usize = 1024 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Perform one blocked `call: http` activity.
+/// Perform one `call: http` from the task the engine already resolved.
 ///
-/// `workflow_input` is `$workflow.input`. Task input and `$context` come from
-/// `block`. The returned value is the raw call output, before task `output.as`.
+/// `workflow_input` is `$workflow.input`. `task_input` is the transformed task
+/// input and `context` is `$context`. The returned value is the raw call
+/// output, before task `output.as`.
 ///
 /// # Errors
 ///
 /// An expression or runtime fault means the `with` block is not a request this
 /// slice can build. A communication fault means the call failed or the status
 /// was outside 200–299.
-pub fn http_call(
-    definition: &Definition,
-    workflow_input: &Value,
-    block: &Block,
+pub(super) fn call(
+    node: &Node,
+    task_input: &Value,
+    continuation: &Continuation,
 ) -> Result<Value, Fault> {
-    if !is_http_activity(block) {
-        return Err(Fault::runtime(
-            block.position(),
-            "block is not an HTTP activity",
-        ));
-    }
-    let position = block.position();
-    let Some(node) = definition.get(position) else {
-        return Err(Fault::runtime(
-            position,
-            "HTTP call node is missing from the definition",
-        ));
-    };
-    let prepared = prepare(node, block.input(), workflow_input, block.context())?;
+    let prepared = prepare(node, task_input, continuation)?;
     let agent = http_agent();
     let received = send(&agent, &prepared)?;
     match prepared.output {
         OutputMode::Content => Ok(received.content),
         OutputMode::Response => Ok(response_value(&prepared, &received)),
     }
-}
-
-fn is_http_activity(block: &Block) -> bool {
-    block.pause() == Pause::Activity
-        && block.effectful()
-        && matches!(block.kind(), NodeKind::Call(CallKind::Http))
 }
 
 fn http_agent() -> ureq::Agent {
@@ -112,8 +87,7 @@ struct Received {
 fn prepare(
     node: &Node,
     task_input: &Value,
-    workflow_input: &Value,
-    context: &Value,
+    continuation: &Continuation,
 ) -> Result<Prepared, Fault> {
     let position = node.position();
     let Some(with) = node.body().get("with") else {
@@ -122,7 +96,10 @@ fn prepare(
     if !with.is_object() {
         return Err(Fault::expression(position, "HTTP `with` must be an object"));
     }
-    let vars = scope(node, task_input, workflow_input, context);
+    // Same scope the interpreter used for `set` and `emit`, including `$item`
+    // and `$error`. Rebuilding it from input, context, and workflow input
+    // alone drops those bindings.
+    let vars = continuation.scope(node, task_input);
     let with = evaluate_data(with, task_input, &vars)
         .map_err(|message| Fault::expression(position, message))?;
     reject_redirect(&with, position)?;
@@ -150,30 +127,6 @@ fn prepare(
         body,
         output,
     })
-}
-
-fn scope(
-    node: &Node,
-    task_input: &Value,
-    workflow_input: &Value,
-    context: &Value,
-) -> BTreeMap<String, Value> {
-    let mut map = BTreeMap::new();
-    map.insert("context".to_string(), context.clone());
-    map.insert("input".to_string(), task_input.clone());
-    map.insert(
-        "workflow".to_string(),
-        serde_json::json!({ "input": workflow_input }),
-    );
-    map.insert(
-        "task".to_string(),
-        serde_json::json!({
-            "name": node.name(),
-            "reference": node.position(),
-            "input": task_input,
-        }),
-    );
-    map
 }
 
 fn reject_redirect(with: &Value, position: &str) -> Result<(), Fault> {
@@ -375,7 +328,7 @@ fn split_fragment(uri: &str) -> (&str, &str) {
 }
 
 /// Simple `{name}` expansion. Names are top-level task-input keys, verbatim.
-fn expand_template(uri: &str, input: &Value, position: &str) -> Result<String, Fault> {
+pub(super) fn expand_template(uri: &str, input: &Value, position: &str) -> Result<String, Fault> {
     let mut out = String::new();
     let mut rest = uri;
     while let Some(start) = rest.find('{') {
@@ -569,44 +522,4 @@ fn response_value(prepared: &Prepared, received: &Received) -> Value {
         "headers": received.headers,
         "content": received.content,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::expand_template;
-
-    #[test]
-    fn simple_template_uses_top_level_task_input() {
-        let input = json!({"petId": "1", "pet.id": "literal", "pet": {"id": "nested"}});
-        let uri = expand_template(
-            "http://example.test/pets/{pet.id}?missing={absent}",
-            &input,
-            "/do/0/call",
-        )
-        .unwrap();
-        assert_eq!(uri, "http://example.test/pets/literal?missing=");
-    }
-
-    #[test]
-    fn template_encodes_scalars_and_rejects_objects() {
-        let uri = expand_template(
-            "http://example.test/{n}/{ok}/{q}",
-            &json!({"n": 3, "ok": true, "q": "a b&c"}),
-            "/p",
-        )
-        .unwrap();
-        assert_eq!(uri, "http://example.test/3/true/a%20b%26c");
-        let error = expand_template(
-            "http://example.test/{pet}",
-            &json!({"pet": {"id": 1}}),
-            "/p",
-        )
-        .unwrap_err();
-        assert_eq!(error.status(), 400);
-        let error =
-            expand_template("http://example.test/{+q}", &json!({"q": "a"}), "/p").unwrap_err();
-        assert!(error.detail().unwrap().contains("simple"));
-    }
 }

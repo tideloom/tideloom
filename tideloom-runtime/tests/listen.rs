@@ -15,6 +15,7 @@ use tideloom_core::Definition;
 use tideloom_core::EventFilter;
 use tideloom_core::ListenSpec;
 use tideloom_core::ListenStrategy;
+use tideloom_core::Outcome;
 use tideloom_core::TaskKey;
 use tideloom_runtime::ActivityExecutor;
 use tideloom_runtime::Clock;
@@ -75,16 +76,48 @@ fn detail(spec: ListenSpec) -> BlockDetail {
     BlockDetail::Listen(spec)
 }
 
-fn execution(definition: DefinitionKey, input: serde_json::Value) -> TaskExecution {
+fn execution(
+    definition: &Definition,
+    key: DefinitionKey,
+    input: serde_json::Value,
+) -> TaskExecution {
+    let Outcome::Blocked {
+        block,
+        continuation,
+    } = tideloom_core::start(definition, &input)
+    else {
+        panic!("the emit is a block, got a finished walk");
+    };
+    execution_from(key, input, block.detail().clone(), continuation)
+}
+
+fn execution_with(
+    definition: DefinitionKey,
+    input: serde_json::Value,
+    detail: tideloom_core::BlockDetail,
+    continuation: tideloom_core::Continuation,
+) -> TaskExecution {
+    execution_from(definition, input, detail, continuation)
+}
+
+fn execution_from(
+    definition: DefinitionKey,
+    input: serde_json::Value,
+    detail: tideloom_core::BlockDetail,
+    continuation: tideloom_core::Continuation,
+) -> TaskExecution {
+    let key = TaskKey::new("/do/0/notify", tideloom_core::ExecutionKey::new(vec![]));
     TaskExecution {
         instance: InstanceId::from_string("emitter"),
         definition,
-        key: TaskKey::new("/do/0/notify", tideloom_core::ExecutionKey::new(vec![])),
+        key,
         kind: TaskKind::Emit,
         attempt: 0,
         input,
         context: json!({}),
         workflow_input: json!({}),
+        detail,
+        continuation,
     }
 }
 
@@ -130,8 +163,7 @@ do:
         wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
         definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
         executors: vec![Arc::new(EmitExecutor::new(
-            Arc::clone(&bus) as Arc<dyn EventSink>,
-            definitions,
+            Arc::clone(&bus) as Arc<dyn EventSink>
         ))],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
@@ -195,12 +227,12 @@ do:
             data:
               order: ${ .order }
 "#;
+    let definition = Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}"));
     let definitions = Arc::new(MemoryDefinitions::new());
-    let key =
-        definitions.publish(Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}")));
-    let executor = EmitExecutor::new(bus.clone(), definitions);
+    let key = definitions.publish(definition.clone());
+    let executor = EmitExecutor::new(bus.clone());
     executor
-        .execute(execution(key, json!({"order": 7})))
+        .execute(execution(&definition, key, json!({"order": 7})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -434,16 +466,16 @@ do:
 "#;
     let definition = Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}"));
     let definitions = Arc::new(MemoryDefinitions::new());
-    let key = definitions.publish(definition);
+    let key = definitions.publish(definition.clone());
     let bus = Arc::new(LocalEventBus::new());
     let listener = InstanceId::from_string("listener");
     bus.subscribe(&listener, one("io.example.paid"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
-    let executor = EmitExecutor::new(bus.clone(), definitions);
+    let executor = EmitExecutor::new(bus.clone());
     let output = executor
-        .execute(execution(key, json!({"order": "A-9"})))
+        .execute(execution(&definition, key, json!({"order": "A-9"})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(output["type"], "io.example.paid");
@@ -521,4 +553,223 @@ async fn a_filter_matches_only_when_every_attribute_is_equal() {
         inbox.is_empty(),
         "a shared type is not enough when source differs"
     );
+}
+
+/// `$task.name` and `${ .items | length }` are on the block the interpreter
+/// created. The executor publishes that value; it does not evaluate again.
+#[tokio::test]
+async fn emit_uses_task_name_and_a_length_filter() {
+    let yaml = r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: paint
+  version: '0.1.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: ${ $task.name }
+            data:
+              count: ${ .items | length }
+"#;
+    let definition = Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}"));
+    let Outcome::Blocked {
+        block,
+        continuation,
+    } = tideloom_core::start(&definition, &json!({"items": [1, 2, 3]}))
+    else {
+        panic!("emit is a block");
+    };
+    let tideloom_core::BlockDetail::Emit(with) = block.detail() else {
+        panic!("expected an evaluated emit, got {:?}", block.detail());
+    };
+    assert_eq!(with["type"], "notify");
+    assert_eq!(with["data"]["count"], 3);
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition);
+    let bus = Arc::new(LocalEventBus::new());
+    let executor = EmitExecutor::new(bus);
+    let output = executor
+        .execute(execution_with(
+            key,
+            json!({"items": [1, 2, 3]}),
+            block.detail().clone(),
+            continuation,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(output["type"], "notify");
+    assert_eq!(output["data"]["count"], 3);
+}
+
+/// An `emit` inside `for` publishes `$item` from the block. A second
+/// evaluation without the loop frame would fault instead of completing.
+/// `for` keeps only the last output, so the recording sink keeps both events.
+#[tokio::test]
+async fn an_emit_inside_for_publishes_each_loop_item() {
+    let yaml = r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: paint
+  version: '0.1.0'
+do:
+  - each:
+      for:
+        each: item
+        in: .items
+      do:
+        - notify:
+            emit:
+              event:
+                with:
+                  source: https://example.test/orders
+                  type: io.example.item
+                  data:
+                    item: ${ $item }
+            output:
+              as: .data.item
+"#;
+    let inbox = drive_subscribed(yaml, json!({"items": ["pen", "ink"]}), "io.example.item").await;
+    let items: Vec<_> = inbox
+        .iter()
+        .map(|event| event.data["item"].clone())
+        .collect();
+    assert_eq!(items, vec![json!("pen"), json!("ink")]);
+}
+
+/// An `emit` inside `catch` publishes `$error.status` from the block. A
+/// re-evaluation without the try frame would fault the instance.
+#[tokio::test]
+async fn an_emit_inside_catch_publishes_the_error() {
+    let yaml = r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: paint
+  version: '0.1.0'
+do:
+  - attempt:
+      try:
+        - boom:
+            raise:
+              error:
+                type: https://example.test/errors/boom
+                status: 503
+                title: boom
+      catch:
+        do:
+          - notify:
+              emit:
+                event:
+                  with:
+                    source: https://example.test/orders
+                    type: io.example.failed
+                    data:
+                      status: ${ $error.status }
+              output:
+                as: .data.status
+  - after:
+      set:
+        status: ${ . }
+"#;
+    let output = drive_emit(yaml, json!({})).await;
+    assert_eq!(output["status"], 503, "{output}");
+}
+
+/// Subscribe before the run, on an instance the workflow never listens as.
+/// Nothing acks that inbox, so both loop events stay there.
+async fn drive_subscribed(
+    yaml: &str,
+    input: serde_json::Value,
+    event_type: &str,
+) -> Vec<CloudEvent> {
+    let definition = Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}"));
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition);
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(16).unwrap()));
+    let bus = Arc::new(LocalEventBus::new());
+    let watcher = InstanceId::from_string("watcher");
+    bus.subscribe(&watcher, one(event_type))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let engine = Engine::new(EngineParts {
+        worker: WorkerId("listen-test".to_string()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: wakeup as Arc<dyn Wakeup>,
+        definitions: definitions as Arc<dyn tideloom_runtime::DefinitionSource>,
+        executors: vec![Arc::new(EmitExecutor::new(
+            Arc::clone(&bus) as Arc<dyn EventSink>
+        ))],
+        events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
+        events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
+        clock: Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+            1_000,
+        ))),
+    });
+    let instance = Instance::new(key, None, input, clock.now());
+    let id = instance.id.clone();
+    store
+        .create(instance)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    engine
+        .drive_until_idle(&clock)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let stored = store
+        .get(&id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(stored.status, Status::Completed, "{stored:?}");
+    bus.inbox(&watcher)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+async fn drive_emit(yaml: &str, input: serde_json::Value) -> serde_json::Value {
+    let definition = Definition::from_yaml(yaml).unwrap_or_else(|error| panic!("{error}"));
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition);
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(16).unwrap()));
+    let bus = Arc::new(LocalEventBus::connected(
+        Arc::clone(&wakeup) as Arc<dyn Wakeup>
+    ));
+    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let engine = Engine::new(EngineParts {
+        worker: WorkerId("listen-test".to_string()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
+        definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
+        executors: vec![Arc::new(EmitExecutor::new(
+            Arc::clone(&bus) as Arc<dyn EventSink>
+        ))],
+        events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
+        events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
+        clock: Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+            1_000,
+        ))),
+    });
+    let instance = Instance::new(key, None, input, clock.now());
+    let id = instance.id.clone();
+    store
+        .create(instance)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    engine
+        .drive_until_idle(&clock)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let stored = store
+        .get(&id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(stored.status, Status::Completed, "{stored:?}");
+    stored.output.unwrap_or(json!({}))
 }

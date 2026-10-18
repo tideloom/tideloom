@@ -174,7 +174,7 @@ impl Block {
     }
 
     /// Pause-specific data: the `wait` duration, `fork` branches, the child
-    /// workflow, or the `listen` subscription.
+    /// workflow, the `listen` subscription, or the evaluated `emit` payload.
     #[must_use]
     pub fn detail(&self) -> &BlockDetail {
         &self.detail
@@ -900,6 +900,9 @@ impl<'a> Interpreter<'a> {
 
     fn detail(&self, node: &Node, pending: &Pending) -> Result<BlockDetail, Fault> {
         Ok(match pending.pause {
+            Pause::Activity if matches!(node.kind(), NodeKind::Emit) => {
+                BlockDetail::Emit(self.emit_with(node, &pending.input)?)
+            }
             Pause::Activity | Pause::Retry { .. } => BlockDetail::None,
             Pause::Timer => BlockDetail::Wait {
                 after: self.wait_after(node, &pending.input)?,
@@ -916,6 +919,29 @@ impl<'a> Interpreter<'a> {
             Pause::Child => BlockDetail::Child(self.child_ref(node, &pending.input)?),
             Pause::Events => BlockDetail::Listen(listen_spec(node)?),
         })
+    }
+
+    /// `emit.event.with`, evaluated in the same scope as `set`.
+    ///
+    /// A missing `with` is an empty object: `emit: {}` is a block, and the
+    /// executor reports the missing `source` and `type`. A non-object `with`
+    /// is a runtime fault. Frame bindings ride along, so `$item` and `$error`
+    /// are in the value the executor publishes.
+    fn emit_with(&self, node: &Node, input: &Value) -> Result<Value, Fault> {
+        let with = node
+            .body()
+            .pointer("/emit/event/with")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if !with.is_object() {
+            return Err(Fault::runtime(
+                node.position(),
+                "emit.event.with must be an object",
+            ));
+        }
+        let vars = self.scope(Some(node), input, None);
+        evaluate_data(&with, input, &vars)
+            .map_err(|message| Fault::expression(node.position(), message))
     }
 
     /// The `wait` duration. An empty `wait: {}` is zero.

@@ -19,8 +19,9 @@
 //! `run: workflow`, and an `emit` that satisfies a later `listen`. This example
 //! publishes that document, creates one instance, and drives it with
 //! [`Engine::drive_until_idle`]. The clock is a [`ManualClock`]. The process
-//! does not sleep. HTTP goes to a TCP listener in this process through the
-//! core client; nothing here replaces that client or reimplements a step.
+//! does not sleep. HTTP goes to a TCP listener in this process through a
+//! registered `HttpExecutor`; nothing here replaces that client or
+//! reimplements a step.
 
 use std::io::Read;
 use std::io::Write;
@@ -42,6 +43,7 @@ use tideloom_runtime::Engine;
 use tideloom_runtime::EngineParts;
 use tideloom_runtime::EventSink;
 use tideloom_runtime::EventSource;
+use tideloom_runtime::HttpExecutor;
 use tideloom_runtime::Instance;
 use tideloom_runtime::InstanceStore;
 use tideloom_runtime::LocalEventBus;
@@ -85,10 +87,12 @@ fn run() -> String {
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
         wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
         definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
-        executors: vec![Arc::new(EmitExecutor::new(
-            Arc::clone(&bus) as Arc<dyn EventSink>,
-            Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
-        ))],
+        executors: vec![
+            Arc::new(HttpExecutor::new(
+                Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>
+            )),
+            Arc::new(EmitExecutor::new(Arc::clone(&bus) as Arc<dyn EventSink>)),
+        ],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: bus as Arc<dyn EventSource>,
         clock: Arc::new(ManualClock::at(clock.now())),

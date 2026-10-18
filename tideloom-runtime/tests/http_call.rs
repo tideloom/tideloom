@@ -1,9 +1,9 @@
 //! `call: http` against a real listener on 127.0.0.1, driven by `Engine`.
 //!
-//! The server is a TCP socket in this process. No HTTP executor is registered,
-//! so the engine sends through `tideloom_core::http_call`. Nothing here
-//! replaces that client with a fake. A stored continuation is resumed by
-//! claiming the instance again, not by a core driver.
+//! The server is a TCP socket in this process. The engine sends through a
+//! registered [`HttpExecutor`]. Nothing here replaces that client with a fake.
+//! A stored continuation is resumed by claiming the instance again, not by a
+//! core driver.
 
 use std::io::Read;
 use std::io::Write;
@@ -24,6 +24,7 @@ use tideloom_core::Fault;
 use tideloom_runtime::Clock;
 use tideloom_runtime::Engine;
 use tideloom_runtime::EngineParts;
+use tideloom_runtime::HttpExecutor;
 use tideloom_runtime::Instance;
 use tideloom_runtime::InstanceId;
 use tideloom_runtime::InstanceStore;
@@ -101,8 +102,10 @@ fn drive(tasks: &str, input: Value) -> tideloom_runtime::Instance {
         worker: WorkerId("http-call".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
         wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
-        definitions,
-        executors: Vec::new(),
+        definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
+        executors: vec![Arc::new(HttpExecutor::new(
+            Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>
+        ))],
         events_out: Arc::new(Discard),
         events_in: Arc::new(Discard),
         clock: Arc::new(ManualClock::at(clock.now())),
@@ -224,8 +227,10 @@ fn a_stored_continuation_resumes_without_repeating_the_call() {
         worker: WorkerId("http-call".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
         wakeup: wakeup as Arc<dyn Wakeup>,
-        definitions,
-        executors: Vec::new(),
+        definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
+        executors: vec![Arc::new(HttpExecutor::new(
+            Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>
+        ))],
         events_out: Arc::new(Discard),
         events_in: Arc::new(Discard),
         clock: Arc::new(ManualClock::at(clock.now())),

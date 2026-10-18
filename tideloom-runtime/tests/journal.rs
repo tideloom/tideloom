@@ -232,7 +232,13 @@ fn an_http_call_upserts_pending_into_output_on_the_same_attempt() {
         ),
     );
     let store = Arc::new(MemoryStore::new());
-    let engine = engine(&store, &definitions, Vec::new());
+    let engine = engine(
+        &store,
+        &definitions,
+        vec![Arc::new(tideloom_runtime::HttpExecutor::new(
+            Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
+        ))],
+    );
     run(store.create(instance("http", key))).unwrap_or_else(|error| panic!("{error}"));
 
     let now = at(1_000);
@@ -284,6 +290,9 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_http_call() {
         "  - notify:\n      call: http\n      with:\n        method: POST\n        endpoint: http://127.0.0.1:9/never\n",
     );
     let store = Arc::new(MemoryStore::new());
+    // Unregistered: the crash is the Pending row, not a second request. A
+    // registered `HttpExecutor` is also non-idempotent, so recovery faults
+    // the same way once the row exists.
     let engine = engine(&store, &definitions, Vec::new());
     let id = InstanceId::from_string("crashed-http");
     run(store.create(instance("crashed-http", key))).unwrap();
