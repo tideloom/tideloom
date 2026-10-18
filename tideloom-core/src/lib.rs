@@ -61,7 +61,6 @@ pub use walk::Block;
 pub use walk::Outcome;
 pub use walk::Pause;
 pub use walk::WalkOptions;
-pub use walk::emit_scope;
 pub use walk::resume;
 pub use walk::resume_with;
 pub use walk::start;

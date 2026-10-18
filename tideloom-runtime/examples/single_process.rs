@@ -91,10 +91,7 @@ fn run() -> String {
             Arc::new(HttpExecutor::new(
                 Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>
             )),
-            Arc::new(EmitExecutor::new(
-                Arc::clone(&bus) as Arc<dyn EventSink>,
-                Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
-            )),
+            Arc::new(EmitExecutor::new(Arc::clone(&bus) as Arc<dyn EventSink>)),
         ],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: bus as Arc<dyn EventSource>,

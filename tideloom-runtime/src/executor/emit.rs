@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tideloom_core::BlockDetail;
 use tideloom_core::Fault;
 
 use crate::ActivityError;
 use crate::ActivityExecutor;
 use crate::CloudEvent;
-use crate::DefinitionSource;
 use crate::EventSink;
 use crate::TaskExecution;
 use crate::TaskKind;
@@ -16,25 +16,22 @@ use crate::TaskKind;
 /// Publishes the `emit` task's event.
 ///
 /// `emit.event.with` is evaluated by the interpreter when the block is
-/// created, in the same scope as `set`. This executor reads that
-/// [`tideloom_core::BlockDetail::Emit`] value and turns it into a CloudEvent. `source` and
-/// `type` are required. A missing `id` is generated. The published event, as
-/// JSON, is the task output so a later `output.as` can read it.
+/// created, in the same scope as `set`, including enclosing `for` and `try`
+/// bindings. This executor reads that [`BlockDetail::Emit`] value and turns
+/// it into a CloudEvent. It does not evaluate the document again. `source`
+/// and `type` are required. A missing `id` is generated. The published event,
+/// as JSON, is the task output so a later `output.as` can read it.
 ///
 /// Publishing is not idempotent: a retried `emit` publishes again.
 pub struct EmitExecutor {
     events: Arc<dyn EventSink>,
-    definitions: Arc<dyn DefinitionSource>,
 }
 
 impl EmitExecutor {
-    /// Publish through `events`. The node is resolved from `definitions`.
+    /// Publish through `events`. The payload is [`BlockDetail::Emit`] on the task.
     #[must_use]
-    pub fn new(events: Arc<dyn EventSink>, definitions: Arc<dyn DefinitionSource>) -> Self {
-        Self {
-            events,
-            definitions,
-        }
+    pub fn new(events: Arc<dyn EventSink>) -> Self {
+        Self { events }
     }
 
     /// The CloudEvent described by an evaluated `emit.event.with` object.
@@ -140,23 +137,13 @@ impl ActivityExecutor for EmitExecutor {
     }
 
     async fn execute(&self, task: TaskExecution) -> Result<Value, ActivityError> {
-        let definition = self
-            .definitions
-            .get(&task.definition)
-            .await
-            .map_err(|error| ActivityError::Executor(error.to_string()))?;
-        let node = definition.get(task.key.position()).ok_or_else(|| {
-            ActivityError::Executor(format!(
-                "emit task {} is not in the definition",
-                task.key.position()
-            ))
-        })?;
-        // The engine's block already holds this value. `TaskExecution` does
-        // not, so a direct `execute` evaluates the node with the same
-        // function and the same `$input` / `$context` / `$workflow` / `$task`
-        // scope. Enclosing `for` bindings are on the block, not on this task.
-        let with = evaluated_emit(node, &task)?;
-        let event = Self::event_from(task.key.position(), &with)?;
+        let BlockDetail::Emit(with) = &task.detail else {
+            return Err(ActivityError::Fault(Fault::runtime(
+                task.key.position(),
+                "emit task has no evaluated payload",
+            )));
+        };
+        let event = Self::event_from(task.key.position(), with)?;
         let output = serde_json::to_value(&event).map_err(|error| {
             ActivityError::Executor(format!("failed to encode emitted event: {error}"))
         })?;
@@ -166,29 +153,4 @@ impl ActivityExecutor for EmitExecutor {
             .map_err(|error| ActivityError::Executor(error.to_string()))?;
         Ok(output)
     }
-}
-
-/// `BlockDetail::Emit` for a caller that has the node but not the block.
-fn evaluated_emit(
-    node: &tideloom_core::Node,
-    task: &TaskExecution,
-) -> Result<Value, ActivityError> {
-    let position = task.key.position();
-    // Missing `with` is an empty object, matching the interpreter. The
-    // CloudEvent conversion then reports the missing `source` and `type`.
-    let owned = node
-        .body()
-        .pointer("/emit/event/with")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let with = &owned;
-    if !with.is_object() {
-        return Err(ActivityError::Fault(Fault::runtime(
-            position,
-            "emit.event.with must be an object",
-        )));
-    }
-    let vars = tideloom_core::emit_scope(node, &task.input, &task.context, &task.workflow_input);
-    tideloom_core::evaluate_data(with, &task.input, &vars)
-        .map_err(|message| ActivityError::Fault(Fault::expression(position, message)))
 }

@@ -828,6 +828,8 @@ impl Engine {
             input: block.input().clone(),
             context: continuation.context(),
             workflow_input: continuation.workflow_input().clone(),
+            detail: block.detail().clone(),
+            continuation: continuation.clone(),
         };
         match executor.execute(task).await {
             Ok(output) => Ok(Ok(output)),

@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use serde_json::Map;
 use serde_json::Value;
+use tideloom_core::Continuation;
 use tideloom_core::Fault;
 use tideloom_core::Node;
-use tideloom_core::emit_scope;
 use tideloom_core::evaluate_data;
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -43,10 +43,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) fn call(
     node: &Node,
     task_input: &Value,
-    workflow_input: &Value,
-    context: &Value,
+    continuation: &Continuation,
 ) -> Result<Value, Fault> {
-    let prepared = prepare(node, task_input, workflow_input, context)?;
+    let prepared = prepare(node, task_input, continuation)?;
     let agent = http_agent();
     let received = send(&agent, &prepared)?;
     match prepared.output {
@@ -88,8 +87,7 @@ struct Received {
 fn prepare(
     node: &Node,
     task_input: &Value,
-    workflow_input: &Value,
-    context: &Value,
+    continuation: &Continuation,
 ) -> Result<Prepared, Fault> {
     let position = node.position();
     let Some(with) = node.body().get("with") else {
@@ -98,7 +96,10 @@ fn prepare(
     if !with.is_object() {
         return Err(Fault::expression(position, "HTTP `with` must be an object"));
     }
-    let vars = emit_scope(node, task_input, context, workflow_input);
+    // Same scope the interpreter used for `set` and `emit`, including `$item`
+    // and `$error`. Rebuilding it from input, context, and workflow input
+    // alone drops those bindings.
+    let vars = continuation.scope(node, task_input);
     let with = evaluate_data(with, task_input, &vars)
         .map_err(|message| Fault::expression(position, message))?;
     reject_redirect(&with, position)?;

@@ -58,8 +58,7 @@ impl ActivityExecutor for HttpExecutor {
                 task.key.position()
             ))
         })?;
-        call::call(node, &task.input, &task.workflow_input, &task.context)
-            .map_err(ActivityError::Fault)
+        call::call(node, &task.input, &task.continuation).map_err(ActivityError::Fault)
     }
 }
 

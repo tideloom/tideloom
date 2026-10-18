@@ -469,37 +469,6 @@ pub fn resume_with(
     interpreter.run(first)
 }
 
-/// The `$input`, `$context`, `$workflow`, and `$task` scope of an `emit`.
-///
-/// This is the scope [`BlockDetail::Emit`] is evaluated in, minus bindings
-/// from enclosing `for` frames. Those bindings exist only while the
-/// interpreter is walking. A runner that has the block uses that evaluated
-/// value; this is for an executor that has the node and the three scopes.
-#[must_use]
-pub fn emit_scope(
-    node: &Node,
-    input: &Value,
-    context: &Value,
-    workflow_input: &Value,
-) -> BTreeMap<String, Value> {
-    let mut map = BTreeMap::new();
-    map.insert("context".to_string(), context.clone());
-    map.insert("input".to_string(), input.clone());
-    map.insert(
-        "workflow".to_string(),
-        serde_json::json!({ "input": workflow_input }),
-    );
-    map.insert(
-        "task".to_string(),
-        serde_json::json!({
-            "name": node.name(),
-            "reference": node.position(),
-            "input": input,
-        }),
-    );
-    map
-}
-
 /// Run one task of `definition` as its own root, for example a `fork` branch.
 ///
 /// The task's transformed output is the run output. Workflow `input.from`,
@@ -956,9 +925,8 @@ impl<'a> Interpreter<'a> {
     ///
     /// A missing `with` is an empty object: `emit: {}` is a block, and the
     /// executor reports the missing `source` and `type`. A non-object `with`
-    /// is a runtime fault. Frame bindings ride along. An executor that only
-    /// has the node calls [`emit_scope`], which is this scope without those
-    /// bindings.
+    /// is a runtime fault. Frame bindings ride along, so `$item` and `$error`
+    /// are in the value the executor publishes.
     fn emit_with(&self, node: &Node, input: &Value) -> Result<Value, Fault> {
         let with = node
             .body()

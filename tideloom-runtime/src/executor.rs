@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tideloom_core::BlockDetail;
 use tideloom_core::CallKind;
+use tideloom_core::Continuation;
 use tideloom_core::Fault;
 use tideloom_core::NodeKind;
 use tideloom_core::RunKind;
@@ -84,6 +86,10 @@ impl TaskKind {
 /// Everything the executor may need is here, so it does not read the store
 /// or the definition tree. `context` and `workflow_input` back the
 /// `$context` and `$workflow.input` an executor may expand in its own fields.
+/// `detail` is the interpreter's block detail, including an `emit` payload
+/// already evaluated with enclosing `for` and `try` bindings. `continuation`
+/// is that stop, so an executor that still evaluates its own fields sees the
+/// same `$item` and `$error`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskExecution {
     /// Which instance.
@@ -102,6 +108,14 @@ pub struct TaskExecution {
     pub context: Value,
     /// `$workflow.input`.
     pub workflow_input: Value,
+    /// Pause-specific data from the block, computed by the interpreter.
+    ///
+    /// For `emit` this is [`BlockDetail::Emit`]: `emit.event.with` already
+    /// evaluated, including `$item` and `$error`. An executor publishes that
+    /// value. It does not evaluate the document again.
+    pub detail: BlockDetail,
+    /// The stop that produced this task, including enclosing frame bindings.
+    pub continuation: Continuation,
 }
 
 /// Why an executor failed, as the engine sees it.
