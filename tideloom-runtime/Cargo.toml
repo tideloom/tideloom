@@ -20,7 +20,18 @@ ureq = { version = "3.4.2", default-features = false }
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
+tideloom-runtime = { path = ".", features = ["test-util"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[features]
+# Test helpers that advance a `ManualClock` from the store's next due instant.
+# Production builds do not include them. Integration tests opt in through
+# dev-dependencies. The acceptance example opts in below.
+test-util = []
+
+[[example]]
+name = "single_process"
+required-features = ["test-util"]
 
 [lints]
 workspace = true

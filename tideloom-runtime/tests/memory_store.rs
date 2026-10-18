@@ -562,6 +562,67 @@ fn children_are_filtered_then_sorted_by_optional_branch_and_creation() {
 }
 
 #[test]
+fn wake_flips_only_an_unarmed_events_wait_and_next_due_skips_other_waits() {
+    let store = Arc::new(MemoryStore::new());
+    let mut events = instance("events", 10);
+    events.status = Status::Waiting(WaitReason::Events);
+    events.wake_at = None;
+    events.version = 3;
+    let mut armed = instance("armed", 11);
+    armed.status = Status::Waiting(WaitReason::Events);
+    armed.wake_at = Some(at(50));
+    let mut timer = instance("timer", 12);
+    timer.status = Status::Waiting(WaitReason::Timer);
+    timer.wake_at = Some(at(80));
+    let mut join = instance("join", 13);
+    join.status = Status::Waiting(WaitReason::Join);
+    join.wake_at = Some(at(40));
+    let mut running = instance("running", 14);
+    running.status = Status::Running;
+    running.lease = Some(Lease {
+        worker: WorkerId("holder".into()),
+        until: at(200),
+    });
+    running.wake_at = Some(at(30));
+    let mut runnable = instance("runnable", 15);
+    runnable.wake_at = Some(at(90));
+    for row in [&events, &armed, &timer, &join, &running, &runnable] {
+        run(store.create(row.clone())).unwrap();
+    }
+
+    let flipped = run(store.wake(
+        &[
+            events.id.clone(),
+            armed.id.clone(),
+            timer.id.clone(),
+            InstanceId::from_string("missing"),
+        ],
+        at(60),
+    ))
+    .unwrap();
+    assert_eq!(flipped, 1, "only the unarmed events wait flips");
+    let woken = run(store.get(&events.id)).unwrap();
+    assert_eq!(woken.status, Status::Runnable);
+    assert_eq!(woken.wake_at, Some(at(60)));
+    assert_eq!(woken.version, 4);
+    assert_eq!(run(store.get(&armed.id)).unwrap().version, 0);
+    assert_eq!(
+        run(store.get(&timer.id)).unwrap().status,
+        Status::Waiting(WaitReason::Timer)
+    );
+
+    // A second wake of the same id is a no-op: it already has a wake_at.
+    assert_eq!(run(store.wake(&[events.id.clone()], at(70))).unwrap(), 0);
+    assert_eq!(run(store.get(&events.id)).unwrap().wake_at, Some(at(60)));
+
+    // 60 is not strictly after 60. The join is not claimable. The running
+    // row's earlier wake_at is behind a live lease. The timer at 80 wins.
+    assert_eq!(run(store.next_due(at(60))).unwrap(), Some(at(80)));
+    assert_eq!(run(store.next_due(at(80))).unwrap(), Some(at(90)));
+    assert_eq!(run(store.next_due(at(90))).unwrap(), None);
+}
+
+#[test]
 fn journal_upserts_by_instance_key_and_attempt_and_reads_in_time_order() {
     let store = Arc::new(MemoryStore::new());
     let engine = engine(&store);
@@ -618,7 +679,7 @@ impl Wakeup for UnusedBackends {
 
 #[async_trait]
 impl EventSink for UnusedBackends {
-    async fn publish(&self, _: CloudEvent) -> Result<(), EventError> {
+    async fn publish(&self, _: CloudEvent) -> Result<Vec<InstanceId>, EventError> {
         panic!("unexpected event publish")
     }
 }

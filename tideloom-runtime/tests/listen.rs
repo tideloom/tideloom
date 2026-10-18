@@ -156,7 +156,9 @@ do:
     let bus = Arc::new(LocalEventBus::connected(
         Arc::clone(&wakeup) as Arc<dyn Wakeup>
     ));
-    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
     let engine = Engine::new(EngineParts {
         worker: WorkerId("listen-test".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -167,9 +169,7 @@ do:
         ))],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
-        clock: Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
-            1_000,
-        ))),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
     let instance = Instance::new(key, None, json!({"order": "A-9"}), clock.now());
     let id = instance.id.clone();
@@ -177,8 +177,7 @@ do:
         .create(instance)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    engine
-        .drive_until_idle(&clock)
+    tideloom_runtime::drive_until_idle(&engine, &clock)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let stored = store
@@ -266,10 +265,12 @@ async fn listen_one_releases_the_first_matching_event_and_acks_after() {
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
-    bus.publish(event("paid-1", "io.example.paid", json!({"order": 7})))
+    let _ = bus
+        .publish(event("paid-1", "io.example.paid", json!({"order": 7})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    bus.publish(event("other", "io.example.other", json!({"order": 8})))
+    let _ = bus
+        .publish(event("other", "io.example.other", json!({"order": 8})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -315,7 +316,8 @@ async fn listen_all_waits_until_every_filter_has_an_event() {
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
-    bus.publish(event("paid", "io.example.paid", json!({"step": "paid"})))
+    let _ = bus
+        .publish(event("paid", "io.example.paid", json!({"step": "paid"})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let waiting = listen::after_claim(&bus, &listener, &detail(spec.clone()))
@@ -323,13 +325,14 @@ async fn listen_all_waits_until_every_filter_has_an_event() {
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(waiting, ListenStep::Wait);
 
-    bus.publish(event(
-        "shipped",
-        "io.example.shipped",
-        json!({"step": "shipped"}),
-    ))
-    .await
-    .unwrap_or_else(|error| panic!("{error}"));
+    let _ = bus
+        .publish(event(
+            "shipped",
+            "io.example.shipped",
+            json!({"step": "shipped"}),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let ListenStep::Release(release) = listen::after_claim(&bus, &listener, &detail(spec))
         .await
         .unwrap_or_else(|error| panic!("{error}"))
@@ -347,13 +350,14 @@ async fn listen_all_waits_until_every_filter_has_an_event() {
 async fn an_event_that_arrives_before_subscribe_is_not_lost() {
     let bus = LocalEventBus::new();
     let listener = InstanceId::from_string("early");
-    bus.publish(event(
-        "early-paid",
-        "io.example.paid",
-        json!({"early": true}),
-    ))
-    .await
-    .unwrap_or_else(|error| panic!("{error}"));
+    let _ = bus
+        .publish(event(
+            "early-paid",
+            "io.example.paid",
+            json!({"early": true}),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     bus.subscribe(&listener, one("io.example.paid"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -374,7 +378,8 @@ async fn an_unmatched_event_does_not_fill_the_inbox() {
     bus.subscribe(&listener, one("io.example.paid"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    bus.publish(event("nope", "io.example.other", json!({"no": true})))
+    let _ = bus
+        .publish(event("nope", "io.example.other", json!({"no": true})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -404,7 +409,8 @@ async fn read_envelope_releases_the_whole_event() {
     bus.subscribe(&listener, spec.clone())
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    bus.publish(event("paid-1", "io.example.paid", json!({"order": 7})))
+    let _ = bus
+        .publish(event("paid-1", "io.example.paid", json!({"order": 7})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -428,7 +434,8 @@ async fn a_matching_publish_notifies_the_wakeup_bus() {
     bus.subscribe(&listener, one("io.example.paid"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    bus.publish(event("paid-1", "io.example.paid", json!({"order": 1})))
+    let _ = bus
+        .publish(event("paid-1", "io.example.paid", json!({"order": 1})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -509,13 +516,14 @@ async fn any_releases_the_first_of_several_filters() {
     bus.subscribe(&listener, spec.clone())
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    bus.publish(event(
-        "shipped",
-        "io.example.shipped",
-        json!({"which": "ship"}),
-    ))
-    .await
-    .unwrap_or_else(|error| panic!("{error}"));
+    let _ = bus
+        .publish(event(
+            "shipped",
+            "io.example.shipped",
+            json!({"which": "ship"}),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let ListenStep::Release(release) = listen::step(
         &detail(spec),
         &bus.inbox(&listener)
@@ -542,7 +550,8 @@ async fn a_filter_matches_only_when_every_attribute_is_equal() {
     bus.subscribe(&listener, spec)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    bus.publish(event("wrong-source", "io.example.paid", json!({"n": 1})))
+    let _ = bus
+        .publish(event("wrong-source", "io.example.paid", json!({"n": 1})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let inbox = bus
@@ -697,7 +706,9 @@ async fn drive_subscribed(
     bus.subscribe(&watcher, one(event_type))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
     let engine = Engine::new(EngineParts {
         worker: WorkerId("listen-test".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -708,9 +719,7 @@ async fn drive_subscribed(
         ))],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
-        clock: Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
-            1_000,
-        ))),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
     let instance = Instance::new(key, None, input, clock.now());
     let id = instance.id.clone();
@@ -718,8 +727,7 @@ async fn drive_subscribed(
         .create(instance)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    engine
-        .drive_until_idle(&clock)
+    tideloom_runtime::drive_until_idle(&engine, &clock)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let stored = store
@@ -741,7 +749,9 @@ async fn drive_emit(yaml: &str, input: serde_json::Value) -> serde_json::Value {
     let bus = Arc::new(LocalEventBus::connected(
         Arc::clone(&wakeup) as Arc<dyn Wakeup>
     ));
-    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
     let engine = Engine::new(EngineParts {
         worker: WorkerId("listen-test".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -752,9 +762,7 @@ async fn drive_emit(yaml: &str, input: serde_json::Value) -> serde_json::Value {
         ))],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
-        clock: Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
-            1_000,
-        ))),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
     let instance = Instance::new(key, None, input, clock.now());
     let id = instance.id.clone();
@@ -762,8 +770,7 @@ async fn drive_emit(yaml: &str, input: serde_json::Value) -> serde_json::Value {
         .create(instance)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    engine
-        .drive_until_idle(&clock)
+    tideloom_runtime::drive_until_idle(&engine, &clock)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let stored = store
@@ -772,4 +779,137 @@ async fn drive_emit(yaml: &str, input: serde_json::Value) -> serde_json::Value {
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(stored.status, Status::Completed, "{stored:?}");
     stored.output.unwrap_or(json!({}))
+}
+
+/// A listen parked by engine A becomes claimable when engine B's emit lands,
+/// even though A never saw the subscription. Either engine's next pass
+/// releases it. The store's `wake`, not a process-local id list, is what
+/// makes the listener claimable.
+#[tokio::test]
+async fn an_emit_on_one_engine_wakes_a_listen_parked_on_another() {
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let listener = Definition::from_yaml(
+        r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: listener
+  version: '0.1.0'
+do:
+  - hear:
+      listen:
+        to:
+          one:
+            with:
+              type: io.example.paid
+  - after:
+      set:
+        heard: true
+"#,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let emitter = Definition::from_yaml(
+        r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: emitter
+  version: '0.1.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: io.example.paid
+            data:
+              order: ${ .order }
+"#,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let listener_key = definitions.publish(listener);
+    let emitter_key = definitions.publish(emitter);
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(16).unwrap()));
+    let bus = Arc::new(LocalEventBus::new());
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
+    let parts = |worker: &str| EngineParts {
+        worker: WorkerId(worker.to_string()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
+        definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
+        executors: vec![Arc::new(EmitExecutor::new(
+            Arc::clone(&bus) as Arc<dyn EventSink>
+        ))],
+        events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
+        events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+    };
+    let engine_a = Engine::new(parts("engine-a"));
+    let engine_b = Engine::new(parts("engine-b"));
+
+    let listener = Instance::new(listener_key, None, json!({}), clock.now());
+    let listener_id = listener.id.clone();
+    store
+        .create(listener)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let parked = engine_a
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(parked.processed, 1);
+    let waiting = store
+        .get(&listener_id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        waiting.status,
+        Status::Waiting(tideloom_runtime::WaitReason::Events)
+    );
+    assert!(
+        waiting.wake_at.is_none(),
+        "an unsatisfied listen is not claimable"
+    );
+
+    let emitter = Instance::new(emitter_key, None, json!({"order": 7}), clock.now());
+    let emitter_id = emitter.id.clone();
+    store
+        .create(emitter)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let emitted = engine_b
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(emitted.processed >= 1, "{emitted:?}");
+    let woken = store
+        .get(&listener_id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        woken.status,
+        Status::Runnable,
+        "B's emit wakes A's listener through the shared store: {woken:?}"
+    );
+    assert_eq!(woken.wake_at, Some(clock.now()));
+
+    // A did not publish the event. Its next pass still claims the woken row.
+    let released = engine_a
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(released.processed >= 1, "{released:?}");
+    let heard = store
+        .get(&listener_id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(heard.status, Status::Completed, "{heard:?}");
+    assert_eq!(
+        heard.output.as_ref().and_then(|output| output.get("heard")),
+        Some(&json!(true))
+    );
+    let _ = emitter_id;
 }

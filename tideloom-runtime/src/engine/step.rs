@@ -36,7 +36,6 @@ use super::translate::encode;
 use super::translate::prepare_child;
 use super::translate::translate;
 use crate::ActivityError;
-use crate::Clock;
 use crate::Commit;
 use crate::Engine;
 use crate::EngineError;
@@ -44,9 +43,6 @@ use crate::Hint;
 use crate::InFlight;
 use crate::Instance;
 use crate::InstanceId;
-use crate::ManualClock;
-use crate::Offset;
-use crate::Signal;
 use crate::Status;
 use crate::StepOutcome;
 use crate::StepResult;
@@ -84,8 +80,10 @@ pub struct StepCount {
 }
 
 impl Engine {
-    /// Claim what is due and step each instance, then notify for the next due timer.
+    /// Claim what is due and step each instance.
     ///
+    /// The pass reads [`Engine::clock`] once and uses that instant for the
+    /// sweep, the claim, and every step. A caller does not pass the time.
     /// Lapsed leases are returned to `Runnable` first, so a dead worker does
     /// not hide an instance from this pass. A signal is a hint: this function
     /// does not read the bus. A lost signal changes when the sweeper or a due
@@ -95,7 +93,8 @@ impl Engine {
     ///
     /// A store or bus failure. A bad continuation or a missing executor
     /// faults that instance and the loop continues with the next one.
-    pub async fn run_once(&self, now: Timestamp) -> Result<StepCount, EngineError> {
+    pub async fn run_once(&self) -> Result<StepCount, EngineError> {
+        let now = self.clock().now();
         self.sweep(now).await?;
         let claimed =
             self.store()
@@ -110,9 +109,6 @@ impl Engine {
                 .await?;
         let mut count = StepCount::default();
         for instance in &claimed {
-            // Before the step, so a listen that parks in this pass is known
-            // when `drive_until_idle` looks for a satisfied inbox.
-            self.remember(instance.id.clone());
             // A claim is a new hold. `in_flight` on that row was written by
             // the hold the sweeper just released, not by this one. `step`
             // re-reads after the claim has replaced the lease, so the flag
@@ -123,50 +119,7 @@ impl Engine {
             }
             count.processed += 1;
         }
-        // A timer that became due during this pass is claimable on the next
-        // one. The store, not a signal, is what `claim` reads.
-        self.note_spawned(&claimed).await?;
         Ok(count)
-    }
-
-    /// Step until nothing is claimable, advancing the clock to the next `wake_at`.
-    ///
-    /// A future `wait` or retry backoff stops a pass that only claims what is
-    /// due. This helper moves `clock` to the earliest such `wake_at` and
-    /// continues, so a test drives a workflow to a terminal status without
-    /// sleeping. It stops when a pass claims nothing and no instance has a
-    /// future `wake_at`. A join does not need the clock: finishing a child
-    /// releases the parent back to `Runnable` inside the same drive.
-    ///
-    /// # Errors
-    ///
-    /// The same as [`Engine::run_once`].
-    pub async fn drive_until_idle(&self, clock: &ManualClock) -> Result<usize, EngineError> {
-        let mut stepped = 0;
-        loop {
-            let count = self.run_once(clock.now()).await?;
-            stepped += count.processed;
-            if count.processed > 0 {
-                continue;
-            }
-            // A matching event only hints the bus. `claim` does not return
-            // `Waiting(Events)`, so a lost hint would leave a satisfied listen
-            // parked forever. Flip it to a due timer before deciding the loop
-            // is idle. The inbox, not the signal, is what this reads.
-            if self.release_satisfied_listens(clock.now()).await? {
-                continue;
-            }
-            let Some(next) = next_wake_at(self, clock.now()).await? else {
-                return Ok(stepped);
-            };
-            // Advancing to a due instant and claiming nothing means the row
-            // is not actually claimable (a live lease, a non-timer wait).
-            // Stop instead of spinning on the same `wake_at`.
-            if next <= clock.now() {
-                return Ok(stepped);
-            }
-            clock.set(next);
-        }
     }
 
     /// Run one claimed instance until its `Pending` journal row is committed.
@@ -253,7 +206,6 @@ impl Engine {
         now: Timestamp,
         recovering: bool,
     ) -> Result<bool, EngineError> {
-        self.remember(instance.id.clone());
         if instance.status == Status::Cancelled || instance.status.is_terminal() {
             return Ok(false);
         }
@@ -277,23 +229,12 @@ impl Engine {
             commit
         };
         let conflict = self.apply_step(commit).await?;
-        if !conflict {
-            // Children created in this commit are not in the claimed set.
-            // Remember them before the next pass, including a child whose
-            // parent completed in the same step (`await: false`).
-            for child in self.store().children(&current.id).await? {
-                self.remember(child.id);
-            }
-        }
         if !conflict && !acked.is_empty() {
             // After the commit, never before. A conflict above leaves the
             // inbox intact so the next claim releases the same events.
             listen::ack_after_commit(self.events_in().as_ref(), &current.id, &acked)
                 .await
                 .map_err(|error| EngineError::Events(error.to_string()))?;
-        }
-        if !conflict {
-            self.remember(current.id.clone());
         }
         if !conflict
             && terminal
@@ -773,6 +714,22 @@ impl Engine {
                     None,
                 )
                 .await?;
+                // After the outcome commit, not inside `publish`. `EmitExecutor`
+                // recorded who received the event. `wake` is a condition on
+                // the store, not a compare-and-set, so it is not part of
+                // `Engine::commit`. The notify is a hint: losing it still
+                // leaves the listener `Runnable`.
+                if kind == TaskKind::Emit
+                    && matches!(event, Resume::Output(_))
+                    && let Some(executor) = self.executor(kind)
+                    && let Some(emit) = executor.as_any().downcast_ref::<crate::EmitExecutor>()
+                {
+                    let landed = emit.take_landed(&instance.id, block.key());
+                    if !landed.is_empty() {
+                        self.wake_landed(&landed, block.key().position(), now)
+                            .await?;
+                    }
+                }
                 Ok(Journalled {
                     version: version + 1,
                     event: Some(event),
@@ -1115,64 +1072,25 @@ impl Engine {
         self.apply_step(commit).await
     }
 
-    /// Make a satisfied `Waiting(Events)` instance claimable.
+    /// Flip listeners that received an emit, then hint the bus.
     ///
-    /// `claim` does not return `Waiting(Events)`. A matching publish only
-    /// hints the bus, and a lost hint must still release: the inbox is the
-    /// source of truth. This flips each known listener whose inbox satisfies
-    /// its spec to a due timer, the same shape an already-satisfied subscribe
-    /// uses. The next claim runs `relisten` and acks after that commit.
-    ///
-    /// Returns whether any instance was flipped.
-    async fn release_satisfied_listens(&self, now: Timestamp) -> Result<bool, EngineError> {
-        let mut flipped = false;
-        for instance in known_instances(self).await? {
-            if instance.status != Status::Waiting(WaitReason::Events) {
-                continue;
-            }
-            let Some(bytes) = instance.continuation.as_deref() else {
-                continue;
-            };
-            let Ok(continuation) = decode(&instance.id, bytes) else {
-                continue;
-            };
-            if continuation.pause() != Pause::Events {
-                continue;
-            }
-            let definition = self.definitions().get(&instance.definition).await?;
-            let ticked = resume_with(
-                &definition,
-                continuation,
-                Resume::Tick,
-                WalkOptions::new().with_now(now),
-            );
-            let Outcome::Blocked { block, .. } = ticked else {
-                continue;
-            };
-            let tideloom_core::BlockDetail::Listen(spec) = block.detail() else {
-                continue;
-            };
-            let inbox = self
-                .events_in()
-                .inbox(&instance.id)
-                .await
-                .map_err(|error| EngineError::Events(error.to_string()))?;
-            if !listen::satisfied(spec, &inbox) {
-                continue;
-            }
-            let mut due = Commit::new(
-                instance.id.clone(),
-                instance.version,
-                Status::Waiting(WaitReason::Timer),
-                now,
-            );
-            due.continuation = instance.continuation.clone();
-            due.wake_at = Some(now);
-            if !self.apply_step(due).await? {
-                flipped = true;
-            }
+    /// Called after the emit's outcome commit. A listener that is not
+    /// `Waiting(Events)` with an empty `wake_at` is ignored, so a second
+    /// wake of the same id is a no-op.
+    async fn wake_landed(
+        &self,
+        landed: &[InstanceId],
+        position: &str,
+        now: Timestamp,
+    ) -> Result<(), EngineError> {
+        self.store().wake(landed, now).await?;
+        for id in landed {
+            let _ = self
+                .wakeup()
+                .notify(id.clone(), Hint::Event(position.to_string()))
+                .await;
         }
-        Ok(flipped)
+        Ok(())
     }
 
     /// `apply` with no bus offset: a step is not triggered by a signal.
@@ -1183,92 +1101,6 @@ impl Engine {
             Err(EngineError::Store(StoreError::VersionConflict { .. })) => Ok(true),
             Err(error) => Err(error),
         }
-    }
-}
-
-/// Hint that a known instance whose `wake_at` is due, or whose lease has
-/// lapsed, may be claimed.
-///
-/// The store is the source of truth. Dropping every signal this sends still
-/// leaves the instance claimable: the next `run_once` sweeps a lapsed lease
-/// and claims a due timer without reading the bus. `run_once` does not call
-/// this. A worker that watches the bus does, and a test that drops the bus
-/// still finishes through the sweeper.
-pub async fn notify_due(engine: &Engine, now: Timestamp) -> Result<(), EngineError> {
-    for signal in due_signals(engine, now).await? {
-        engine.wakeup().notify(signal.instance, signal.hint).await?;
-    }
-    Ok(())
-}
-
-async fn due_signals(engine: &Engine, now: Timestamp) -> Result<Vec<Signal>, EngineError> {
-    let mut signals = Vec::new();
-    for id in engine.store().sweep(now).await? {
-        signals.push(Signal {
-            instance: id,
-            hint: Hint::Other,
-            offset: Offset::default(),
-        });
-    }
-    for instance in known_instances(engine).await? {
-        let due = match instance.status {
-            Status::Runnable => instance.wake_at.is_none_or(|at| at <= now),
-            Status::Waiting(WaitReason::Timer) => instance.wake_at.is_some_and(|at| at <= now),
-            _ => false,
-        };
-        let leased = instance
-            .lease
-            .as_ref()
-            .is_some_and(|lease| lease.until > now);
-        if due && !leased && !instance.status.is_terminal() {
-            signals.push(Signal {
-                instance: instance.id,
-                hint: Hint::Timer,
-                offset: Offset::default(),
-            });
-        }
-    }
-    Ok(signals)
-}
-
-async fn next_wake_at(engine: &Engine, now: Timestamp) -> Result<Option<Timestamp>, EngineError> {
-    let mut earliest = None;
-    for instance in known_instances(engine).await? {
-        if instance.status.is_terminal() {
-            continue;
-        }
-        let Some(at) = instance.wake_at else {
-            continue;
-        };
-        if at <= now {
-            continue;
-        }
-        earliest = Some(earliest.map_or(at, |current: Timestamp| current.min(at)));
-    }
-    Ok(earliest)
-}
-
-async fn known_instances(engine: &Engine) -> Result<Vec<Instance>, EngineError> {
-    let mut instances = Vec::new();
-    for id in engine.known_ids() {
-        match engine.store().get(&id).await {
-            Ok(instance) => instances.push(instance),
-            Err(StoreError::NotFound(_)) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(instances)
-}
-
-impl Engine {
-    async fn note_spawned(&self, claimed: &[Instance]) -> Result<(), EngineError> {
-        for instance in claimed {
-            self.remember(instance.id.clone());
-            if let Some(parent) = &instance.parent {
-                self.remember(parent.id.clone());
-            }
-        }
-        Ok(())
     }
 }
 

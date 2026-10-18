@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -25,13 +26,44 @@ use crate::TaskKind;
 /// Publishing is not idempotent: a retried `emit` publishes again.
 pub struct EmitExecutor {
     events: Arc<dyn EventSink>,
+    /// Inboxes the last successful `publish` wrote, keyed by the emitting
+    /// instance and task. The engine takes the entry after the outcome
+    /// commit and calls [`crate::InstanceStore::wake`]. `publish` itself
+    /// does not touch the store.
+    landed: Mutex<Vec<Landed>>,
+}
+
+/// One `emit` and the instances whose inbox received it.
+struct Landed {
+    instance: crate::InstanceId,
+    key: tideloom_core::TaskKey,
+    ids: Vec<crate::InstanceId>,
 }
 
 impl EmitExecutor {
     /// Publish through `events`. The payload is [`BlockDetail::Emit`] on the task.
     #[must_use]
     pub fn new(events: Arc<dyn EventSink>) -> Self {
-        Self { events }
+        Self {
+            events,
+            landed: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn take_landed(
+        &self,
+        instance: &crate::InstanceId,
+        key: &tideloom_core::TaskKey,
+    ) -> Vec<crate::InstanceId> {
+        let Ok(mut landed) = self.landed.lock() else {
+            return Vec::new();
+        };
+        let position = landed
+            .iter()
+            .position(|entry| entry.instance == *instance && entry.key == *key);
+        position
+            .map(|index| landed.swap_remove(index).ids)
+            .unwrap_or_default()
     }
 
     /// The CloudEvent described by an evaluated `emit.event.with` object.
@@ -136,6 +168,10 @@ impl ActivityExecutor for EmitExecutor {
         TaskKind::Emit
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn execute(&self, task: TaskExecution) -> Result<Value, ActivityError> {
         let BlockDetail::Emit(with) = &task.detail else {
             return Err(ActivityError::Fault(Fault::runtime(
@@ -147,10 +183,20 @@ impl ActivityExecutor for EmitExecutor {
         let output = serde_json::to_value(&event).map_err(|error| {
             ActivityError::Executor(format!("failed to encode emitted event: {error}"))
         })?;
-        self.events
+        // Record who received it. The engine wakes those ids after the
+        // outcome commit. Waking here would call the store from the executor.
+        let landed = self
+            .events
             .publish(event)
             .await
             .map_err(|error| ActivityError::Executor(error.to_string()))?;
+        if let Ok(mut recorded) = self.landed.lock() {
+            recorded.push(Landed {
+                instance: task.instance,
+                key: task.key,
+                ids: landed,
+            });
+        }
         Ok(output)
     }
 }

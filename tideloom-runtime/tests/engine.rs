@@ -71,7 +71,7 @@ struct Harness {
     other: Engine,
     store: Arc<MemoryStore>,
     wakeup: Arc<DroppingWakeup>,
-    clock: ManualClock,
+    clock: Arc<ManualClock>,
     key: DefinitionKey,
 }
 
@@ -81,7 +81,7 @@ impl Harness {
         let key = definitions.publish(definition(head, tasks));
         let store = Arc::new(MemoryStore::new());
         let wakeup = Arc::new(DroppingWakeup::new());
-        let clock = ManualClock::at(at(1_000));
+        let clock = Arc::new(ManualClock::at(at(1_000)));
         let calls = Arc::new(AtomicUsize::new(0));
         // Registered, so the retry test replaces the HTTP transport. An
         // unregistered HTTP task faults like any other missing executor.
@@ -114,10 +114,15 @@ impl Harness {
     }
 
     fn drive(&self) -> usize {
-        run(self.engine.drive_until_idle(&self.clock)).unwrap()
+        run(tideloom_runtime::drive_until_idle(
+            &self.engine,
+            &self.clock,
+        ))
+        .unwrap()
     }
 }
 
+#[allow(dead_code)]
 /// Poll a future that may wait on a tokio mutex, as the journal tests do not.
 fn block_on<F: Future>(future: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -133,7 +138,7 @@ fn engine_for(
     wakeup: &Arc<DroppingWakeup>,
     definitions: &Arc<MemoryDefinitions>,
     executors: Vec<Arc<dyn ActivityExecutor>>,
-    clock: &ManualClock,
+    clock: &Arc<ManualClock>,
 ) -> Engine {
     Engine::new(EngineParts {
         worker: WorkerId(worker.to_string()),
@@ -143,7 +148,7 @@ fn engine_for(
         executors,
         events_out: Arc::new(Silent),
         events_in: Arc::new(Silent),
-        clock: Arc::new(ManualClock::at(clock.now())),
+        clock: Arc::clone(clock) as Arc<dyn Clock>,
     })
 }
 
@@ -170,6 +175,7 @@ impl DroppingWakeup {
         *self.dropped.lock().expect("drop flag") = true;
     }
 
+    #[allow(dead_code)]
     fn notifies(&self) -> usize {
         self.notifies.load(Ordering::SeqCst)
     }
@@ -216,8 +222,8 @@ struct Silent;
 
 #[async_trait]
 impl EventSink for Silent {
-    async fn publish(&self, _: CloudEvent) -> Result<(), EventError> {
-        Ok(())
+    async fn publish(&self, _: CloudEvent) -> Result<Vec<InstanceId>, EventError> {
+        Ok(Vec::new())
     }
 }
 
@@ -291,14 +297,15 @@ fn a_wait_completes_when_the_clock_reaches_wake_at() {
 "#,
     );
     let id = harness.start(json!({}));
-    let parked = run(harness.engine.run_once(harness.clock.now())).unwrap();
+    let parked = run(harness.engine.run_once()).unwrap();
     assert_eq!(parked.processed, 1);
     let waiting = run(harness.store.get(&id)).unwrap();
     assert_eq!(waiting.status, Status::Waiting(WaitReason::Timer));
     assert_eq!(waiting.wake_at, Some(at(31_000)));
 
-    // Still in the future: claim finds nothing.
-    let early = run(harness.engine.run_once(at(30_999))).unwrap();
+    // Still in the future: claim finds nothing. The engine reads its own clock.
+    harness.clock.set(at(30_999));
+    let early = run(harness.engine.run_once()).unwrap();
     assert_eq!(early.processed, 0);
     assert_eq!(
         run(harness.store.get(&id)).unwrap().status,
@@ -331,7 +338,7 @@ fn a_reparked_wait_keeps_its_first_wake_at() {
 "#,
     );
     let id = harness.start(json!({}));
-    run(harness.engine.run_once(harness.clock.now())).unwrap();
+    run(harness.engine.run_once()).unwrap();
     let waiting = run(harness.store.get(&id)).unwrap();
     let first = waiting.wake_at.expect("first park");
     assert_eq!(first, at(31_000));
@@ -379,7 +386,7 @@ fn a_retry_is_claimed_again_at_wake_at() {
 "#,
     );
     let id = harness.start(json!({}));
-    let first = run(harness.engine.run_once(harness.clock.now())).unwrap();
+    let first = run(harness.engine.run_once()).unwrap();
     assert_eq!(first.processed, 1);
     let waiting = run(harness.store.get(&id)).unwrap();
     assert_eq!(waiting.status, Status::Waiting(WaitReason::Timer));
@@ -411,7 +418,8 @@ fn a_workflow_timeout_faults_on_tick() {
 "#,
     );
     let id = harness.start(json!({}));
-    let parked = run(harness.engine.run_once(at(5_000))).unwrap();
+    harness.clock.set(at(5_000));
+    let parked = run(harness.engine.run_once()).unwrap();
     assert_eq!(parked.processed, 1);
     let waiting = run(harness.store.get(&id)).unwrap();
     assert_eq!(waiting.status, Status::Waiting(WaitReason::Timer));
@@ -445,7 +453,7 @@ fn a_dropped_signal_still_finishes_after_the_sweeper() {
     );
     harness.wakeup.drop_all();
     let id = harness.start(json!({}));
-    let parked = run(harness.engine.run_once(harness.clock.now())).unwrap();
+    let parked = run(harness.engine.run_once()).unwrap();
     assert_eq!(parked.processed, 1);
     let waiting = run(harness.store.get(&id)).unwrap();
     assert_eq!(waiting.status, Status::Waiting(WaitReason::Timer));
@@ -455,8 +463,8 @@ fn a_dropped_signal_still_finishes_after_the_sweeper() {
     );
 
     // The wait is not due yet, so a claim takes nothing. Arm a lease at the
-    // deadline, then move the clock past it without stepping. `notify_due`
-    // reads the store's sweep; the bus drops the hint it sends.
+    // deadline, then move the clock past it without stepping. The next
+    // `run_once` sweeps the lapsed lease; the bus drops every hint.
     let claimed =
         run(harness
             .store
@@ -477,15 +485,9 @@ fn a_dropped_signal_still_finishes_after_the_sweeper() {
     assert_eq!(held.len(), 1);
     let lease_until = held[0].lease.as_ref().expect("claimed lease").until;
     harness.clock.set(at(lease_until.millis() + 1));
-    let swept = block_on(tideloom_runtime::notify_due(
-        &harness.engine,
-        harness.clock.now(),
-    ));
-    assert!(swept.is_ok());
-    assert!(
-        harness.wakeup.notifies() > 0,
-        "the sweeper still notifies; the bus drops the signal"
-    );
+    // The sweeper inside `run_once` returns the lapsed lease. No separate
+    // hint is required: a lost signal is still only a hint, and this bus
+    // drops every one the drive might send.
     assert!(
         harness.wakeup.dropped(),
         "the test drops every signal before the next claim"
@@ -546,4 +548,47 @@ fn two_engines_do_not_run_the_same_step() {
     assert_eq!(stored.output, Some(json!({"n": 1})));
     assert_eq!(stored.version, 1, "one commit, not two");
     assert!(stored.lease.is_none());
+}
+
+/// The caller does not pass `now`. Moving the engine's clock is what makes
+/// the wait due. A second clock the engine does not hold would leave it parked.
+#[test]
+fn the_engine_reads_its_own_clock() {
+    let harness = Harness::new(
+        "",
+        r#"
+  - pause:
+      wait:
+        seconds: 5
+  - after:
+      set:
+        done: true
+"#,
+    );
+    let id = harness.start(json!({}));
+    let parked = run(harness.engine.run_once()).unwrap();
+    assert_eq!(parked.processed, 1);
+    let waiting = run(harness.store.get(&id)).unwrap();
+    assert_eq!(waiting.status, Status::Waiting(WaitReason::Timer));
+    let due = waiting.wake_at.expect("wait");
+
+    // The harness clock is the engine clock. Setting it is the only way to
+    // move the pass. `run_once` takes no instant.
+    harness.clock.set(at(due.millis() - 1));
+    let early = run(harness.engine.run_once()).unwrap();
+    assert_eq!(early.processed, 0);
+    assert_eq!(
+        run(harness.store.get(&id)).unwrap().status,
+        Status::Waiting(WaitReason::Timer)
+    );
+
+    harness.clock.set(due);
+    let released = run(harness.engine.run_once()).unwrap();
+    assert_eq!(released.processed, 1);
+    let done = run(harness.store.get(&id)).unwrap();
+    assert_eq!(done.status, Status::Completed, "{done:?}");
+    assert_eq!(
+        done.output.as_ref().and_then(|output| output.get("done")),
+        Some(&json!(true))
+    );
 }

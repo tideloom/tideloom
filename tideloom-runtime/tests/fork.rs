@@ -48,7 +48,7 @@ struct Harness {
     engine: Engine,
     store: Arc<MemoryStore>,
     wakeup: Arc<LocalWakeup>,
-    clock: ManualClock,
+    clock: Arc<ManualClock>,
     key: DefinitionKey,
 }
 
@@ -58,7 +58,7 @@ impl Harness {
         let key = definitions.publish(definition);
         let store = Arc::new(MemoryStore::new());
         let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(64).expect("64")));
-        let clock = ManualClock::at(at(1_000));
+        let clock = Arc::new(ManualClock::at(at(1_000)));
         let engine = Engine::new(EngineParts {
             worker: WorkerId("fork-test".to_string()),
             store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -67,7 +67,7 @@ impl Harness {
             executors: Vec::new(),
             events_out: Arc::new(Discard),
             events_in: Arc::new(EmptyInbox),
-            clock: Arc::new(ManualClock::at(at(1_000))),
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
         });
         Self {
             engine,
@@ -83,7 +83,7 @@ impl Harness {
         let key = definitions.publish(definition);
         let store = Arc::new(MemoryStore::new());
         let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(64).expect("64")));
-        let clock = ManualClock::at(at(1_000));
+        let clock = Arc::new(ManualClock::at(at(1_000)));
         let engine = Engine::new(EngineParts {
             worker: WorkerId("fork-test".to_string()),
             store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -92,7 +92,7 @@ impl Harness {
             executors: vec![executor],
             events_out: Arc::new(Discard),
             events_in: Arc::new(EmptyInbox),
-            clock: Arc::new(ManualClock::at(at(1_000))),
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
         });
         Self {
             engine,
@@ -114,8 +114,7 @@ impl Harness {
     }
 
     async fn drive(&self) {
-        self.engine
-            .drive_until_idle(&self.clock)
+        tideloom_runtime::drive_until_idle(&self.engine, &self.clock)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
     }
@@ -128,8 +127,8 @@ impl tideloom_runtime::EventSink for Discard {
     async fn publish(
         &self,
         _event: tideloom_runtime::CloudEvent,
-    ) -> Result<(), tideloom_runtime::EventError> {
-        Ok(())
+    ) -> Result<Vec<InstanceId>, tideloom_runtime::EventError> {
+        Ok(Vec::new())
     }
 }
 
@@ -358,7 +357,7 @@ fn two_branches_finishing_together_release_the_parent_once() {
     block_on(async {
         let id = harness.start().await;
         // First pass creates the children and parks the parent.
-        let first = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let first = harness.engine.run_once().await.unwrap();
         assert_eq!(first.processed, 1);
         let parent = harness.store.get(&id).await.unwrap();
         assert_eq!(parent.status, Status::Waiting(WaitReason::Join));
@@ -369,7 +368,7 @@ fn two_branches_finishing_together_release_the_parent_once() {
         // reads the parent as it is now. The second writes `Runnable` again;
         // `rejoin` re-reads the children, so that second release is idempotent
         // and is not a version conflict.
-        let second = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let second = harness.engine.run_once().await.unwrap();
         assert_eq!(second.processed, 2);
         assert_eq!(
             second.conflicts, 0,
@@ -530,7 +529,7 @@ fn a_cancelled_branch_is_claimed_and_not_resumed() {
             .unwrap();
         assert!(again.iter().all(|instance| instance.id != slow.id));
         assert_eq!(*calls.lock().unwrap(), 0);
-        let _ = Clock::now(&harness.clock);
+        let _ = harness.clock.now();
     });
 }
 
@@ -565,14 +564,14 @@ fn a_late_branch_releases_a_parent_that_was_reparked_in_the_same_pass() {
     block_on(async {
         let id = harness.start().await;
         // Pass 1: spawn both branches and park the parent on the join.
-        let spawned = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let spawned = harness.engine.run_once().await.unwrap();
         assert_eq!(spawned.processed, 1);
         let parent = harness.store.get(&id).await.unwrap();
         assert_eq!(parent.status, Status::Waiting(WaitReason::Join));
 
         // Pass 2: the early branch finishes and releases the parent. The late
         // branch parks on its wait, which is not due yet.
-        let early = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let early = harness.engine.run_once().await.unwrap();
         assert!(early.processed >= 2, "{early:?}");
         let parent = harness.store.get(&id).await.unwrap();
         assert_eq!(parent.status, Status::Runnable, "{parent:?}");
@@ -584,7 +583,7 @@ fn a_late_branch_releases_a_parent_that_was_reparked_in_the_same_pass() {
         // sees the late branch still waiting and reparks; the late branch
         // then completes and must release that new row.
         harness.clock.set(at(1_000 + 5_000));
-        let late = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let late = harness.engine.run_once().await.unwrap();
         assert!(late.processed >= 2, "{late:?}");
         assert_eq!(
             late.conflicts, 0,
@@ -630,7 +629,7 @@ fn a_branch_runs_its_first_activity_in_the_pass_that_starts_it() {
     block_on(async {
         let id = harness.start().await;
         // The parent reaches the fork and spawns the branch.
-        let spawned = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let spawned = harness.engine.run_once().await.unwrap();
         assert_eq!(spawned.processed, 1);
         assert_eq!(
             *calls.lock().unwrap(),
@@ -645,7 +644,7 @@ fn a_branch_runs_its_first_activity_in_the_pass_that_starts_it() {
         );
 
         // The next pass claims the fresh branch and runs its activity.
-        let started = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let started = harness.engine.run_once().await.unwrap();
         assert_eq!(started.processed, 1, "{started:?}");
         assert_eq!(
             *calls.lock().unwrap(),
@@ -685,7 +684,7 @@ fn a_branch_keeps_the_parent_input_and_records_its_position() {
         let id = instance.id.clone();
         harness.store.create(instance).await.unwrap();
 
-        let spawned = harness.engine.run_once(harness.clock.now()).await.unwrap();
+        let spawned = harness.engine.run_once().await.unwrap();
         assert_eq!(spawned.processed, 1);
         let parent = harness.store.get(&id).await.unwrap();
         assert!(parent.root_task.is_none(), "{parent:?}");

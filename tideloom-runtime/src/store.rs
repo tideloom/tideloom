@@ -50,6 +50,11 @@ pub enum StoreError {
 ///   changes.
 /// - `sweep` lists instances whose lease lapsed before `before`. It does not change them; the
 ///   engine does.
+/// - `wake` flips `Waiting(Events)` rows with an empty `wake_at` to `Runnable`. It is a condition,
+///   not a compare-and-set, so the engine calls it outside
+///   [`Engine::commit`](crate::Engine::commit).
+/// - `next_due` is the earliest future `wake_at` a claim could see. The test driver and the
+///   production poll use it for their interval. Correctness does not.
 #[async_trait]
 pub trait InstanceStore: Send + Sync {
     /// Insert a new instance. Fails when the id exists.
@@ -94,4 +99,27 @@ pub trait InstanceStore: Send + Sync {
         instance: &InstanceId,
         key: &TaskKey,
     ) -> Result<Option<StepResult>, StoreError>;
+
+    /// Make event listeners claimable.
+    ///
+    /// Each id that is `Waiting(Events)` with an empty `wake_at` becomes
+    /// `Runnable`, with `wake_at = now` and its version bumped. A live lease,
+    /// a terminal status, a timer, a join, and a row that already has a
+    /// `wake_at` are left alone. An unknown id is ignored. The count is how
+    /// many rows flipped. Calling this twice is a no-op the second time.
+    ///
+    /// This is not a compare-and-set. The engine calls it after an emit's
+    /// activity commit, not from [`Engine::commit`](crate::Engine::commit).
+    async fn wake(&self, ids: &[InstanceId], now: Timestamp) -> Result<usize, StoreError>;
+
+    /// The earliest `wake_at` strictly after `now` that a claim could take.
+    ///
+    /// A candidate is `Runnable` or `Waiting(Timer)` and holds no lease that
+    /// is still live at `now`. `Waiting(Events)`, `Waiting(Join)`, and
+    /// `Waiting(Child)` are not candidates: they are not claimable until
+    /// something else releases them. `None` means nothing is waiting on a
+    /// future instant. The test driver advances a manual clock to this
+    /// instant; a production loop uses it as a poll interval. Neither uses
+    /// it to decide whether an instance is runnable.
+    async fn next_due(&self, now: Timestamp) -> Result<Option<Timestamp>, StoreError>;
 }

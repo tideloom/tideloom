@@ -41,7 +41,7 @@ fn document(namespace: &str, name: &str, version: &str, tasks: &str) -> Definiti
 struct Harness {
     engine: Engine,
     store: Arc<MemoryStore>,
-    clock: ManualClock,
+    clock: Arc<ManualClock>,
     parent: DefinitionKey,
 }
 
@@ -54,7 +54,7 @@ impl Harness {
         }
         let store = Arc::new(MemoryStore::new());
         let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(64).expect("64")));
-        let clock = ManualClock::at(at(1_000));
+        let clock = Arc::new(ManualClock::at(at(1_000)));
         let engine = Engine::new(EngineParts {
             worker: WorkerId("child-test".to_string()),
             store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -63,7 +63,7 @@ impl Harness {
             executors: Vec::new(),
             events_out: Arc::new(Discard),
             events_in: Arc::new(EmptyInbox),
-            clock: Arc::new(ManualClock::at(at(1_000))),
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
         });
         Self {
             engine,
@@ -84,8 +84,7 @@ impl Harness {
     }
 
     async fn drive(&self) {
-        self.engine
-            .drive_until_idle(&self.clock)
+        tideloom_runtime::drive_until_idle(&self.engine, &self.clock)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
     }
@@ -98,8 +97,8 @@ impl tideloom_runtime::EventSink for Discard {
     async fn publish(
         &self,
         _event: tideloom_runtime::CloudEvent,
-    ) -> Result<(), tideloom_runtime::EventError> {
-        Ok(())
+    ) -> Result<Vec<InstanceId>, tideloom_runtime::EventError> {
+        Ok(Vec::new())
     }
 }
 
@@ -474,8 +473,7 @@ fn a_parent_waits_on_child_until_the_child_is_terminal() {
         &[receipt()],
     );
     let id = block_on(harness.start(json!({"orderId": 1})));
-    let stepped = block_on(harness.engine.run_once(harness.clock.now()))
-        .unwrap_or_else(|error| panic!("{error}"));
+    let stepped = block_on(harness.engine.run_once()).unwrap_or_else(|error| panic!("{error}"));
     assert!(stepped.processed >= 1);
 
     let parent = block_on(harness.store.get(&id)).unwrap_or_else(|error| panic!("{error}"));
@@ -520,12 +518,10 @@ fn a_child_wait_holds_the_parent_until_the_timer_is_due() {
         &[child],
     );
     let id = block_on(harness.start(json!({})));
-    block_on(harness.engine.run_once(harness.clock.now()))
-        .unwrap_or_else(|error| panic!("{error}"));
+    block_on(harness.engine.run_once()).unwrap_or_else(|error| panic!("{error}"));
     // The child is spawned and claimed in later passes. Drive once more so
     // the child reaches its wait, then stop before the clock advances.
-    block_on(harness.engine.run_once(harness.clock.now()))
-        .unwrap_or_else(|error| panic!("{error}"));
+    block_on(harness.engine.run_once()).unwrap_or_else(|error| panic!("{error}"));
     let parent = block_on(harness.store.get(&id)).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
         parent.status,

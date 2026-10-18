@@ -127,7 +127,7 @@ fn unindex(state: &mut State, instance: &InstanceId, spec: &ListenSpec) {
 
 #[async_trait]
 impl EventSink for LocalEventBus {
-    async fn publish(&self, event: CloudEvent) -> Result<(), EventError> {
+    async fn publish(&self, event: CloudEvent) -> Result<Vec<InstanceId>, EventError> {
         let mut landed = Vec::new();
         {
             let mut state = self.inner.state.lock().await;
@@ -167,11 +167,13 @@ impl EventSink for LocalEventBus {
             }
         }
         if let Some(wakeup) = &self.inner.wakeup {
-            for instance in landed {
-                let _ = wakeup.notify(instance, Hint::Event(event.id.clone())).await;
+            for instance in &landed {
+                let _ = wakeup
+                    .notify(instance.clone(), Hint::Event(event.id.clone()))
+                    .await;
             }
         }
-        Ok(())
+        Ok(landed)
     }
 }
 

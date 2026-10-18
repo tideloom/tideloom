@@ -34,6 +34,8 @@ mod events;
 mod executor;
 mod instance;
 mod store;
+#[cfg(feature = "test-util")]
+mod testing;
 mod wakeup;
 
 pub use clock::Clock;
@@ -51,7 +53,6 @@ pub use engine::EngineParts;
 pub use engine::StepCount;
 pub use engine::UNKNOWN_DETAIL;
 pub use engine::listen::ListenRelease;
-pub use engine::notify_due;
 pub use events::CloudEvent;
 pub use events::EventError;
 pub use events::EventSink;
@@ -76,6 +77,8 @@ pub use instance::WorkerId;
 pub use store::InstanceStore;
 pub use store::MemoryStore;
 pub use store::StoreError;
+#[cfg(feature = "test-util")]
+pub use testing::drive_until_idle;
 pub use wakeup::BusError;
 pub use wakeup::Hint;
 pub use wakeup::LocalWakeup;

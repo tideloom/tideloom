@@ -97,7 +97,9 @@ fn drive(tasks: &str, input: Value) -> tideloom_runtime::Instance {
     let key = definitions.publish(definition(tasks));
     let store = Arc::new(MemoryStore::new());
     let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(8).expect("8")));
-    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
     let engine = Engine::new(EngineParts {
         worker: WorkerId("http-call".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -108,12 +110,13 @@ fn drive(tasks: &str, input: Value) -> tideloom_runtime::Instance {
         ))],
         events_out: Arc::new(Discard),
         events_in: Arc::new(Discard),
-        clock: Arc::new(ManualClock::at(clock.now())),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
     let instance = Instance::new(key, None, input, clock.now());
     let id = instance.id.clone();
     block_on(store.create(instance)).unwrap_or_else(|error| panic!("{error}"));
-    block_on(engine.drive_until_idle(&clock)).unwrap_or_else(|error| panic!("{error}"));
+    block_on(tideloom_runtime::drive_until_idle(&engine, &clock))
+        .unwrap_or_else(|error| panic!("{error}"));
     block_on(store.get(&id)).unwrap_or_else(|error| panic!("{error}"))
 }
 
@@ -124,8 +127,8 @@ impl tideloom_runtime::EventSink for Discard {
     async fn publish(
         &self,
         _: tideloom_runtime::CloudEvent,
-    ) -> Result<(), tideloom_runtime::EventError> {
-        Ok(())
+    ) -> Result<Vec<InstanceId>, tideloom_runtime::EventError> {
+        Ok(Vec::new())
     }
 }
 
@@ -222,7 +225,9 @@ fn a_stored_continuation_resumes_without_repeating_the_call() {
     let key = definitions.publish(definition(&tasks));
     let store = Arc::new(MemoryStore::new());
     let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(8).expect("8")));
-    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
     let engine = Engine::new(EngineParts {
         worker: WorkerId("http-call".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -233,14 +238,14 @@ fn a_stored_continuation_resumes_without_repeating_the_call() {
         ))],
         events_out: Arc::new(Discard),
         events_in: Arc::new(Discard),
-        clock: Arc::new(ManualClock::at(clock.now())),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
     let instance = Instance::new(key, None, json!({}), clock.now());
     let id = instance.id.clone();
     block_on(store.create(instance)).unwrap_or_else(|error| panic!("{error}"));
     // One claim journals Pending, sends the request, then upserts Output on
     // the same attempt. A second drive must not send again.
-    block_on(engine.run_once(clock.now())).unwrap_or_else(|error| panic!("{error}"));
+    block_on(engine.run_once()).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(server.hits(), 1);
     let steps = block_on(store.steps(&id)).unwrap_or_else(|error| panic!("{error}"));
     assert!(
@@ -249,7 +254,8 @@ fn a_stored_continuation_resumes_without_repeating_the_call() {
             .any(|step| matches!(step.outcome, tideloom_runtime::StepOutcome::Output(_))),
         "the call outcome is stored, {steps:?}"
     );
-    block_on(engine.drive_until_idle(&clock)).unwrap_or_else(|error| panic!("{error}"));
+    block_on(tideloom_runtime::drive_until_idle(&engine, &clock))
+        .unwrap_or_else(|error| panic!("{error}"));
     let done = block_on(store.get(&id)).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(done.status, Status::Completed, "{done:?}");
     assert_eq!(

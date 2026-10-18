@@ -60,8 +60,15 @@ pub enum EventError {
 /// Where `emit` publishes.
 #[async_trait]
 pub trait EventSink: Send + Sync {
-    /// Publish one event. Returns once the backend accepted it.
-    async fn publish(&self, event: CloudEvent) -> Result<(), EventError>;
+    /// Publish one event and return the instances whose inbox received it.
+    ///
+    /// The vector is the instances this call newly wrote the event into. A
+    /// repeated publish of the same event returns an empty vector when the
+    /// backend does not write it again. The engine wakes those instances
+    /// after the emit's activity commit. Waking inside this call is an
+    /// implementation choice, not this contract: the bus and the store are
+    /// different traits.
+    async fn publish(&self, event: CloudEvent) -> Result<Vec<InstanceId>, EventError>;
 }
 
 /// Where `listen` subscribes and collects.
