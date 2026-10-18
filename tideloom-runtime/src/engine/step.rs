@@ -223,11 +223,20 @@ impl Engine {
         };
         let terminal = commit.status.is_terminal();
         let parent = current.parent.clone();
-        let commit = if terminal {
+        let mut commit = if terminal {
             self.cancel_losing_siblings(&current, commit).await?
         } else {
             commit
         };
+        // `wake` ignores a listener that was still `Running` when the emit
+        // landed. If this commit is about to park that listen, the event is
+        // already in the inbox and `claim` would never return the row. Arm
+        // the park before `apply`, not after: a wake of the committed
+        // `Waiting(Events)` row races the next claim.
+        if commit.status == Status::Waiting(WaitReason::Events) && commit.wake_at.is_none() {
+            self.arm_satisfied_listen(&current, &mut commit, now)
+                .await?;
+        }
         let conflict = self.apply_step(commit).await?;
         if !conflict && !acked.is_empty() {
             // After the commit, never before. A conflict above leaves the
@@ -518,22 +527,33 @@ impl Engine {
                 .await
                 .map_err(|error| EngineError::Events(error.to_string()))?;
             // Subscribe happens before the commit, so an emit already in the
-            // retained log is in the inbox. Release now instead of parking
-            // on `Waiting(Events)`, which `claim` would never return.
-            let inbox = self
-                .events_in()
-                .inbox(&instance.id)
-                .await
-                .map_err(|error| EngineError::Events(error.to_string()))?;
-            if listen::satisfied(&spec, &inbox) {
+            // retained log is in the inbox. An emit that lands while this
+            // instance is still `Running` is also already there: `wake` does
+            // not flip a row that is not yet `Waiting(Events)`, and `claim`
+            // never returns that wait. Read the inbox again immediately
+            // before returning the commit. A hit between this read and
+            // `apply` is the remaining window; the next emit's `wake` covers
+            // a row that has parked by then.
+            if self.inbox_satisfies(&instance.id, &spec).await? {
                 // Due now, so the next `run_once` claims it and releases.
-                // An unsatisfied listen stays `Waiting(Events)`, which
-                // `claim` does not return.
                 commit.status = Status::Waiting(WaitReason::Timer);
                 commit.wake_at = Some(now);
             }
         }
         Ok(commit)
+    }
+
+    async fn inbox_satisfies(
+        &self,
+        instance: &InstanceId,
+        spec: &tideloom_core::ListenSpec,
+    ) -> Result<bool, EngineError> {
+        let inbox = self
+            .events_in()
+            .inbox(instance)
+            .await
+            .map_err(|error| EngineError::Events(error.to_string()))?;
+        Ok(listen::satisfied(spec, &inbox))
     }
 
     /// A claimed listen either keeps waiting or resumes with the inbox.
@@ -1070,6 +1090,44 @@ impl Engine {
         commit.continuation = Some(bytes);
         commit.wake_at = Some(now);
         self.apply_step(commit).await
+    }
+
+    /// Make a listen park claimable when the inbox already satisfies it.
+    ///
+    /// Called immediately before `apply`. `wake` cannot see this row yet: it
+    /// is still `Running`. The commit is what stores the wait, so the commit
+    /// is also what has to carry `wake_at` when the event is already there.
+    async fn arm_satisfied_listen(
+        &self,
+        instance: &Instance,
+        commit: &mut Commit,
+        now: Timestamp,
+    ) -> Result<(), EngineError> {
+        let Some(bytes) = commit.continuation.as_deref() else {
+            return Ok(());
+        };
+        let continuation = decode(&instance.id, bytes)?;
+        if continuation.pause() != Pause::Events {
+            return Ok(());
+        }
+        let definition = self.definitions().get(&instance.definition).await?;
+        let ticked = resume_with(
+            &definition,
+            continuation,
+            Resume::Tick,
+            WalkOptions::new().with_now(now),
+        );
+        let Outcome::Blocked { block, .. } = ticked else {
+            return Ok(());
+        };
+        let tideloom_core::BlockDetail::Listen(spec) = block.detail() else {
+            return Ok(());
+        };
+        if self.inbox_satisfies(&instance.id, spec).await? {
+            commit.status = Status::Waiting(WaitReason::Timer);
+            commit.wake_at = Some(now);
+        }
+        Ok(())
     }
 
     /// Flip listeners that received an emit, then hint the bus.

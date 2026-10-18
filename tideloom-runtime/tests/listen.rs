@@ -913,3 +913,94 @@ do:
     );
     let _ = emitter_id;
 }
+
+/// An emit that lands while the listener is still `Running` is already in
+/// the inbox when the listen parks. `wake` does not flip a row that is not
+/// yet `Waiting(Events)`. The park commit must still leave the listener
+/// claimable, or `claim` never returns it.
+#[tokio::test]
+async fn a_listen_that_parks_after_the_emit_stays_claimable() {
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let definition = Definition::from_yaml(
+        r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: late-listen
+  version: '0.1.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: io.example.paid
+            data:
+              order: 1
+  - hear:
+      listen:
+        to:
+          one:
+            with:
+              type: io.example.paid
+  - after:
+      set:
+        heard: true
+"#,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let key = definitions.publish(definition);
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(LocalWakeup::new(NonZeroUsize::new(16).unwrap()));
+    let bus = Arc::new(LocalEventBus::new());
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
+    let engine = Engine::new(EngineParts {
+        worker: WorkerId("late-listen".to_string()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: wakeup as Arc<dyn Wakeup>,
+        definitions: definitions as Arc<dyn tideloom_runtime::DefinitionSource>,
+        executors: vec![Arc::new(EmitExecutor::new(
+            Arc::clone(&bus) as Arc<dyn EventSink>
+        ))],
+        events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
+        events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+    });
+    let instance = Instance::new(key, None, json!({}), clock.now());
+    let id = instance.id.clone();
+    store
+        .create(instance)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    engine
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let parked = store
+        .get(&id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_ne!(
+        parked.status,
+        Status::Waiting(tideloom_runtime::WaitReason::Events),
+        "the emit already satisfied the listen, so the park must be claimable: {parked:?}"
+    );
+    assert!(
+        parked.wake_at.is_some() || parked.status.is_terminal(),
+        "{parked:?}"
+    );
+    tideloom_runtime::drive_until_idle(&engine, &clock)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let done = store
+        .get(&id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(done.status, Status::Completed, "{done:?}");
+    assert_eq!(
+        done.output.as_ref().and_then(|output| output.get("heard")),
+        Some(&json!(true))
+    );
+}
