@@ -8,6 +8,9 @@
 //! whole value is one interpolation becomes that value. Other interpolations
 //! are text. `if`, `when`, `for.in`, `while`, `input.from`, `output.as`,
 //! `export.as`, and `emit.event.with` are evaluated through [`evaluate_data`].
+//!
+//! Parsing and evaluation each refuse nesting deeper than [`MAX_DEPTH`]. The
+//! fault is `expression nests too deeply`, not a stack overflow.
 
 use std::collections::BTreeMap;
 
@@ -15,13 +18,22 @@ use serde_json::Map;
 use serde_json::Number;
 use serde_json::Value;
 
+/// How deep a parser call or an `eval` call may nest.
+///
+/// The same bound as the engine's activity loop. A definition that nests
+/// past it is an expression fault, not a stack overflow in the worker that
+/// holds the lease.
+const MAX_DEPTH: u32 = 64;
+
+const TOO_DEEP: &str = "expression nests too deeply";
+
 pub(crate) fn evaluate(
     source: &str,
     dot: &Value,
     vars: &BTreeMap<String, Value>,
 ) -> Result<Value, String> {
     let expr = parse(source).map_err(|message| format!("{message} in `{source}`"))?;
-    let mut values = eval(&expr, dot, vars)?;
+    let mut values = eval(&expr, dot, vars, 0)?;
     if values.len() != 1 {
         return Err(format!(
             "expression must produce one value, got {} in `{source}`",
@@ -183,7 +195,11 @@ enum BinOp {
 }
 
 fn parse(source: &str) -> Result<Expr, String> {
-    let mut parser = Parser { source, index: 0 };
+    let mut parser = Parser {
+        source,
+        index: 0,
+        depth: 0,
+    };
     let expr = parser.parse_pipe()?;
     parser.skip();
     if parser.index != parser.source.len() {
@@ -195,10 +211,25 @@ fn parse(source: &str) -> Result<Expr, String> {
 struct Parser<'a> {
     source: &'a str,
     index: usize,
+    /// Nested [`Self::parse_pipe`] calls. `if`, parentheses, indexes, and
+    /// function arguments all re-enter there.
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
     fn parse_pipe(&mut self) -> Result<Expr, String> {
+        // The entry call is not a nest. Each parenthesis, index, `if`, or
+        // function argument is one. 64 of those fault; 63 stay legal.
+        if self.depth >= MAX_DEPTH {
+            return Err(TOO_DEEP.to_string());
+        }
+        self.depth += 1;
+        let parsed = self.parse_pipe_at();
+        self.depth -= 1;
+        parsed
+    }
+
+    fn parse_pipe_at(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_default()?;
         while self.eat_op("|") {
             let right = self.parse_default()?;
@@ -661,7 +692,16 @@ fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
-fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>, String> {
+fn eval(
+    expr: &Expr,
+    dot: &Value,
+    vars: &BTreeMap<String, Value>,
+    depth: u32,
+) -> Result<Vec<Value>, String> {
+    if depth >= MAX_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
+    let next = depth + 1;
     match expr {
         Expr::Dot => Ok(vec![dot.clone()]),
         Expr::Var(name) => vars
@@ -669,7 +709,7 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
             .cloned()
             .map(|value| vec![value])
             .ok_or_else(|| format!("unknown variable `${name}`")),
-        Expr::Field(base, name) => eval(base, dot, vars)?
+        Expr::Field(base, name) => eval(base, dot, vars, next)?
             .into_iter()
             .map(|value| match value {
                 Value::Object(object) => Ok(object.get(name).cloned().unwrap_or(Value::Null)),
@@ -679,8 +719,8 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
             .collect(),
         Expr::Index(base, index) => {
             let mut out = Vec::new();
-            for value in eval(base, dot, vars)? {
-                for index in eval(index, dot, vars)? {
+            for value in eval(base, dot, vars, next)? {
+                for index in eval(index, dot, vars, next)? {
                     out.push(index_value(&value, &index)?);
                 }
             }
@@ -690,34 +730,34 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
         Expr::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.extend(eval(item, dot, vars)?);
+                out.extend(eval(item, dot, vars, next)?);
             }
             Ok(vec![Value::Array(out)])
         }
         Expr::Object(fields) => {
             let mut objects = vec![Map::new()];
             for (key, value) in fields {
-                let values = eval(value, dot, vars)?;
-                let mut next = Vec::new();
+                let values = eval(value, dot, vars, next)?;
+                let mut expanded = Vec::new();
                 for object in objects {
                     for value in &values {
                         let mut object = object.clone();
                         object.insert(key.clone(), value.clone());
-                        next.push(object);
+                        expanded.push(object);
                     }
                 }
-                objects = next;
+                objects = expanded;
             }
             Ok(objects.into_iter().map(Value::Object).collect())
         }
-        Expr::Not(inner) => eval(inner, dot, vars)?
+        Expr::Not(inner) => eval(inner, dot, vars, next)?
             .into_iter()
             .map(|value| match value {
                 Value::Bool(flag) => Ok(Value::Bool(!flag)),
                 _ => Err("`not` expects a boolean".to_string()),
             })
             .collect(),
-        Expr::Neg(inner) => eval(inner, dot, vars)?
+        Expr::Neg(inner) => eval(inner, dot, vars, next)?
             .into_iter()
             .map(|value| match as_num(&value) {
                 Some(Num::Int(number)) => number
@@ -730,7 +770,7 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
             .collect(),
         Expr::Binary(op, left, right) => {
             let mut out = Vec::new();
-            for left in eval(left, dot, vars)? {
+            for left in eval(left, dot, vars, next)? {
                 if matches!(op, BinOp::And | BinOp::Or) {
                     let Value::Bool(flag) = left else {
                         return Err(format!("`{}` expects a boolean", bin_name(*op)));
@@ -740,7 +780,7 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
                         continue;
                     }
                 }
-                for right in eval(right, dot, vars)? {
+                for right in eval(right, dot, vars, next)? {
                     out.push(eval_binary(*op, &left, &right)?);
                 }
             }
@@ -748,29 +788,37 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
         }
         Expr::Pipe(left, right) => {
             let mut out = Vec::new();
-            for value in eval(left, dot, vars)? {
-                out.extend(eval(right, &value, vars)?);
+            for value in eval(left, dot, vars, next)? {
+                out.extend(eval(right, &value, vars, next)?);
             }
             Ok(out)
         }
         Expr::Iterate(base) => {
             let mut out = Vec::new();
-            for value in eval(base, dot, vars)? {
+            for value in eval(base, dot, vars, next)? {
                 out.extend(iterate(value)?);
             }
             Ok(out)
         }
         Expr::If(condition, yes, no) => {
             let mut out = Vec::new();
-            for value in eval(condition, dot, vars)? {
-                out.extend(eval(if truthy(&value) { yes } else { no }, dot, vars)?);
+            for value in eval(condition, dot, vars, next)? {
+                out.extend(eval(
+                    if truthy(&value) { yes } else { no },
+                    dot,
+                    vars,
+                    next,
+                )?);
             }
             Ok(out)
         }
         Expr::Default(left, right) => {
-            let values: Vec<_> = eval(left, dot, vars)?.into_iter().filter(truthy).collect();
+            let values: Vec<_> = eval(left, dot, vars, next)?
+                .into_iter()
+                .filter(truthy)
+                .collect();
             if values.is_empty() {
-                eval(right, dot, vars)
+                eval(right, dot, vars, next)
             } else {
                 Ok(values)
             }
@@ -780,12 +828,12 @@ fn eval(expr: &Expr, dot: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<
                 if name == "map" {
                     let mut out = Vec::new();
                     for value in iterate(dot.clone())? {
-                        out.extend(eval(argument, &value, vars)?);
+                        out.extend(eval(argument, &value, vars, next)?);
                     }
                     return Ok(vec![Value::Array(out)]);
                 }
                 let mut out = Vec::new();
-                for value in eval(argument, dot, vars)? {
+                for value in eval(argument, dot, vars, next)? {
                     if name == "select" {
                         if truthy(&value) {
                             out.push(dot.clone());
@@ -1425,6 +1473,28 @@ do:
             fault.error_type(),
             "https://open-workflow-specification.org/spec/1.0.0/errors/expression"
         );
+    }
+
+    #[test]
+    fn nesting_past_the_depth_limit_is_an_expression_fault() {
+        // Parentheses re-enter `parse_pipe` once per pair, and the literal
+        // inside the innermost pair is one more call. 63 pairs stay at the
+        // bound; 64 pairs cross it. Fifty thousand would blow the stack
+        // before the counter ran.
+        let allowed = format!("{}1{}", "(".repeat(63), ")".repeat(63));
+        assert_eq!(ev(&allowed, json!(null)), json!(1));
+        let refused = format!("{}1{}", "(".repeat(64), ")".repeat(64));
+        let error = evaluate(&refused, &json!(null), &BTreeMap::new()).unwrap_err();
+        assert!(error.contains("expression nests too deeply"), "{error}");
+
+        // Each field is one `eval` call. 63 fields stay at the bound; the
+        // 64th crosses it.
+        let dot = (0..63).fold(json!(1), |inner, _| json!({"n": inner}));
+        let allowed_path = format!(".{}", ".n".repeat(63));
+        assert_eq!(ev(&allowed_path, dot.clone()), json!(1));
+        let refused_path = format!(".{}", ".n".repeat(64));
+        let error = evaluate(&refused_path, &dot, &BTreeMap::new()).unwrap_err();
+        assert!(error.contains("expression nests too deeply"), "{error}");
     }
 
     #[test]

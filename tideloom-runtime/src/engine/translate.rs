@@ -55,10 +55,12 @@ pub struct Translated {
 ///
 /// `definition` is the key the instance was created with. A join's branches
 /// run that same tree, started at each branch position. `now` is the single
-/// clock reading of the step. A timer's `wake_at` is `now + after`: the
-/// continuation's task start is the join's, not the wait's, and using it
-/// would make a wait after a join due in the past. A retry uses the delay
-/// the interpreter already computed, added to `now` for the same reason.
+/// clock reading of the step. A timer's `wake_at` is
+/// `continuation.task_started() + after`, and a retry's is
+/// `continuation.task_started() + delay` — the same instant [`Pause::retry_at`]
+/// already computes. A missing task start falls back to `now`, which is how
+/// the first observation sticks. A later tick of the same pause does not move
+/// `wake_at`.
 ///
 /// # Errors
 ///
@@ -217,16 +219,15 @@ fn translate_block(
             };
             (
                 Status::Waiting(WaitReason::Timer),
-                // A zero wait is still a stop. `claim` treats `wake_at <= now`
-                // as due, so parking at `now` would be claimed again in the
-                // same instant and the step would never idle.
-                Some(park_until(now, after)),
+                Some(park_until(task_started(continuation, now), after)),
                 Vec::new(),
             )
         }
         Pause::Retry { delay, .. } => (
             Status::Waiting(WaitReason::Timer),
-            Some(park_until(now, delay)),
+            // `Pause::retry_at` is this sum. The caller used to pass `now`,
+            // which moved the deadline every time the pause was reparked.
+            Some(park_until(task_started(continuation, now), delay)),
             Vec::new(),
         ),
         Pause::Join { .. } => {
@@ -302,18 +303,30 @@ fn translate_block(
     })
 }
 
+/// When the pending pause was first observed.
+///
+/// The interpreter stamps `task_started` on the block it just built, which is
+/// this step's `now`. A tick of the same pause keeps the stored instant, so
+/// the caller that recorded the first observation is what makes a repark
+/// stable. A missing stamp falls back to `now`.
+fn task_started(continuation: &Continuation, now: Timestamp) -> Timestamp {
+    continuation.task_started().unwrap_or(now)
+}
+
 /// When a timer or a retry may be claimed again.
 ///
 /// `claim` treats `wake_at <= now` as due. A zero duration is a real stop, so
-/// it parks one millisecond later; otherwise the same pass would claim it
-/// again and never idle. A positive duration is added to `now` as written.
-fn park_until(now: Timestamp, delay: Duration) -> Timestamp {
+/// it parks one millisecond after the task start; otherwise the same pass
+/// would claim it again and never idle. A positive duration is added to the
+/// task start as written. The anchor is the first observation, not the clock
+/// reading of a later tick.
+fn park_until(started: Timestamp, delay: Duration) -> Timestamp {
     let delay = if delay.is_zero() {
         Duration::from_millis(1)
     } else {
         delay
     };
-    add_duration(now, delay)
+    add_duration(started, delay)
 }
 
 fn add_duration(start: Timestamp, delay: Duration) -> Timestamp {
