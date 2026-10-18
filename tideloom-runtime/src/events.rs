@@ -10,7 +10,6 @@ use crate::InstanceId;
 
 mod local;
 
-pub use local::ListenRelease;
 pub use local::LocalEventBus;
 
 /// A CloudEvent as the runtime moves it around.

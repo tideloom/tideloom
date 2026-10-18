@@ -321,7 +321,11 @@ impl Engine {
     ) -> Result<(Commit, Vec<String>), EngineError> {
         let options = WalkOptions::new().with_now(now);
         let mut outcome = match &instance.continuation {
-            None => self.begin(instance, definition, options)?,
+            None => {
+                let mut started = self.begin(instance, definition, options)?;
+                Self::observe(&mut started, now);
+                started
+            }
             Some(bytes) => {
                 let continuation = decode(&instance.id, bytes)?;
                 // A released join is `Runnable` with the join continuation
@@ -397,11 +401,25 @@ impl Engine {
             version = journalled.version;
             let event = journalled.event.unwrap_or(Resume::Tick);
             outcome = resume_with(definition, continuation.clone(), event, options);
+            Self::observe(&mut outcome, now);
         }
         let commit = self
             .commit_stopped(instance, definition, outcome, version, now)
             .await?;
         Ok((commit, Vec::new()))
+    }
+
+    /// Keep the first observation of a pause across a later tick.
+    ///
+    /// A new block stamps `task_started` with this step's clock and clears
+    /// any earlier one. A tick of the same pause does not. `translate` adds
+    /// the wait or the retry delay to that instant, so the first park has to
+    /// record it; otherwise the next tick would stamp `now` and move
+    /// `wake_at`. The first instant stays.
+    fn observe(outcome: &mut Outcome, now: Timestamp) {
+        if let Outcome::Blocked { continuation, .. } = outcome {
+            continuation.start_task(now);
+        }
     }
 
     /// A claimed timer or retry has reached `wake_at`. Release it.
@@ -433,8 +451,8 @@ impl Engine {
             ));
         }
         let Outcome::Blocked {
+            block,
             continuation: parked,
-            ..
         } = ticked
         else {
             return Ok((
@@ -449,7 +467,28 @@ impl Engine {
                 Vec::new(),
             ));
         };
-        let outcome = resume_with(definition, parked, Resume::Release(Value::Null), options);
+        // A claim can hand this row out before the recorded deadline: the
+        // sweeper returns a lapsed lease, and a test can step a held row.
+        // Releasing then would skip the rest of the wait. Park again at the
+        // same `wake_at`. A deadline that has arrived, or a tick that moved
+        // off the timer, falls through to the release.
+        let mut commit = translate(
+            &instance.id,
+            instance.version,
+            &instance.definition,
+            Outcome::Blocked {
+                block,
+                continuation: parked.clone(),
+            },
+            Vec::new(),
+            now,
+        )?;
+        if commit.wake_at.is_some_and(|due| now < due) {
+            commit.status = Status::Waiting(WaitReason::Timer);
+            return Ok((commit, Vec::new()));
+        }
+        let mut outcome = resume_with(definition, parked, Resume::Release(Value::Null), options);
+        Self::observe(&mut outcome, now);
         let commit = self
             .finish_inline(instance, definition, outcome, now)
             .await?;
@@ -492,6 +531,7 @@ impl Engine {
             version = journalled.version;
             let event = journalled.event.unwrap_or(Resume::Tick);
             outcome = resume_with(definition, continuation.clone(), event, options);
+            Self::observe(&mut outcome, now);
         }
         self.commit_stopped(instance, definition, outcome, version, now)
             .await
@@ -544,7 +584,7 @@ impl Engine {
                 .inbox(&instance.id)
                 .await
                 .map_err(|error| EngineError::Events(error.to_string()))?;
-            if crate::LocalEventBus::satisfied(&spec, &inbox) {
+            if listen::satisfied(&spec, &inbox) {
                 // Due now, so the next `run_once` claims it and releases.
                 // An unsatisfied listen stays `Waiting(Events)`, which
                 // `claim` does not return.
@@ -603,12 +643,13 @@ impl Engine {
         let ListenStep::Release(release) = decision else {
             return Ok((still_events(instance, &continuation, now)?, Vec::new()));
         };
-        let outcome = resume_with(
+        let mut outcome = resume_with(
             definition,
             continuation,
             Resume::Release(serde_json::Value::Array(release.events)),
             WalkOptions::new().with_now(now),
         );
+        Self::observe(&mut outcome, now);
         // Same finish as a timer release: an activity immediately after the
         // listen runs in this step instead of parking as a due timer.
         let commit = self
@@ -776,12 +817,13 @@ impl Engine {
         match decide(&children, compete) {
             JoinDecision::Pending => Ok(still_waiting(instance, &continuation, now)?),
             JoinDecision::Release { output, cancel } => {
-                let outcome = resume_with(
+                let mut outcome = resume_with(
                     definition,
                     continuation,
                     Resume::Release(output),
                     WalkOptions::new().with_now(now),
                 );
+                Self::observe(&mut outcome, now);
                 // Same finish as a child-workflow release. `translate` alone
                 // would park the next activity as a due timer and leave it
                 // for the following claim.
@@ -1012,21 +1054,23 @@ impl Engine {
         match super::child::decide(&children) {
             ChildDecision::Pending => Ok(still_child(instance, &continuation, now)?),
             ChildDecision::Output { output } => {
-                let outcome = resume_with(
+                let mut outcome = resume_with(
                     definition,
                     continuation,
                     Resume::Output(output),
                     WalkOptions::new().with_now(now),
                 );
+                Self::observe(&mut outcome, now);
                 self.finish_inline(instance, definition, outcome, now).await
             }
             ChildDecision::Fault { fault } => {
-                let outcome = resume_with(
+                let mut outcome = resume_with(
                     definition,
                     continuation,
                     Resume::Fault(fault),
                     WalkOptions::new().with_now(now),
                 );
+                Self::observe(&mut outcome, now);
                 self.finish_inline(instance, definition, outcome, now).await
             }
         }
@@ -1113,7 +1157,7 @@ impl Engine {
                 .inbox(&instance.id)
                 .await
                 .map_err(|error| EngineError::Events(error.to_string()))?;
-            if !crate::LocalEventBus::satisfied(spec, &inbox) {
+            if !listen::satisfied(spec, &inbox) {
                 continue;
             }
             let mut due = Commit::new(

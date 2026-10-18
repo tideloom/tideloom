@@ -318,6 +318,45 @@ fn a_wait_completes_when_the_clock_reaches_wake_at() {
 }
 
 #[test]
+fn a_reparked_wait_keeps_its_first_wake_at() {
+    let harness = Harness::new(
+        "",
+        r#"
+  - pause:
+      wait:
+        seconds: 30
+  - after:
+      set:
+        done: true
+"#,
+    );
+    let id = harness.start(json!({}));
+    run(harness.engine.run_once(harness.clock.now())).unwrap();
+    let waiting = run(harness.store.get(&id)).unwrap();
+    let first = waiting.wake_at.expect("first park");
+    assert_eq!(first, at(31_000));
+
+    // `claim` will not return this row before `wake_at`. Take it directly and
+    // step at a later clock that is still before the deadline. The tick
+    // returns the same wait, and `wake_at` stays at the first observation
+    // plus 30s. Anchoring it on this step would move it to 40s.
+    let held = run(harness.store.claim(
+        harness.engine.worker(),
+        first,
+        at(first.millis() + 30_000),
+        1,
+    ))
+    .unwrap();
+    assert_eq!(held.len(), 1);
+    let again = run(harness.engine.step(held[0].clone(), at(10_000))).unwrap();
+    assert!(!again, "the repark commits");
+    let parked = run(harness.store.get(&id)).unwrap();
+    assert_eq!(parked.status, Status::Waiting(WaitReason::Timer));
+    assert_eq!(parked.wake_at, Some(first), "{parked:?}");
+    assert_ne!(parked.wake_at, Some(at(40_000)));
+}
+
+#[test]
 fn a_retry_is_claimed_again_at_wake_at() {
     let harness = Harness::new(
         "",

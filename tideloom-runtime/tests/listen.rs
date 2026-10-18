@@ -364,7 +364,7 @@ async fn an_event_that_arrives_before_subscribe_is_not_lost() {
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].id, "early-paid");
-    assert!(LocalEventBus::satisfied(&one("io.example.paid"), &inbox));
+    assert!(listen::satisfied(&one("io.example.paid"), &inbox));
 }
 
 #[tokio::test]

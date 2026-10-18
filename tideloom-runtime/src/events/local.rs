@@ -6,7 +6,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tideloom_core::EventFilter;
 use tideloom_core::ListenSpec;
-use tideloom_core::ListenStrategy;
 use tokio::sync::Mutex;
 
 use crate::CloudEvent;
@@ -86,55 +85,6 @@ impl LocalEventBus {
             }),
         }
     }
-
-    /// Whether `inbox` already satisfies `spec`.
-    ///
-    /// `One` and `Any` need one matching event. `All` needs one event for
-    /// every filter. Events are not consumed.
-    #[must_use]
-    pub fn satisfied(spec: &ListenSpec, inbox: &[CloudEvent]) -> bool {
-        match spec.strategy {
-            ListenStrategy::One | ListenStrategy::Any => inbox
-                .iter()
-                .any(|event| spec.filters.iter().any(|filter| matches(filter, event))),
-            ListenStrategy::All => spec
-                .filters
-                .iter()
-                .all(|filter| inbox.iter().any(|event| matches(filter, event))),
-        }
-    }
-
-    /// The events a `Release` should carry, oldest first, and the ids to ack.
-    ///
-    /// `None` when the inbox does not yet satisfy the strategy. `One` and
-    /// `Any` release the first match. `All` releases the first match of each
-    /// filter, in filter order. `read: data` yields each event's `data`;
-    /// `envelope` and `raw` yield the whole event.
-    #[must_use]
-    pub fn release(spec: &ListenSpec, inbox: &[CloudEvent]) -> Option<ListenRelease> {
-        let chosen = match spec.strategy {
-            ListenStrategy::One | ListenStrategy::Any => {
-                let event = inbox
-                    .iter()
-                    .find(|event| spec.filters.iter().any(|filter| matches(filter, event)))?;
-                vec![event]
-            }
-            ListenStrategy::All => {
-                let mut chosen = Vec::with_capacity(spec.filters.len());
-                for filter in &spec.filters {
-                    let event = inbox.iter().find(|event| matches(filter, event))?;
-                    chosen.push(event);
-                }
-                chosen
-            }
-        };
-        let ids = chosen.iter().map(|event| event.id.clone()).collect();
-        let events = chosen
-            .into_iter()
-            .map(|event| read_event(spec, event))
-            .collect();
-        Some(ListenRelease { events, ids })
-    }
 }
 
 impl Default for LocalEventBus {
@@ -143,35 +93,11 @@ impl Default for LocalEventBus {
     }
 }
 
-/// What a satisfied listen releases, and which inbox ids that consumes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ListenRelease {
-    /// The array handed to `Resume::Release`, in strategy order.
-    pub events: Vec<serde_json::Value>,
-    /// Inbox ids to [`EventSource::ack`] after the commit lands.
-    pub ids: Vec<String>,
-}
-
 fn matches(filter: &EventFilter, event: &CloudEvent) -> bool {
     filter
         .attributes
         .iter()
         .all(|(name, expected)| event.attribute(name) == Some(expected.as_str()))
-}
-
-fn read_event(spec: &ListenSpec, event: &CloudEvent) -> serde_json::Value {
-    if spec.read == "data" {
-        event.data.clone()
-    } else {
-        serde_json::json!({
-            "id": event.id,
-            "type": event.r#type,
-            "source": event.source,
-            "subject": event.subject,
-            "time": event.time,
-            "data": event.data,
-        })
-    }
 }
 
 fn index_keys(spec: &ListenSpec) -> Vec<IndexKey> {
