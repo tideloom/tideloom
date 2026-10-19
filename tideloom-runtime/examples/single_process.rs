@@ -18,7 +18,8 @@
 //! that retries, `wait`, a cooperative `fork`, a compete `fork`,
 //! `run: workflow`, and an `emit` that satisfies a later `listen`. This example
 //! publishes that document, creates one instance, and drives it with
-//! [`Engine::drive_until_idle`]. The clock is a [`ManualClock`]. The process
+//! [`tideloom_runtime::drive_until_idle`]. The clock is a [`ManualClock`] in
+//! [`EngineParts::clock`]. The process
 //! does not sleep. HTTP goes to a TCP listener in this process through a
 //! registered `HttpExecutor`; nothing here replaces that client or
 //! reimplements a step.
@@ -81,7 +82,9 @@ fn run() -> String {
     let bus = Arc::new(LocalEventBus::connected(
         Arc::clone(&wakeup) as Arc<dyn Wakeup>
     ));
-    let clock = ManualClock::at(tideloom_core::Timestamp::from_millis(1_000));
+    let clock = Arc::new(ManualClock::at(tideloom_core::Timestamp::from_millis(
+        1_000,
+    )));
     let engine = Engine::new(EngineParts {
         worker: WorkerId("single-process".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
@@ -95,13 +98,13 @@ fn run() -> String {
         ],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
         events_in: bus as Arc<dyn EventSource>,
-        clock: Arc::new(ManualClock::at(clock.now())),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
 
     let instance = Instance::new(parent_key, None, json!({"order": "A-1"}), clock.now());
     let id = instance.id.clone();
     block_on(store.create(instance)).expect("create");
-    let stepped = block_on(engine.drive_until_idle(&clock)).expect("drive");
+    let stepped = block_on(tideloom_runtime::drive_until_idle(&engine, &clock)).expect("drive");
     assert!(stepped > 0, "the engine claimed nothing");
 
     let parent = block_on(store.get(&id)).expect("parent");

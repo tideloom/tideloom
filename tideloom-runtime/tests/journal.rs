@@ -104,8 +104,8 @@ impl Wakeup for Silent {
 
 #[async_trait]
 impl EventSink for Silent {
-    async fn publish(&self, _: CloudEvent) -> Result<(), EventError> {
-        Ok(())
+    async fn publish(&self, _: CloudEvent) -> Result<Vec<InstanceId>, EventError> {
+        Ok(Vec::new())
     }
 }
 
@@ -168,6 +168,7 @@ fn engine(
     store: &Arc<MemoryStore>,
     definitions: &Arc<MemoryDefinitions>,
     executors: Vec<Arc<dyn ActivityExecutor>>,
+    clock: &Arc<ManualClock>,
 ) -> Engine {
     Engine::new(EngineParts {
         worker: WorkerId("journal".into()),
@@ -177,7 +178,7 @@ fn engine(
         executors,
         events_out: Arc::new(Silent),
         events_in: Arc::new(Silent),
-        clock: Arc::new(ManualClock::at(at(1_000))),
+        clock: Arc::clone(clock) as Arc<dyn tideloom_runtime::Clock>,
     })
 }
 
@@ -232,12 +233,14 @@ fn an_http_call_upserts_pending_into_output_on_the_same_attempt() {
         ),
     );
     let store = Arc::new(MemoryStore::new());
+    let clock = Arc::new(ManualClock::at(at(1_000)));
     let engine = engine(
         &store,
         &definitions,
         vec![Arc::new(tideloom_runtime::HttpExecutor::new(
             Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
         ))],
+        &clock,
     );
     run(store.create(instance("http", key))).unwrap_or_else(|error| panic!("{error}"));
 
@@ -293,7 +296,8 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_http_call() {
     // Unregistered: the crash is the Pending row, not a second request. A
     // registered `HttpExecutor` is also non-idempotent, so recovery faults
     // the same way once the row exists.
-    let engine = engine(&store, &definitions, Vec::new());
+    let clock = Arc::new(ManualClock::at(at(1_000)));
+    let engine = engine(&store, &definitions, Vec::new(), &clock);
     let id = InstanceId::from_string("crashed-http");
     run(store.create(instance("crashed-http", key))).unwrap();
 
@@ -305,7 +309,8 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_http_call() {
     // Running row and claims it again.
     let crashed = run(store.get(&id)).unwrap();
     let until = crashed.lease.expect("held lease").until;
-    let recovered = run(engine.run_once(at(until.millis() + 1))).unwrap();
+    clock.set(at(until.millis() + 1));
+    let recovered = run(engine.run_once()).unwrap();
     assert!(
         recovered.processed >= 1,
         "the lapsed instance must be claimed again"
@@ -344,7 +349,8 @@ fn a_crash_between_the_two_commits_reruns_an_idempotent_executor_at_attempt_one(
     );
     let store = Arc::new(MemoryStore::new());
     let executor = Arc::new(CountingExecutor::new(TaskKind::Emit, true));
-    let engine = engine(&store, &definitions, vec![executor.clone()]);
+    let clock = Arc::new(ManualClock::at(at(1_000)));
+    let engine = engine(&store, &definitions, vec![executor.clone()], &clock);
     let id = InstanceId::from_string("retry-emit");
     run(store.create(instance("retry-emit", key))).unwrap();
 
@@ -356,7 +362,8 @@ fn a_crash_between_the_two_commits_reruns_an_idempotent_executor_at_attempt_one(
     assert_eq!(crashed.status, Status::Running);
     let until = crashed.lease.expect("held lease").until;
 
-    let recovered = run(engine.run_once(at(until.millis() + 1))).unwrap();
+    clock.set(at(until.millis() + 1));
+    let recovered = run(engine.run_once()).unwrap();
     assert!(recovered.processed >= 1);
     assert_eq!(
         executor.hits(),
@@ -389,7 +396,8 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_executor() {
     );
     let store = Arc::new(MemoryStore::new());
     let executor = Arc::new(CountingExecutor::new(TaskKind::Emit, false));
-    let engine = engine(&store, &definitions, vec![executor.clone()]);
+    let clock = Arc::new(ManualClock::at(at(1_000)));
+    let engine = engine(&store, &definitions, vec![executor.clone()], &clock);
     let id = InstanceId::from_string("once-emit");
     run(store.create(instance("once-emit", key))).unwrap();
 
@@ -399,7 +407,8 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_executor() {
     let crashed = run(store.get(&id)).unwrap();
     let until = crashed.lease.as_ref().expect("held lease").until;
 
-    let recovered = run(engine.run_once(at(until.millis() + 1))).unwrap();
+    clock.set(at(until.millis() + 1));
+    let recovered = run(engine.run_once()).unwrap();
     assert!(recovered.processed >= 1);
     assert_eq!(
         executor.hits(),

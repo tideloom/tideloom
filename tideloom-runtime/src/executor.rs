@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
@@ -148,4 +150,15 @@ pub trait ActivityExecutor: Send + Sync {
 
     /// Run the task and return its raw output, before `output.as`.
     async fn execute(&self, task: TaskExecution) -> Result<Value, ActivityError>;
+
+    /// Downcast. The default is not an `EmitExecutor`.
+    ///
+    /// The engine uses this only to read the ids [`crate::EmitExecutor`]
+    /// recorded after `publish`. A custom executor that does not override
+    /// this does not wake the store. Hidden because it is not part of the
+    /// public contract.
+    #[doc(hidden)]
+    fn as_any(&self) -> &dyn Any {
+        &()
+    }
 }

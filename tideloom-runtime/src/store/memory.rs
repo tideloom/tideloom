@@ -283,4 +283,62 @@ impl InstanceStore for MemoryStore {
         }
         Ok(latest)
     }
+
+    async fn wake(&self, ids: &[InstanceId], now: Timestamp) -> Result<usize, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut flipped = 0;
+        for id in ids {
+            let Some(instance) = state.instances.get_mut(id) else {
+                continue;
+            };
+            // A row that already has a wake_at was flipped, or was parked on
+            // something else. Flipping it again would move the instant and
+            // bump the version under a worker that is about to CAS.
+            if instance.status != Status::Waiting(WaitReason::Events) || instance.wake_at.is_some()
+            {
+                continue;
+            }
+            instance.status = Status::Runnable;
+            instance.wake_at = Some(now);
+            instance.version += 1;
+            instance.updated_at = now;
+            flipped += 1;
+        }
+        Ok(flipped)
+    }
+
+    async fn next_due(&self, now: Timestamp) -> Result<Option<Timestamp>, StoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut earliest = None;
+        for instance in state.instances.values() {
+            let claimable = matches!(
+                instance.status,
+                Status::Runnable | Status::Waiting(WaitReason::Timer)
+            );
+            if !claimable {
+                continue;
+            }
+            let leased = instance
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.until > now);
+            if leased {
+                continue;
+            }
+            let Some(at) = instance.wake_at else {
+                continue;
+            };
+            if at <= now {
+                continue;
+            }
+            earliest = Some(earliest.map_or(at, |current: Timestamp| current.min(at)));
+        }
+        Ok(earliest)
+    }
 }

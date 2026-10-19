@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use crate::ActivityExecutor;
 use crate::BusError;
@@ -23,7 +22,6 @@ mod translate;
 
 pub use step::StepCount;
 pub use step::UNKNOWN_DETAIL;
-pub use step::notify_due;
 
 /// Listen subscription, inbox check, and ack. The step calls these from the
 /// Events branch of translate and after claim.
@@ -103,14 +101,6 @@ pub struct Engine {
     events_out: Arc<dyn EventSink>,
     events_in: Arc<dyn EventSource>,
     clock: Arc<dyn Clock>,
-    /// Instances this engine created or spawned.
-    ///
-    /// The store trait has no listing method, and MR-3 does not change it.
-    /// `drive_until_idle` and the due-timer hint need the earliest `wake_at`,
-    /// so the engine remembers the ids it is responsible for and reads those
-    /// rows. A lost signal still claims from the store; this set is only how
-    /// the single-process loop finds the next timer without a new trait.
-    known: Mutex<Vec<crate::InstanceId>>,
 }
 
 impl Engine {
@@ -132,25 +122,7 @@ impl Engine {
             events_out: parts.events_out,
             events_in: parts.events_in,
             clock: parts.clock,
-            known: Mutex::new(Vec::new()),
         }
-    }
-
-    /// Remember `id` so a later pass can read its `wake_at` without listing the store.
-    pub(crate) fn remember(&self, id: crate::InstanceId) {
-        if let Ok(mut known) = self.known.lock()
-            && !known.contains(&id)
-        {
-            known.push(id);
-        }
-    }
-
-    /// Ids this engine has created or spawned, in insertion order.
-    pub(crate) fn known_ids(&self) -> Vec<crate::InstanceId> {
-        self.known
-            .lock()
-            .map(|known| known.clone())
-            .unwrap_or_default()
     }
 
     /// This worker's identity.
