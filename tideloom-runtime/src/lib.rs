@@ -11,25 +11,22 @@
 //! [`EventSource`]), and what time it is ([`Clock`]). [`Engine`] composes
 //! them.
 //!
-//! The traits are the contract of ADR-0001 §9 and of milestone M2 in
-//! `docs/milestone-m2-single-process-runtime.md`. Implementations arrive in
-//! their own pull requests; this crate ships the in-memory ones that are small
-//! enough to be obviously right ([`ManualClock`], [`SystemClock`],
-//! [`MemoryDefinitions`]).
+//! The traits are the contract of ADR-0001 §9 and of milestone M3 in
+//! `docs/milestone-m3-postgres-and-two-workers.md`. This crate ships the
+//! in-memory implementations ([`MemoryStore`], [`LocalWakeup`],
+//! [`LocalEventBus`], [`MemoryDefinitions`], [`ManualClock`], [`SystemClock`],
+//! [`HttpExecutor`], [`EmitExecutor`]).
 //!
-//! [`engine`] is public so milestone MRs can add step helpers beside
-//! [`Engine`] without a new crate path.
+//! The engine module is private. [`Engine`], [`EngineParts`], [`EngineError`],
+//! and [`StepCount`] are the public surface; step and listen helpers stay
+//! beside the loop that calls them.
 
 #![warn(missing_docs)]
 
 mod clock;
 mod commit;
 mod definitions;
-/// The engine, its step loop, and the listen helpers that loop calls.
-///
-/// [`Engine`] is the composition root. [`engine::listen`] is
-/// the Events branch of translate and the post-claim inbox check.
-pub mod engine;
+mod engine;
 mod events;
 mod executor;
 mod instance;
@@ -51,8 +48,6 @@ pub use engine::Engine;
 pub use engine::EngineError;
 pub use engine::EngineParts;
 pub use engine::StepCount;
-pub use engine::UNKNOWN_DETAIL;
-pub use engine::listen::ListenRelease;
 pub use events::CloudEvent;
 pub use events::EventError;
 pub use events::EventSink;
@@ -62,7 +57,6 @@ pub use executor::ActivityError;
 pub use executor::ActivityExecutor;
 pub use executor::EmitExecutor;
 pub use executor::HttpExecutor;
-pub use executor::LogExecutor;
 pub use executor::TaskExecution;
 pub use executor::TaskKind;
 pub use instance::DefinitionKey;

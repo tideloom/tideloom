@@ -2,7 +2,7 @@
 
 Tideloom is a Rust runtime for the [Serverless Workflow DSL](https://github.com/serverlessworkflow/specification) (Open Workflow Specification 1.0).
 
-This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. That is `tideloom-core`, and it is pure: a blocked `call: http` is one request via `http_call`, not a walk. `tideloom-runtime` holds the traits for everything with side effects: the instance store, the wake-up bus, activity executors, definitions, events, and the clock, composed by an `Engine`. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md); the runtime traits are described in [docs/runtime-architecture.md](docs/runtime-architecture.md); the work queue is [docs/milestone-m2-single-process-runtime.md](docs/milestone-m2-single-process-runtime.md). Contributors and coding agents start at [AGENTS.md](AGENTS.md).
+This repository builds a workflow file into an immutable definition tree and runs it with an explicit continuation. `start` runs control flow inline from the root and stops at the first blocking or effectful block; the stop is a serializable `Continuation`. `resume` takes that value and what happened to the block, and continues from exactly there. Nothing is replayed from the root. That is `tideloom-core`, and it is pure: a blocked `call: http` is a block, not a walk. `tideloom-runtime` holds the traits for everything with side effects: the instance store, the wake-up bus, activity executors, definitions, events, and the clock, composed by an `Engine`. The HTTP client is `HttpExecutor`. The execution model is [ADR-0001](docs/ADR-0001-serverless-workflow-execution-model.md); the runtime traits are described in [docs/runtime-architecture.md](docs/runtime-architecture.md); the work queue is [docs/milestone-m3-postgres-and-two-workers.md](docs/milestone-m3-postgres-and-two-workers.md). Contributors and coding agents start at [AGENTS.md](AGENTS.md).
 
 ## Build
 
@@ -18,7 +18,7 @@ cargo run -p tideloom-runtime --example single_process
 
 `Engine` is the single-process runner. It claims instances from an `InstanceStore`, resumes the continuation, and commits the result. Time comes from a `Clock`. A test injects `ManualClock` and calls `Engine::drive_until_idle`, which advances that clock to the next `wake_at` instead of sleeping.
 
-The acceptance workflow is `tideloom-runtime/examples/single_process.yaml`. One `Engine` runs it through `set`, `call: http`, a `try` retry, `wait`, a cooperative `fork`, a compete `fork`, `run: workflow`, and an `emit` that a later `listen` consumes. The HTTP call goes to a TCP listener in the same process through `http_call`. The child workflow is a second document in that file, published into `MemoryDefinitions` before the parent starts.
+The acceptance workflow is `tideloom-runtime/examples/single_process.yaml`. One `Engine` runs it through `set`, `call: http`, a `try` retry, `wait`, a cooperative `fork`, a compete `fork`, `run: workflow`, a `listen`, a `wait`, and a child `emit`. The listen is subscribed before the wait. The example publishes the event the listen waits for during that wait, after the subscription. The child emits the same event once the listen has released. The bus does not replay an event that arrived before the subscription. The HTTP call goes to a TCP listener in the same process through a registered `HttpExecutor`. The child workflows are further documents in that file, published into `MemoryDefinitions` before the parent starts.
 
 ```sh
 cargo run -p tideloom-runtime --example single_process
@@ -63,7 +63,7 @@ let _boundary = task.is_block_boundary();
 
 `tideloom_core::start` takes a definition and the workflow input and runs from the root.
 
-- `set`, `do`, `switch`, `for`, `raise`, `try` (until a retry backoff), and `call` of a `use.functions` entry run inline.
+- `set`, `do`, `switch`, `for`, `raise`, `try` (until a retry backoff), and `call` of a `use.functions` entry run inline. A `set` task's output is the evaluated object itself, not that object merged into the task input. Keys that were not assigned are not copied forward. A `switch` with no matching case finishes with its input and follows its own `then` (`continue` when the task omits one); it does not fault. `export.as` replaces `$context` with the expression result. It does not merge keys into the existing context; accumulate with `$context + {...}`.
 - The run stops at the next block boundary and returns `Outcome::Blocked { block, continuation }`. The `Block` has the position, execution key, pause reason, transformed input, `$context`, and whether the block is effectful. The `Continuation` is everything needed to continue: `$context`, one frame per enclosing control-flow task, and the pending block. It implements `Serialize` / `Deserialize`; store it as the instance state.
 - Pause reasons are `Activity`, `Timer` (`wait`), `Events` (`listen`), `Join` (`fork`), `Retry` (`try` backoff), and `Child` (`run workflow`). A retry pause includes the computed wait. See [Retry backoff](#retry-backoff).
 - `tideloom_core::resume` takes the definition, the continuation, and a `Resume` event: `Output` or `Fault` for an effectful task, `Release` for `wait`, `listen`, `fork`, and a retry backoff, or `Tick` when only the clock moved. Inline tasks after the block run until the next boundary. Inline tasks before it do not run again.
@@ -142,7 +142,7 @@ Starts live on the continuation. `start_with` a `now` records the workflow start
 
 ## HTTP call
 
-`tideloom_core::http_call` performs one blocked `call: http` and returns the raw output, before task `output.as`. The runtime engine resumes with `Resume::Output` or `Resume::Fault`, so `output.as`, `export.as`, and `try` see the result. It does not sleep for a retry backoff: that pause is claimed again when `wake_at` is due.
+`HttpExecutor` performs one blocked `call: http` and the engine resumes with `Resume::Output` or `Resume::Fault`, so `output.as`, `export.as`, and `try` see the result. The call does not sleep for a retry backoff: that pause is claimed again when `wake_at` is due. The client lives in `tideloom-runtime`; the core crate does not perform I/O.
 
 `with` accepts:
 

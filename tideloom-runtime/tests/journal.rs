@@ -18,17 +18,21 @@ use async_trait::async_trait;
 use serde_json::Value;
 use serde_json::json;
 use tideloom_core::Definition;
+use tideloom_core::ExecutionKey;
 use tideloom_core::ListenSpec;
+use tideloom_core::TaskKey;
 use tideloom_core::Timestamp;
 use tideloom_runtime::ActivityError;
 use tideloom_runtime::ActivityExecutor;
 use tideloom_runtime::CloudEvent;
+use tideloom_runtime::Commit;
 use tideloom_runtime::DefinitionKey;
 use tideloom_runtime::Engine;
 use tideloom_runtime::EngineParts;
 use tideloom_runtime::EventError;
 use tideloom_runtime::EventSink;
 use tideloom_runtime::EventSource;
+use tideloom_runtime::InFlight;
 use tideloom_runtime::Instance;
 use tideloom_runtime::InstanceId;
 use tideloom_runtime::InstanceStore;
@@ -37,9 +41,9 @@ use tideloom_runtime::MemoryDefinitions;
 use tideloom_runtime::MemoryStore;
 use tideloom_runtime::Status;
 use tideloom_runtime::StepOutcome;
+use tideloom_runtime::StepResult;
 use tideloom_runtime::TaskExecution;
 use tideloom_runtime::TaskKind;
-use tideloom_runtime::UNKNOWN_DETAIL;
 use tideloom_runtime::Wakeup;
 use tideloom_runtime::WorkerId;
 
@@ -182,6 +186,42 @@ fn engine(
     })
 }
 
+/// The fault detail a non-idempotent crash writes. The engine keeps this
+/// string crate-private; the assertion is the observable fault text.
+const UNKNOWN_DETAIL: &str = "activity outcome unknown";
+
+/// Commit the `Pending` row a dead worker would have written, without running
+/// the executor. The engine no longer exposes a cut between those two commits;
+/// the store is the persistence boundary the next claim reads. `task` is the
+/// first task name in the published document, which is `/do/0/{task}`.
+fn leave_pending(
+    store: &MemoryStore,
+    claimed: &Instance,
+    now: Timestamp,
+    kind: TaskKind,
+    task: &str,
+) {
+    let key = TaskKey::new(format!("/do/0/{task}"), ExecutionKey::new([]));
+    let mut commit = Commit::new(claimed.id.clone(), claimed.version, Status::Running, now);
+    commit.continuation = claimed.continuation.clone();
+    commit.release_lease = false;
+    commit.in_flight = Some(InFlight {
+        key: key.clone(),
+        attempt: 0,
+    });
+    commit.step_results.push(StepResult {
+        instance: claimed.id.clone(),
+        key,
+        kind,
+        attempt: 0,
+        input: json!({}),
+        outcome: StepOutcome::Pending,
+        started_at: now,
+        finished_at: now,
+    });
+    run(store.apply(commit)).unwrap_or_else(|error| panic!("{error}"));
+}
+
 fn claim_one(store: &MemoryStore, now: Timestamp) -> Instance {
     let claimed = run(store.claim(
         &WorkerId("journal".into()),
@@ -246,7 +286,7 @@ fn an_http_call_upserts_pending_into_output_on_the_same_attempt() {
 
     let now = at(1_000);
     let claimed = claim_one(&store, now);
-    run(engine.step_until_pending(claimed, now)).unwrap_or_else(|error| panic!("{error}"));
+    leave_pending(&store, &claimed, now, TaskKind::Http, "notify");
     let pending = run(store.steps(&InstanceId::from_string("http"))).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].attempt, 0);
@@ -303,7 +343,7 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_http_call() {
 
     let now = at(2_000);
     let claimed = claim_one(&store, now);
-    run(engine.step_until_pending(claimed, now)).unwrap();
+    leave_pending(&store, &claimed, now, TaskKind::Http, "notify");
     // The worker died here: Pending is committed, the call was not made, the
     // lease is still held. Advance past that lease; run_once sweeps the
     // Running row and claims it again.
@@ -356,7 +396,7 @@ fn a_crash_between_the_two_commits_reruns_an_idempotent_executor_at_attempt_one(
 
     let now = at(3_000);
     let claimed = claim_one(&store, now);
-    run(engine.step_until_pending(claimed, now)).unwrap();
+    leave_pending(&store, &claimed, now, TaskKind::Emit, "note");
     assert_eq!(executor.hits(), 0);
     let crashed = run(store.get(&id)).unwrap();
     assert_eq!(crashed.status, Status::Running);
@@ -403,7 +443,7 @@ fn a_crash_between_the_two_commits_faults_a_non_idempotent_executor() {
 
     let now = at(4_000);
     let claimed = claim_one(&store, now);
-    run(engine.step_until_pending(claimed, now)).unwrap();
+    leave_pending(&store, &claimed, now, TaskKind::Emit, "note");
     let crashed = run(store.get(&id)).unwrap();
     let until = crashed.lease.as_ref().expect("held lease").until;
 

@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# M2 acceptance workflow. `examples/single_process.rs` runs this document and
-# the child workflow below through one `Engine`. `{base}` is the local HTTP
+# M3 acceptance workflow. `examples/single_process.rs` runs this document and
+# the child workflows below through one `Engine`. `{base}` is the local HTTP
 # fixture the example substitutes before publishing the definition.
+#
+# `hear` subscribes before `tell` emits, and a short `wait` sits between
+# them. The example publishes `hear`'s event during that wait, after the
+# subscription exists. `tell` emits the same event once the listen has
+# released. The bus does not replay an event that arrived before the
+# subscription.
 document:
   dsl: '1.0.0'
   namespace: default
@@ -74,6 +80,16 @@ do:
             order: ${ $workflow.input.order }
       output:
         as: '{ order: .receipt, paid: true }'
+  - hear:
+      listen:
+        to:
+          one:
+            with:
+              type: io.example.paid
+              source: https://example.test/orders
+  - hold:
+      wait:
+        milliseconds: 5
   - tell:
       run:
         workflow:
@@ -84,13 +100,6 @@ do:
             order: ${ $workflow.input.order }
       output:
         as: '{ order: .order, paid: true }'
-  - hear:
-      listen:
-        to:
-          one:
-            with:
-              type: io.example.paid
-              source: https://example.test/orders
   - seal:
       set:
         order: ${ $workflow.input.order }

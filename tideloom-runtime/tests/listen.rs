@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::json;
-use tideloom_core::BlockDetail;
 use tideloom_core::Definition;
 use tideloom_core::EventFilter;
 use tideloom_core::ListenSpec;
@@ -40,8 +39,6 @@ use tideloom_runtime::TaskExecution;
 use tideloom_runtime::TaskKind;
 use tideloom_runtime::Wakeup;
 use tideloom_runtime::WorkerId;
-use tideloom_runtime::engine::listen;
-use tideloom_runtime::engine::listen::ListenStep;
 
 fn one(type_name: &str) -> ListenSpec {
     ListenSpec {
@@ -70,10 +67,6 @@ fn event(id: &str, type_name: &str, data: serde_json::Value) -> CloudEvent {
         extensions: std::collections::BTreeMap::new(),
         data,
     }
-}
-
-fn detail(spec: ListenSpec) -> BlockDetail {
-    BlockDetail::Listen(spec)
 }
 
 fn execution(
@@ -123,6 +116,9 @@ fn execution_from(
 
 #[tokio::test]
 async fn the_engine_releases_a_listen_after_an_emit() {
+    // `listen` is a block boundary, so an emit later in the same document
+    // does not run until the listen releases. A second instance emits after
+    // this one has subscribed. The bus does not replay an earlier event.
     let yaml = r#"
 document:
   dsl: '1.0.0'
@@ -130,14 +126,6 @@ document:
   name: paint
   version: '0.1.0'
 do:
-  - notify:
-      emit:
-        event:
-          with:
-            source: https://example.test/orders
-            type: io.example.paid
-            data:
-              order: ${ .order }
   - hear:
       listen:
         to:
@@ -177,6 +165,43 @@ do:
         .create(instance)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    engine
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let parked = store
+        .get(&id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        parked.status,
+        Status::Waiting(tideloom_runtime::WaitReason::Events),
+        "subscribe parks before the emit: {parked:?}"
+    );
+    let emitter = Definition::from_yaml(
+        r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: emitter
+  version: '0.1.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: io.example.paid
+            data:
+              order: A-9
+"#,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let emitter_key = definitions.publish(emitter);
+    store
+        .create(Instance::new(emitter_key, None, json!({}), clock.now()))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     tideloom_runtime::drive_until_idle(&engine, &clock)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -205,8 +230,7 @@ async fn an_emit_wakes_a_listen_one() {
     let wakeup = Arc::new(LocalWakeup::new(std::num::NonZeroUsize::new(16).unwrap()));
     let bus = Arc::new(LocalEventBus::connected(wakeup.clone()));
     let listener = InstanceId::from_string("listener");
-    let spec = one("io.example.paid");
-    bus.subscribe(&listener, spec.clone())
+    bus.subscribe(&listener, one("io.example.paid"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -235,13 +259,12 @@ do:
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
-    let decision = listen::after_claim(&*bus, &listener, &detail(spec))
+    let inbox = bus
+        .inbox(&listener)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let ListenStep::Release(release) = decision else {
-        panic!("emit should satisfy listen one, got {decision:?}");
-    };
-    assert_eq!(release.events, vec![json!({"order": 7})]);
+    assert_eq!(inbox.len(), 1, "emit should land in the subscribed inbox");
+    assert_eq!(inbox[0].data, json!({"order": 7}));
 
     let mut stream = wakeup
         .watch(tideloom_runtime::Offset(0))
@@ -261,7 +284,7 @@ async fn listen_one_releases_the_first_matching_event_and_acks_after() {
     let bus = LocalEventBus::new();
     let listener = InstanceId::from_string("listener");
     let spec = one("io.example.paid");
-    listen::subscribe(&bus, &listener, spec.clone())
+    bus.subscribe(&listener, spec)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -274,23 +297,17 @@ async fn listen_one_releases_the_first_matching_event_and_acks_after() {
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
-    let decision = listen::after_claim(&bus, &listener, &detail(spec))
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
-    let ListenStep::Release(release) = decision else {
-        panic!("one matching event should release, got {decision:?}");
-    };
-    assert_eq!(release.events, vec![json!({"order": 7})]);
-    assert_eq!(release.ids, vec!["paid-1".to_string()]);
-
-    // The inbox still holds the event until ack, which follows the commit.
+    // Only the matching event is in the inbox. Ack, which follows the commit,
+    // is what removes it; publish itself does not.
     let pending = bus
         .inbox(&listener)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "paid-1");
+    assert_eq!(pending[0].data, json!({"order": 7}));
 
-    listen::ack_after_commit(&bus, &listener, &release.ids)
+    bus.ack(&listener, &["paid-1".to_string()])
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     let left = bus
@@ -320,10 +337,16 @@ async fn listen_all_waits_until_every_filter_has_an_event() {
         .publish(event("paid", "io.example.paid", json!({"step": "paid"})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let waiting = listen::after_claim(&bus, &listener, &detail(spec.clone()))
+    let waiting = bus
+        .inbox(&listener)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(waiting, ListenStep::Wait);
+    assert_eq!(
+        waiting.len(),
+        1,
+        "one of two filters is not enough to finish"
+    );
+    assert_eq!(waiting[0].id, "paid");
 
     let _ = bus
         .publish(event(
@@ -333,24 +356,31 @@ async fn listen_all_waits_until_every_filter_has_an_event() {
         ))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let ListenStep::Release(release) = listen::after_claim(&bus, &listener, &detail(spec))
+    let inbox = bus
+        .inbox(&listener)
         .await
-        .unwrap_or_else(|error| panic!("{error}"))
-    else {
-        panic!("both filters matched");
-    };
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
-        release.events,
+        inbox
+            .iter()
+            .map(|event| event.data.clone())
+            .collect::<Vec<_>>(),
         vec![json!({"step": "paid"}), json!({"step": "shipped"})]
     );
-    assert_eq!(release.ids, vec!["paid".to_string(), "shipped".to_string()]);
+    assert_eq!(
+        inbox
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paid", "shipped"]
+    );
 }
 
 #[tokio::test]
-async fn an_event_that_arrives_before_subscribe_is_not_lost() {
+async fn an_event_published_before_subscribe_is_lost() {
     let bus = LocalEventBus::new();
     let listener = InstanceId::from_string("early");
-    let _ = bus
+    let landed = bus
         .publish(event(
             "early-paid",
             "io.example.paid",
@@ -358,6 +388,10 @@ async fn an_event_that_arrives_before_subscribe_is_not_lost() {
         ))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        landed.is_empty(),
+        "nobody was subscribed, so the event lands nowhere"
+    );
     bus.subscribe(&listener, one("io.example.paid"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -366,9 +400,10 @@ async fn an_event_that_arrives_before_subscribe_is_not_lost() {
         .inbox(&listener)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(inbox.len(), 1);
-    assert_eq!(inbox[0].id, "early-paid");
-    assert!(listen::satisfied(&one("io.example.paid"), &inbox));
+    assert!(
+        inbox.is_empty(),
+        "subscribe does not replay an event published before it"
+    );
 }
 
 #[tokio::test]
@@ -388,42 +423,39 @@ async fn an_unmatched_event_does_not_fill_the_inbox() {
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert!(inbox.is_empty());
-    let decision = listen::after_claim(&bus, &listener, &detail(one("io.example.paid")))
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(decision, ListenStep::Wait);
 }
 
 #[tokio::test]
 async fn read_envelope_releases_the_whole_event() {
     let bus = LocalEventBus::new();
     let listener = InstanceId::from_string("listener");
-    let spec = ListenSpec {
-        strategy: ListenStrategy::One,
-        filters: vec![filter(&[
-            ("type", "io.example.paid"),
-            ("source", "https://example.test/orders"),
-        ])],
-        read: "envelope".to_string(),
-    };
-    bus.subscribe(&listener, spec.clone())
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
+    bus.subscribe(
+        &listener,
+        ListenSpec {
+            strategy: ListenStrategy::One,
+            filters: vec![filter(&[
+                ("type", "io.example.paid"),
+                ("source", "https://example.test/orders"),
+            ])],
+            read: "envelope".to_string(),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}"));
     let _ = bus
         .publish(event("paid-1", "io.example.paid", json!({"order": 7})))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
-    let ListenStep::Release(release) = listen::after_claim(&bus, &listener, &detail(spec))
+    let inbox = bus
+        .inbox(&listener)
         .await
-        .unwrap_or_else(|error| panic!("{error}"))
-    else {
-        panic!("expected a release");
-    };
-    assert_eq!(release.events[0]["id"], "paid-1");
-    assert_eq!(release.events[0]["type"], "io.example.paid");
-    assert_eq!(release.events[0]["source"], "https://example.test/orders");
-    assert_eq!(release.events[0]["data"]["order"], 7);
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].id, "paid-1");
+    assert_eq!(inbox[0].r#type, "io.example.paid");
+    assert_eq!(inbox[0].source, "https://example.test/orders");
+    assert_eq!(inbox[0].data["order"], 7);
 }
 
 #[tokio::test]
@@ -505,17 +537,19 @@ do:
 async fn any_releases_the_first_of_several_filters() {
     let bus = LocalEventBus::new();
     let listener = InstanceId::from_string("listener");
-    let spec = ListenSpec {
-        strategy: ListenStrategy::Any,
-        filters: vec![
-            filter(&[("type", "io.example.paid")]),
-            filter(&[("type", "io.example.shipped")]),
-        ],
-        read: "data".to_string(),
-    };
-    bus.subscribe(&listener, spec.clone())
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
+    bus.subscribe(
+        &listener,
+        ListenSpec {
+            strategy: ListenStrategy::Any,
+            filters: vec![
+                filter(&[("type", "io.example.paid")]),
+                filter(&[("type", "io.example.shipped")]),
+            ],
+            read: "data".to_string(),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}"));
     let _ = bus
         .publish(event(
             "shipped",
@@ -524,15 +558,12 @@ async fn any_releases_the_first_of_several_filters() {
         ))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let ListenStep::Release(release) = listen::step(
-        &detail(spec),
-        &bus.inbox(&listener)
-            .await
-            .unwrap_or_else(|error| panic!("{error}")),
-    ) else {
-        panic!("any should release on the first match");
-    };
-    assert_eq!(release.events, vec![json!({"which": "ship"})]);
+    let inbox = bus
+        .inbox(&listener)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(inbox.len(), 1, "any collects the first matching event");
+    assert_eq!(inbox[0].data, json!({"which": "ship"}));
 }
 
 #[tokio::test]
@@ -914,12 +945,11 @@ do:
     let _ = emitter_id;
 }
 
-/// An emit that lands while the listener is still `Running` is already in
-/// the inbox when the listen parks. `wake` does not flip a row that is not
-/// yet `Waiting(Events)`. The park commit must still leave the listener
-/// claimable, or `claim` never returns it.
+/// An event published before `subscribe` is not in the inbox when the listen
+/// parks. The bus does not replay it, and `wake` did not flip the row,
+/// because the row was not yet `Waiting(Events)`. The park stays a wait.
 #[tokio::test]
-async fn a_listen_that_parks_after_the_emit_stays_claimable() {
+async fn a_listen_that_subscribes_after_the_emit_keeps_waiting() {
     let definitions = Arc::new(MemoryDefinitions::new());
     let definition = Definition::from_yaml(
         r#"
@@ -929,14 +959,6 @@ document:
   name: late-listen
   version: '0.1.0'
 do:
-  - notify:
-      emit:
-        event:
-          with:
-            source: https://example.test/orders
-            type: io.example.paid
-            data:
-              order: 1
   - hear:
       listen:
         to:
@@ -960,7 +982,7 @@ do:
         worker: WorkerId("late-listen".to_string()),
         store: Arc::clone(&store) as Arc<dyn InstanceStore>,
         wakeup: wakeup as Arc<dyn Wakeup>,
-        definitions: definitions as Arc<dyn tideloom_runtime::DefinitionSource>,
+        definitions: Arc::clone(&definitions) as Arc<dyn tideloom_runtime::DefinitionSource>,
         executors: vec![Arc::new(EmitExecutor::new(
             Arc::clone(&bus) as Arc<dyn EventSink>
         ))],
@@ -968,12 +990,58 @@ do:
         events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
-    let instance = Instance::new(key, None, json!({}), clock.now());
+    let mut instance = Instance::new(key, None, json!({}), clock.now());
+    // Due, but leased to someone else. The first pass claims the emitter
+    // and not this row, so the event is published before this subscribe.
+    instance.lease = Some(tideloom_runtime::Lease {
+        worker: WorkerId("other".to_string()),
+        until: tideloom_core::Timestamp::from_millis(60_000),
+    });
     let id = instance.id.clone();
     store
         .create(instance)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    let emitter = Definition::from_yaml(
+        r#"
+document:
+  dsl: '1.0.0'
+  namespace: default
+  name: late-emit
+  version: '0.1.0'
+do:
+  - notify:
+      emit:
+        event:
+          with:
+            source: https://example.test/orders
+            type: io.example.paid
+            data:
+              order: 1
+"#,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let emitter_key = definitions.publish(emitter);
+    store
+        .create(Instance::new(emitter_key, None, json!({}), clock.now()))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    engine
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let holding = store
+        .get(&id)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        holding.status,
+        Status::Runnable,
+        "the leased listener is not claimed with the emitter: {holding:?}"
+    );
+    // The lease lapses. The next pass subscribes. The earlier event is not
+    // replayed, so the listen parks with an empty inbox and no `wake_at`.
+    clock.set(tideloom_core::Timestamp::from_millis(60_001));
     engine
         .run_once()
         .await
@@ -982,25 +1050,15 @@ do:
         .get(&id)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_ne!(
+    assert_eq!(
         parked.status,
         Status::Waiting(tideloom_runtime::WaitReason::Events),
-        "the emit already satisfied the listen, so the park must be claimable: {parked:?}"
+        "a lost event does not make the listen claimable: {parked:?}"
     );
-    assert!(
-        parked.wake_at.is_some() || parked.status.is_terminal(),
-        "{parked:?}"
-    );
-    tideloom_runtime::drive_until_idle(&engine, &clock)
+    assert!(parked.wake_at.is_none(), "{parked:?}");
+    let inbox = bus
+        .inbox(&id)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let done = store
-        .get(&id)
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(done.status, Status::Completed, "{done:?}");
-    assert_eq!(
-        done.output.as_ref().and_then(|output| output.get("heard")),
-        Some(&json!(true))
-    );
+    assert!(inbox.is_empty(), "subscribe does not replay: {inbox:?}");
 }

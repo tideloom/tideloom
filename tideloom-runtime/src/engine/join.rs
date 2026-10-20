@@ -19,7 +19,7 @@ use crate::Status;
 
 /// What a join should do, given the children it has right now.
 #[derive(Clone, Debug, PartialEq)]
-pub enum JoinDecision {
+pub(crate) enum JoinDecision {
     /// Not every branch has reported. Keep waiting.
     Pending,
     /// Cooperative: every branch completed. The array is in branch order.
@@ -56,7 +56,7 @@ pub enum JoinDecision {
 /// first `Completed` branch and cancels the rest, and faults only when every
 /// branch is `Faulted` or `Cancelled`.
 #[must_use]
-pub fn decide(children: &[Instance], compete: bool) -> JoinDecision {
+pub(crate) fn decide(children: &[Instance], compete: bool) -> JoinDecision {
     let branches: Vec<&Instance> = children
         .iter()
         .filter(|child| {

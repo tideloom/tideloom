@@ -25,7 +25,7 @@ use crate::StoreError;
 
 /// What a `run: workflow` block does to its parent.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ChildStart {
+pub(crate) enum ChildStart {
     /// Create the child and park the parent on `Waiting(Child)`.
     Await {
         /// The child row, created in the same commit.
@@ -61,7 +61,7 @@ pub enum ChildStart {
 ///
 /// A definition lookup that fails for a reason other than "not published"
 /// (a backend error) is returned as that [`StoreError`].
-pub async fn start(
+pub(crate) async fn start(
     definitions: &dyn DefinitionSource,
     parent: &InstanceId,
     position: &str,
@@ -127,7 +127,7 @@ fn planned(parent: &InstanceId, definition: DefinitionKey, child: &ChildRef) -> 
 /// A fork join does not: its fault is the parent's status. A child workflow
 /// is an ordinary effectful task, so its fault is not a boundary.
 #[must_use]
-pub fn decide(children: &[Instance]) -> ChildDecision {
+pub(crate) fn decide(children: &[Instance]) -> ChildDecision {
     let workflows: Vec<&Instance> = children
         .iter()
         .filter(|child| {
@@ -164,7 +164,7 @@ pub fn decide(children: &[Instance]) -> ChildDecision {
 
 /// What a waiting parent should do with its child workflow.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ChildDecision {
+pub(crate) enum ChildDecision {
     /// The child has not finished. Keep waiting.
     Pending,
     /// The child completed. Resume the parent with its output.

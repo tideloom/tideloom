@@ -55,7 +55,7 @@ use crate::WaitReason;
 ///
 /// Long enough that a step finishes under it, short enough that a dead
 /// worker is swept. The sweeper returns a lapsed lease to `Runnable`.
-pub const DEFAULT_LEASE: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 
 /// How many instances one `run_once` claims. Children of a fork are claimed
 /// on the next pass, so one pass does not have to drain the whole store.
@@ -66,8 +66,9 @@ const CLAIM_LIMIT: usize = 64;
 const MAX_ACTIVITIES: u32 = 64;
 
 /// Detail of the runtime fault written when a non-idempotent activity's
-/// outcome is unknown. The milestone fixes this string.
-pub const UNKNOWN_DETAIL: &str = "activity outcome unknown";
+/// outcome is unknown. The milestone fixes this string. It is not part of
+/// the crate's public surface.
+pub(crate) const UNKNOWN_DETAIL: &str = "activity outcome unknown";
 
 /// How many instances a pass processed, and how many commits it dropped
 /// because another worker won the CAS.
@@ -120,66 +121,6 @@ impl Engine {
             count.processed += 1;
         }
         Ok(count)
-    }
-
-    /// Run one claimed instance until its `Pending` journal row is committed.
-    ///
-    /// The executor has not run. The instance stays `Running`, the lease stays
-    /// held, and `in_flight` names the open attempt, so a later
-    /// [`Engine::step`] of the same instance finishes it instead of treating
-    /// it as a crash. Tests stand in for a dead worker by advancing the clock
-    /// past the lease and calling `run_once`: the sweeper returns the expired
-    /// `Running` row, and the next claim reads `latest_step`.
-    ///
-    /// # Errors
-    ///
-    /// The same as [`Engine::step`].
-    pub async fn step_until_pending(
-        &self,
-        instance: Instance,
-        now: Timestamp,
-    ) -> Result<bool, EngineError> {
-        if instance.status == Status::Cancelled || instance.status.is_terminal() {
-            return Ok(false);
-        }
-        let current = self.store().get(&instance.id).await?;
-        if current.status == Status::Cancelled || current.status.is_terminal() {
-            return Ok(false);
-        }
-        let definition = self.definitions().get(&current.definition).await?;
-        let options = WalkOptions::new().with_now(now);
-        let outcome = match &current.continuation {
-            None => self.begin(&current, &definition, options)?,
-            Some(bytes) => {
-                let continuation = decode(&current.id, bytes)?;
-                resume_with(&definition, continuation, Resume::Tick, options)
-            }
-        };
-        let Outcome::Blocked {
-            block,
-            continuation,
-        } = outcome
-        else {
-            return Ok(false);
-        };
-        if block.pause() != Pause::Activity {
-            return Ok(false);
-        }
-        let journalled = self
-            .run_journalled(
-                &current,
-                &block,
-                &continuation,
-                current.version,
-                now,
-                true,
-                false,
-            )
-            .await?;
-        let Some(commit) = journalled.done else {
-            return Ok(false);
-        };
-        self.apply_step(commit).await
     }
 
     /// Run one claimed instance to its next stop and commit that.
@@ -491,7 +432,7 @@ impl Engine {
     ///
     /// `interpret` and `finish_inline` both end here. A listen that skipped
     /// subscribe would park on `Waiting(Events)` and never see a later emit,
-    /// including one that already landed in the retained log.
+    /// including one that lands in the inbox before this commit returns.
     async fn commit_stopped(
         &self,
         instance: &Instance,
@@ -526,14 +467,14 @@ impl Engine {
             listen::subscribe(self.events_in().as_ref(), &instance.id, spec.clone())
                 .await
                 .map_err(|error| EngineError::Events(error.to_string()))?;
-            // Subscribe happens before the commit, so an emit already in the
-            // retained log is in the inbox. An emit that lands while this
-            // instance is still `Running` is also already there: `wake` does
-            // not flip a row that is not yet `Waiting(Events)`, and `claim`
-            // never returns that wait. Read the inbox again immediately
-            // before returning the commit. A hit between this read and
-            // `apply` is the remaining window; the next emit's `wake` covers
-            // a row that has parked by then.
+            // Subscribe happens before the commit. An emit that lands while
+            // this instance is still `Running` is already in the inbox:
+            // `wake` does not flip a row that is not yet `Waiting(Events)`,
+            // and `claim` never returns that wait. Events published before
+            // this subscribe are not replayed. Read the inbox again
+            // immediately before returning the commit. A hit between this
+            // read and `apply` is the remaining window; the next emit's
+            // `wake` covers a row that has parked by then.
             if self.inbox_satisfies(&instance.id, &spec).await? {
                 // Due now, so the next `run_once` claims it and releases.
                 commit.status = Status::Waiting(WaitReason::Timer);
