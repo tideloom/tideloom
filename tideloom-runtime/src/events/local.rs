@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,12 +17,13 @@ use crate::Wakeup;
 
 /// In-process [`EventSink`] and [`EventSource`] for one process.
 ///
-/// A published event is copied into every inbox whose [`ListenSpec`] matches
-/// it, including events that arrive before the listener is claimed again. The
-/// inbox outlives the claim; only [`EventSource::ack`] removes events.
-/// Subscriptions are indexed by their static attributes so a publish checks
-/// only listeners that share an attribute value with the event. The match
-/// itself is still full string equality on every filter attribute.
+/// A published event is copied into every inbox whose [`ListenSpec`] already
+/// matches it. An event published before [`EventSource::subscribe`] is lost;
+/// this bus does not keep a log to replay into a later inbox. The inbox
+/// outlives the claim; only [`EventSource::ack`] removes events. Subscriptions
+/// are indexed by their static attributes so a publish checks only listeners
+/// that share an attribute value with the event. The match itself is still
+/// full string equality on every filter attribute.
 ///
 /// Matching is string equality on CloudEvents context attributes. `data` is
 /// not a filter. `foreach`, `until`, and correlation are rejected by the core
@@ -41,14 +41,7 @@ struct Inner {
 struct State {
     subscriptions: HashMap<InstanceId, Subscription>,
     index: HashMap<IndexKey, Vec<InstanceId>>,
-    /// Recent events, oldest first. A subscribe replays the ones that match,
-    /// so an event published before the listen task runs is not lost. The
-    /// bound is [`RETAINED`]; older events are dropped.
-    retained: VecDeque<CloudEvent>,
 }
-
-/// How many recent events a subscribe can still see.
-const RETAINED: usize = 1024;
 
 struct Subscription {
     spec: ListenSpec,
@@ -161,10 +154,6 @@ impl EventSink for LocalEventBus {
                 subscription.inbox.push(event.clone());
                 landed.push(instance);
             }
-            state.retained.push_back(event.clone());
-            while state.retained.len() > RETAINED {
-                state.retained.pop_front();
-            }
         }
         if let Some(wakeup) = &self.inner.wakeup {
             for instance in &landed {
@@ -207,24 +196,15 @@ impl EventSource for LocalEventBus {
         {
             return Ok(());
         }
-        let mut inbox = if let Some(existing) = state.subscriptions.remove(instance) {
+        let inbox = if let Some(existing) = state.subscriptions.remove(instance) {
             unindex(&mut state, instance, &existing.spec);
             existing.inbox
         } else {
             Vec::new()
         };
-        // Replay events published before this subscribe. An emit earlier in
-        // the same workflow, or an event from another instance, is still here.
-        for event in &state.retained {
-            if inbox.iter().any(|held| held.id == event.id) {
-                continue;
-            }
-            if spec.filters.iter().any(|filter| matches(filter, event)) {
-                inbox.push(event.clone());
-            }
-        }
         // A repeated subscribe for a different spec keeps events already
-        // collected. The index is rebuilt from the new spec.
+        // collected. Nothing published before this subscribe is copied in.
+        // The index is rebuilt from the new spec.
         for key in index_keys(&spec) {
             state.index.entry(key).or_default().push(instance.clone());
         }

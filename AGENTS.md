@@ -22,8 +22,7 @@ Tideloom is a Rust runtime for the Serverless Workflow DSL 1.0.
   Nothing is replayed from the root. See ADR-0001.
 - Two crates:
   - `tideloom-core`: definitions, continuation, interpreter, expressions.
-    The HTTP client still lives here until M3 MR-H4 moves it. No tokio, no
-    clock.
+    No tokio, no I/O, no clock.
   - `tideloom-runtime`: everything with side effects. Store, wake-up bus,
     executors, definition source, events, clock, and the `Engine` that
     composes them. Traits first, implementations in their own PRs.
@@ -52,12 +51,11 @@ tideloom/
 │   ├── src/node.rs            # Node, NodeKind, the three predicates
 │   ├── src/continuation.rs    # Continuation, frames, Resume, SCHEMA
 │   ├── src/key.rs             # ExecutionKey, Counter, TaskKey
-│   ├── src/spec.rs            # BlockDetail: wait, branches, child, listen
+│   ├── src/spec.rs            # BlockDetail: wait, branches, child, listen, emit
 │   ├── src/walk.rs            # the interpreter: start, start_at, resume
 │   ├── src/expr.rs            # the expression subset
 │   ├── src/retry.rs           # backoff, jitter, durations, Timestamp
 │   ├── src/fault.rs           # RFC 7807 faults
-│   ├── src/http.rs            # call: http; M3 MR-H4 moves this out of core
 │   └── tests/                 # one file per concern, see below
 ├── tideloom-runtime/
 │   ├── src/instance.rs        # Instance, InstanceId, Status, WaitReason
@@ -65,6 +63,7 @@ tideloom/
 │   ├── src/store.rs           # InstanceStore trait
 │   ├── src/wakeup.rs          # Wakeup trait, Signal, Offset
 │   ├── src/executor.rs        # ActivityExecutor trait, TaskKind
+│   ├── src/executor/http.rs   # call: http
 │   ├── src/definitions.rs     # DefinitionSource trait + MemoryDefinitions
 │   ├── src/events.rs          # CloudEvent, EventSink, EventSource
 │   ├── src/clock.rs           # Clock, ManualClock, SystemClock
@@ -150,8 +149,8 @@ grep -E "test result|FAILED|panicked" /tmp/tideloom-<topic>.log
 - `tideloom-core/tests/retry.rs`, `retry_limit.rs`, `timeout.rs`: policies
   and deadlines, driven by `Resume::Tick` with an injected `now`.
 - `tideloom-runtime/tests/http_call.rs`: `call: http` against a local TCP
-  fixture; no mocks of the client. The client still lives in
-  `tideloom-core/src/http.rs` until M3 MR-H4 moves it.
+  fixture; no mocks of the client. The client lives in
+  `tideloom-runtime/src/executor/http.rs`.
 - `tideloom-runtime/tests/contract.rs`: trait object safety, helpers,
   task routing. Milestone PRs add `memory_store.rs`, `local_wakeup.rs`,
   `engine.rs`, `journal.rs`, `fork.rs`, `child_workflow.rs`, `listen.rs`.
@@ -182,8 +181,8 @@ Test naming reads as a sentence: `a_jump_back_through_an_effectful_task_gets_a_n
   `until` fault at block creation with a configuration fault; they are
   milestone work, not bugs.
 - `InstanceId::new` reads the wall clock through `Uuid::now_v7`. Ids carry
-  no deadline, so they do not go through `Clock`. Event ids are document or
-  executor values, likewise not clock readings.
-- Events are not retained for a subscription that does not exist yet. The
-  M2 `LocalEventBus` replays a retained log into a new inbox; M3 MR-H6
-  removes that replay. A lost event before `subscribe` is lost.
+  no deadline, so they do not go through `Clock`. Event ids are the document
+  value or a value the executor generates, likewise not clock readings.
+- Events are not retained for a subscription that does not exist yet. A
+  publish that matches no current inbox is lost; `subscribe` does not replay
+  one. An event that lands in an inbox that already exists stays until `ack`.

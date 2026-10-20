@@ -35,7 +35,7 @@ use crate::StoreError;
 use crate::WaitReason;
 
 /// What `translate` decided, before the step fills in the CAS guard.
-pub struct Translated {
+pub(crate) struct Translated {
     /// New status.
     pub status: Status,
     /// Serialized continuation, `None` when terminal.
@@ -68,7 +68,7 @@ pub struct Translated {
 /// A child workflow must already have been resolved by [`prepare_child`].
 /// Reaching `Pause::Child` here means that step was skipped. `spawn` is the
 /// child that resolution produced; other pauses pass an empty list.
-pub fn translate(
+pub(crate) fn translate(
     instance: &InstanceId,
     expected_version: u64,
     definition: &DefinitionKey,
@@ -110,7 +110,7 @@ pub fn translate(
 }
 
 /// An outcome plus the child a `run: workflow` resolution attached to it.
-pub struct Prepared {
+pub(crate) struct Prepared {
     /// What `translate` turns into a commit.
     pub outcome: Outcome,
     /// The child to create in that commit. Empty when the outcome spawned none.
@@ -128,7 +128,7 @@ pub struct Prepared {
 /// # Errors
 ///
 /// A definition lookup that is not "not published" is an [`EngineError`].
-pub async fn prepare_child(
+pub(crate) async fn prepare_child(
     definitions: &dyn DefinitionSource,
     instance: &Instance,
     definition: &Definition,
@@ -335,7 +335,10 @@ fn add_duration(start: Timestamp, delay: Duration) -> Timestamp {
 }
 
 /// Serialize a continuation. The store keeps the bytes and never parses them.
-pub fn encode(instance: &InstanceId, continuation: &Continuation) -> Result<Vec<u8>, EngineError> {
+pub(crate) fn encode(
+    instance: &InstanceId,
+    continuation: &Continuation,
+) -> Result<Vec<u8>, EngineError> {
     serde_json::to_vec(continuation).map_err(|error| EngineError::Continuation {
         instance: instance.to_string(),
         detail: error.to_string(),
@@ -343,7 +346,7 @@ pub fn encode(instance: &InstanceId, continuation: &Continuation) -> Result<Vec<
 }
 
 /// Decode a stored continuation.
-pub fn decode(instance: &InstanceId, bytes: &[u8]) -> Result<Continuation, EngineError> {
+pub(crate) fn decode(instance: &InstanceId, bytes: &[u8]) -> Result<Continuation, EngineError> {
     serde_json::from_slice(bytes).map_err(|error| EngineError::Continuation {
         instance: instance.to_string(),
         detail: error.to_string(),

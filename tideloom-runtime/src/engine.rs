@@ -17,15 +17,11 @@ use crate::WorkerId;
 
 mod child;
 mod join;
+pub(crate) mod listen;
 mod step;
 mod translate;
 
 pub use step::StepCount;
-pub use step::UNKNOWN_DETAIL;
-
-/// Listen subscription, inbox check, and ack. The step calls these from the
-/// Events branch of translate and after claim.
-pub mod listen;
 
 /// Why an engine step failed.
 #[derive(Debug, thiserror::Error)]

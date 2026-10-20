@@ -11,7 +11,7 @@ use crate::InstanceId;
 ///
 /// Called from the Events branch of `translate`. Idempotent: a repeated
 /// subscribe keeps events already in the inbox.
-pub async fn subscribe(
+pub(crate) async fn subscribe(
     events: &dyn EventSource,
     instance: &InstanceId,
     spec: ListenSpec,
@@ -21,7 +21,7 @@ pub async fn subscribe(
 
 /// What a claimed `Waiting(Events)` instance should do with its inbox.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ListenStep {
+pub(crate) enum ListenStep {
     /// The inbox satisfies the strategy. Resume with `Release(events)`, then
     /// ack `ids` only after `Engine::commit` succeeds.
     Release(ListenRelease),
@@ -34,7 +34,7 @@ pub enum ListenStep {
 /// `One` and `Any` release on the first matching event. `All` releases only
 /// when every filter has a match. A non-listen detail waits.
 #[must_use]
-pub fn step(detail: &BlockDetail, inbox: &[CloudEvent]) -> ListenStep {
+pub(crate) fn step(detail: &BlockDetail, inbox: &[CloudEvent]) -> ListenStep {
     let BlockDetail::Listen(spec) = detail else {
         return ListenStep::Wait;
     };
@@ -50,7 +50,7 @@ pub fn step(detail: &BlockDetail, inbox: &[CloudEvent]) -> ListenStep {
 /// filter. Events are not consumed. Matching is string equality on CloudEvents
 /// context attributes; `data` is not a filter.
 #[must_use]
-pub fn satisfied(spec: &ListenSpec, inbox: &[CloudEvent]) -> bool {
+pub(crate) fn satisfied(spec: &ListenSpec, inbox: &[CloudEvent]) -> bool {
     match spec.strategy {
         ListenStrategy::One | ListenStrategy::Any => inbox
             .iter()
@@ -70,7 +70,7 @@ pub fn satisfied(spec: &ListenSpec, inbox: &[CloudEvent]) -> bool {
 /// yield the whole event. The [`Resume::Release`](tideloom_core::Resume::Release)
 /// value is the caller's conversion of `events`, not this return.
 #[must_use]
-pub fn release(spec: &ListenSpec, inbox: &[CloudEvent]) -> Option<ListenRelease> {
+pub(crate) fn release(spec: &ListenSpec, inbox: &[CloudEvent]) -> Option<ListenRelease> {
     let chosen = match spec.strategy {
         ListenStrategy::One | ListenStrategy::Any => {
             let event = inbox
@@ -97,9 +97,10 @@ pub fn release(spec: &ListenSpec, inbox: &[CloudEvent]) -> Option<ListenRelease>
 
 /// What a satisfied listen releases, and which inbox ids that consumes.
 ///
-/// Crate-visible. The root re-export goes away with the public-API shrink.
+/// Crate-visible. Callers outside the engine convert `events` into
+/// `Resume::Release` themselves; this type is not re-exported.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ListenRelease {
+pub(crate) struct ListenRelease {
     /// The values handed to `Resume::Release`, in strategy order.
     pub events: Vec<serde_json::Value>,
     /// Inbox ids to [`EventSource::ack`] after the commit lands.
@@ -129,7 +130,7 @@ fn read_event(spec: &ListenSpec, event: &CloudEvent) -> serde_json::Value {
 }
 
 /// Read the inbox and decide whether this claim can release the listen.
-pub async fn after_claim(
+pub(crate) async fn after_claim(
     events: &dyn EventSource,
     instance: &InstanceId,
     detail: &BlockDetail,
@@ -139,7 +140,7 @@ pub async fn after_claim(
 }
 
 /// Remove consumed events. Call this only after the `Release` commit lands.
-pub async fn ack_after_commit(
+pub(crate) async fn ack_after_commit(
     events: &dyn EventSource,
     instance: &InstanceId,
     ids: &[String],

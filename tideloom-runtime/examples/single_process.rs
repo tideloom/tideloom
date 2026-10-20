@@ -16,7 +16,10 @@
 //!
 //! The document in `single_process.yaml` contains `set`, `call: http`, a `try`
 //! that retries, `wait`, a cooperative `fork`, a compete `fork`,
-//! `run: workflow`, and an `emit` that satisfies a later `listen`. This example
+//! `run: workflow`, a `listen`, a `wait`, and a child `emit`. The listen is
+//! subscribed before the wait. The example publishes the event `hear` waits
+//! for during that wait, after the subscription. The child emits the same
+//! event once the listen has released. This example
 //! publishes that document, creates one instance, and drives it with
 //! [`tideloom_runtime::drive_until_idle`]. The clock is a [`ManualClock`] in
 //! [`EngineParts::clock`]. The process
@@ -39,6 +42,7 @@ use std::time::Duration;
 use serde_json::json;
 use tideloom_core::Definition;
 use tideloom_runtime::Clock;
+use tideloom_runtime::CloudEvent;
 use tideloom_runtime::EmitExecutor;
 use tideloom_runtime::Engine;
 use tideloom_runtime::EngineParts;
@@ -97,14 +101,54 @@ fn run() -> String {
             Arc::new(EmitExecutor::new(Arc::clone(&bus) as Arc<dyn EventSink>)),
         ],
         events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
-        events_in: bus as Arc<dyn EventSource>,
+        events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
     });
 
     let instance = Instance::new(parent_key, None, json!({"order": "A-1"}), clock.now());
     let id = instance.id.clone();
     block_on(store.create(instance)).expect("create");
-    let stepped = block_on(tideloom_runtime::drive_until_idle(&engine, &clock)).expect("drive");
+    // Drive until `hear` has subscribed. Earlier stops are the HTTP retry
+    // and the first `wait`. The event is published only after that
+    // subscription; the bus does not replay an earlier one.
+    let mut stepped = 0;
+    loop {
+        let count = block_on(engine.run_once()).expect("run");
+        stepped += count.processed;
+        let parent = block_on(store.get(&id)).expect("parent");
+        if parent.status == Status::Waiting(tideloom_runtime::WaitReason::Events) {
+            break;
+        }
+        if count.processed == 0 {
+            let Some(next) = block_on(store.next_due(clock.now())).expect("due") else {
+                break;
+            };
+            if next <= clock.now() {
+                break;
+            }
+            clock.set(next);
+        }
+    }
+    let parked = block_on(store.get(&id)).expect("parked");
+    assert_eq!(
+        parked.status,
+        Status::Waiting(tideloom_runtime::WaitReason::Events),
+        "hear subscribes before the event is published: {parked:?}"
+    );
+    block_on(bus.publish(CloudEvent {
+        id: "paid-a-1".to_string(),
+        source: "https://example.test/orders".to_string(),
+        r#type: "io.example.paid".to_string(),
+        subject: None,
+        time: None,
+        data: json!({"order": "A-1"}),
+        extensions: Default::default(),
+    }))
+    .expect("publish after subscribe");
+    // The publish landed while `hear` was already `Waiting(Events)`. Wake
+    // it the way an emit's outcome commit does, then finish the run.
+    block_on(store.wake(std::slice::from_ref(&id), clock.now())).expect("wake");
+    stepped += block_on(tideloom_runtime::drive_until_idle(&engine, &clock)).expect("drive");
     assert!(stepped > 0, "the engine claimed nothing");
 
     let parent = block_on(store.get(&id)).expect("parent");
