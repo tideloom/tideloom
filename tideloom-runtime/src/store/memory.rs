@@ -341,4 +341,23 @@ impl InstanceStore for MemoryStore {
         }
         Ok(earliest)
     }
+
+    async fn release_leases(&self, worker: &WorkerId, now: Timestamp) -> Result<usize, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut released = 0;
+        for instance in state.instances.values_mut() {
+            let Some(lease) = instance.lease.as_mut() else {
+                continue;
+            };
+            if &lease.worker != worker || lease.until <= now {
+                continue;
+            }
+            lease.until = now;
+            released += 1;
+        }
+        Ok(released)
+    }
 }

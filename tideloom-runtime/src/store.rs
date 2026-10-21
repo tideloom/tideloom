@@ -55,6 +55,8 @@ pub enum StoreError {
 ///   [`Engine::commit`](crate::Engine::commit).
 /// - `next_due` is the earliest future `wake_at` a claim could see. The test driver and the
 ///   production poll use it for their interval. Correctness does not.
+/// - `release_leases` only shortens leases this worker still holds. It does not change status. The
+///   next sweep decides whether a recovered activity is still `Pending`.
 #[async_trait]
 pub trait InstanceStore: Send + Sync {
     /// Insert a new instance. Fails when the id exists.
@@ -122,4 +124,14 @@ pub trait InstanceStore: Send + Sync {
     /// instant; a production loop uses it as a poll interval. Neither uses
     /// it to decide whether an instance is runnable.
     async fn next_due(&self, now: Timestamp) -> Result<Option<Timestamp>, StoreError>;
+
+    /// Shorten every lease this worker still holds so that it lapses at `now`.
+    ///
+    /// A graceful shutdown stops claiming, finishes the step already in
+    /// progress, then calls this. The instances stay `Running`. The next
+    /// sweep is what returns them to `Runnable` and keeps `in_flight`, so a
+    /// recovered activity is not treated as a fresh entry. A lease already
+    /// ending at or before `now` is left as it is. Another worker's lease is
+    /// left as it is. The count is how many rows changed.
+    async fn release_leases(&self, worker: &WorkerId, now: Timestamp) -> Result<usize, StoreError>;
 }

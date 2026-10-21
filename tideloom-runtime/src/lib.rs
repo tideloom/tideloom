@@ -45,6 +45,7 @@ pub use commit::StepResult;
 pub use definitions::DefinitionSource;
 pub use definitions::MemoryDefinitions;
 pub use engine::Engine;
+pub use engine::EngineConfig;
 pub use engine::EngineError;
 pub use engine::EngineParts;
 pub use engine::StepCount;

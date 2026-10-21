@@ -95,19 +95,32 @@ impl Engine {
     /// A store or bus failure. A bad continuation or a missing executor
     /// faults that instance and the loop continues with the next one.
     pub async fn run_once(&self) -> Result<StepCount, EngineError> {
+        self.run_once_with(DEFAULT_LEASE, CLAIM_LIMIT).await
+    }
+
+    /// [`Engine::run_once`] with the production loop's lease and claim limit.
+    ///
+    /// `Engine::run` is the only caller. A direct `run_once` keeps the defaults,
+    /// so existing tests do not change what they claim.
+    pub(crate) async fn run_once_with(
+        &self,
+        lease: Duration,
+        claim_limit: usize,
+    ) -> Result<StepCount, EngineError> {
         let now = self.clock().now();
         self.sweep(now).await?;
-        let claimed =
-            self.store()
-                .claim(
-                    self.worker(),
-                    now,
-                    Timestamp::from_millis(now.millis().saturating_add(
-                        u64::try_from(DEFAULT_LEASE.as_millis()).unwrap_or(u64::MAX),
-                    )),
-                    CLAIM_LIMIT,
-                )
-                .await?;
+        let claimed = self
+            .store()
+            .claim(
+                self.worker(),
+                now,
+                Timestamp::from_millis(
+                    now.millis()
+                        .saturating_add(u64::try_from(lease.as_millis()).unwrap_or(u64::MAX)),
+                ),
+                claim_limit,
+            )
+            .await?;
         let mut count = StepCount::default();
         for instance in &claimed {
             // A claim is a new hold. `in_flight` on that row was written by
