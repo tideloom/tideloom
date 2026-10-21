@@ -6,8 +6,6 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::Postgres;
@@ -266,7 +264,14 @@ impl InstanceStore for PgStore {
         .bind(encode_continuation(commit.continuation.as_deref())?)
         .bind(commit.wake_at.map(timestamp).transpose()?)
         .bind(commit.output.clone().map(Json))
-        .bind(commit.fault.as_ref().map(encode_fault).map(Json))
+        .bind(
+            commit
+                .fault
+                .as_ref()
+                .map(encode_fault)
+                .transpose()?
+                .map(Json),
+        )
         .bind(in_flight.as_ref().map(|value| value.0.clone()))
         .bind(in_flight.as_ref().map(|value| value.1))
         .bind(commit.release_lease)
@@ -641,7 +646,7 @@ struct InstanceRow {
     continuation_json: Option<Json<Value>>,
     input_json: Json<Value>,
     output_json: Option<Json<Value>>,
-    fault_json: Option<Json<FaultJson>>,
+    fault_json: Option<Json<Value>>,
 }
 
 impl TryFrom<Instance> for InstanceRow {
@@ -685,7 +690,12 @@ impl TryFrom<Instance> for InstanceRow {
             continuation_json: encode_continuation(instance.continuation.as_deref())?,
             input_json: Json(instance.input),
             output_json: instance.output.map(Json),
-            fault_json: instance.fault.as_ref().map(encode_fault).map(Json),
+            fault_json: instance
+                .fault
+                .as_ref()
+                .map(encode_fault)
+                .transpose()?
+                .map(Json),
         })
     }
 }
@@ -733,7 +743,10 @@ impl TryFrom<InstanceRow> for Instance {
             in_flight: decode_in_flight(row.in_flight_key, row.in_flight_attempt)?,
             input: row.input_json.0,
             output: row.output_json.map(|value| value.0),
-            fault: row.fault_json.map(|value| value.0.into()),
+            fault: row
+                .fault_json
+                .map(|value| decode_fault(value.0))
+                .transpose()?,
             created_at: from_timestamp(row.created_at)?,
             updated_at: from_timestamp(row.updated_at)?,
         })
@@ -773,65 +786,14 @@ impl TryFrom<StepRow> for StepResult {
     }
 }
 
-/// RFC 7807 fields, stored as JSON. `Fault` keeps its fields private.
-#[derive(Debug, Serialize, Deserialize)]
-struct FaultJson {
-    #[serde(rename = "type")]
-    error_type: String,
-    status: u16,
-    instance: String,
-    title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+fn encode_fault(fault: &Fault) -> Result<Value, StoreError> {
+    // `Fault` serializes its private fields. Rebuilding through the public
+    // constructors would rewrite type, status, and title for a `raise` fault.
+    serde_json::to_value(fault).map_err(backend)
 }
 
-impl From<FaultJson> for Fault {
-    fn from(value: FaultJson) -> Self {
-        // Reconstruct through the public constructors when the type matches,
-        // then overwrite nothing: constructors fix status and title. A stored
-        // fault that does not match a known type is still a runtime fault of
-        // the same instance and detail, which is the only public builder that
-        // accepts an arbitrary message. Known types round-trip exactly.
-        match value.error_type.as_str() {
-            ty if ty.ends_with("/errors/expression") => {
-                Fault::expression(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/runtime") => {
-                Fault::runtime(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/configuration") => {
-                Fault::configuration(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/validation") => {
-                Fault::validation(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/authentication") => {
-                Fault::authentication(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/authorization") => {
-                Fault::authorization(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/timeout") => {
-                Fault::timeout(value.instance, value.detail.unwrap_or_default())
-            }
-            ty if ty.ends_with("/errors/communication") => Fault::communication(
-                value.instance,
-                value.status,
-                value.detail.unwrap_or_default(),
-            ),
-            _ => Fault::runtime(value.instance, value.detail.unwrap_or(value.title)),
-        }
-    }
-}
-
-fn encode_fault(fault: &Fault) -> FaultJson {
-    FaultJson {
-        error_type: fault.error_type().to_string(),
-        status: fault.status(),
-        instance: fault.instance().to_string(),
-        title: fault.title().to_string(),
-        detail: fault.detail().map(str::to_string),
-    }
+fn decode_fault(value: Value) -> Result<Fault, StoreError> {
+    serde_json::from_value(value).map_err(backend)
 }
 
 fn encode_status(status: Status) -> Result<(i16, Option<i16>), StoreError> {
@@ -900,7 +862,7 @@ fn encode_outcome(outcome: &StepOutcome) -> Result<(i16, Option<Value>), StoreEr
     Ok(match outcome {
         StepOutcome::Pending => (OUTCOME_PENDING, None),
         StepOutcome::Output(value) => (OUTCOME_OUTPUT, Some(value.clone())),
-        StepOutcome::Fault(fault) => (OUTCOME_FAULT, Some(fault.to_value())),
+        StepOutcome::Fault(fault) => (OUTCOME_FAULT, Some(encode_fault(fault)?)),
         StepOutcome::Unknown => (OUTCOME_UNKNOWN, None),
     })
 }
@@ -909,10 +871,7 @@ fn decode_outcome(outcome: i16, result: Option<Json<Value>>) -> Result<StepOutco
     match (outcome, result) {
         (OUTCOME_PENDING, _) => Ok(StepOutcome::Pending),
         (OUTCOME_OUTPUT, Some(value)) => Ok(StepOutcome::Output(value.0)),
-        (OUTCOME_FAULT, Some(value)) => {
-            let stored: FaultJson = serde_json::from_value(value.0).map_err(backend)?;
-            Ok(StepOutcome::Fault(stored.into()))
-        }
+        (OUTCOME_FAULT, Some(value)) => Ok(StepOutcome::Fault(decode_fault(value.0)?)),
         (OUTCOME_UNKNOWN, _) => Ok(StepOutcome::Unknown),
         _ => Err(StoreError::Backend(format!(
             "outcome {outcome} is missing its result"
@@ -930,7 +889,16 @@ fn encode_in_flight(in_flight: Option<&InFlight>) -> Result<Option<(String, i32)
             in_flight.attempt
         ))
     })?;
-    Ok(Some((in_flight.key.to_string(), attempt)))
+    // Position and execution key are separate. A JSON Pointer may contain `@`,
+    // so the display form `position@key` cannot be split back apart.
+    Ok(Some((
+        format!(
+            "{}\u{1f}{}",
+            in_flight.key.position(),
+            in_flight.key.execution_key()
+        ),
+        attempt,
+    )))
 }
 
 fn decode_in_flight(
@@ -1008,18 +976,14 @@ fn decode_continuation(value: Option<Json<Value>>) -> Result<Option<Vec<u8>>, St
     Ok(Some(bytes))
 }
 
-/// `TaskKey`'s display form: `position` or `position@loop:n/attempt:n/pass:n`.
+/// Stored form is `position` then U+001F then the execution key. U+001F cannot
+/// appear in a JSON Pointer, so a position that contains `@` stays intact.
 fn parse_task_key(text: &str) -> Result<TaskKey, StoreError> {
-    let Some((position, key)) = text.rsplit_once('@') else {
-        return Ok(TaskKey::new(text, ExecutionKey::empty()));
-    };
-    // A JSON Pointer never contains `@`. An execution key always starts with
-    // a counter name, so a trailing `@` with no counters is rejected below.
-    if position.contains('@') {
+    let Some((position, key)) = text.split_once('\u{1f}') else {
         return Err(StoreError::Backend(format!(
-            "in-flight key {text:?} has more than one '@'"
+            "in-flight key {text:?} has no separator"
         )));
-    }
+    };
     Ok(TaskKey::new(position, parse_execution_key(key)?))
 }
 

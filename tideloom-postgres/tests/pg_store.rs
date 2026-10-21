@@ -154,3 +154,32 @@ async fn a_duplicate_spawn_in_the_middle_of_apply_leaves_no_partial_write() {
     assert_eq!(store.get(&existing.id).await.unwrap(), existing);
     assert!(store.children(&parent.id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_raised_fault_and_an_at_sign_in_a_position_round_trip() {
+    if skip_without_database() {
+        return;
+    }
+    let schema = store_contract::schema().await;
+    let store = schema.store().await;
+    let mut row = store_contract::bare_instance(0);
+    // Not a constructor fault: type, status, and title are the document's.
+    let fault = serde_json::from_value(serde_json::json!({
+        "error_type": "https://example.test/errors/raised",
+        "status": 422,
+        "instance": "/do/0",
+        "title": "raised",
+        "detail": "from the document"
+    }))
+    .unwrap();
+    row.fault = Some(fault);
+    row.in_flight = Some(tideloom_runtime::InFlight {
+        key: tideloom_core::TaskKey::new(
+            "/do/0/call@partner",
+            tideloom_core::ExecutionKey::new([tideloom_core::Counter::Loop(2)]),
+        ),
+        attempt: 1,
+    });
+    store.create(row.clone()).await.unwrap();
+    assert_eq!(store.get(&row.id).await.unwrap(), row);
+}
