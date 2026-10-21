@@ -345,6 +345,103 @@ async fn shutdown_waits_for_the_open_pass_then_shortens_a_lease_the_pass_still_h
 }
 
 #[tokio::test]
+async fn a_closed_signal_watch_does_not_stop_the_sweep() {
+    let definitions = Arc::new(MemoryDefinitions::new());
+    let key = definitions.publish(definition());
+    let store = Arc::new(MemoryStore::new());
+    let wakeup = Arc::new(ClosingWakeup::new());
+    let clock = Arc::new(ManualClock::at(at(1_000)));
+    let bus = Arc::new(LocalEventBus::new());
+    let engine = Engine::new(EngineParts {
+        worker: WorkerId("worker-a".into()),
+        store: Arc::clone(&store) as Arc<dyn InstanceStore>,
+        wakeup: Arc::clone(&wakeup) as Arc<dyn Wakeup>,
+        definitions: Arc::clone(&definitions) as Arc<dyn DefinitionSource>,
+        executors: vec![Arc::new(ReadyHttp)],
+        events_out: Arc::clone(&bus) as Arc<dyn EventSink>,
+        events_in: Arc::clone(&bus) as Arc<dyn EventSource>,
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+    });
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    tokio::time::pause();
+    let running = tokio::spawn(async move {
+        engine
+            .run(
+                EngineConfig {
+                    sweep_every: Duration::from_millis(50),
+                    ..config()
+                },
+                stop,
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    let id = start_instance(&store, &key, &clock);
+
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let parked =
+        wait_until(|| {
+            let store = Arc::clone(&store);
+            let id = id.clone();
+            async move {
+                store.get(&id).await.expect("get").status == Status::Waiting(WaitReason::Timer)
+            }
+        })
+        .await;
+    assert!(
+        parked,
+        "a closed signal watch should leave the sweep interval running"
+    );
+    assert!(
+        !running.is_finished(),
+        "the loop should not release leases and return because the watch ended"
+    );
+
+    shutdown.cancel();
+    tokio::time::resume();
+    running.await.expect("join").expect("run");
+}
+
+/// A bus whose watch ends immediately. Signals are lost; the sweep is the backstop.
+struct ClosingWakeup;
+
+impl ClosingWakeup {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Wakeup for ClosingWakeup {
+    async fn notify(
+        &self,
+        _instance: InstanceId,
+        _hint: Hint,
+    ) -> Result<tideloom_runtime::Offset, tideloom_runtime::BusError> {
+        Ok(tideloom_runtime::Offset(1))
+    }
+
+    async fn watch(
+        &self,
+        _from: tideloom_runtime::Offset,
+    ) -> Result<tideloom_runtime::SignalStream, tideloom_runtime::BusError> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn commit_offset(
+        &self,
+        _offset: tideloom_runtime::Offset,
+    ) -> Result<(), tideloom_runtime::BusError> {
+        Ok(())
+    }
+
+    async fn committed(&self) -> Result<tideloom_runtime::Offset, tideloom_runtime::BusError> {
+        Ok(tideloom_runtime::Offset(0))
+    }
+}
+
+#[tokio::test]
 async fn a_lost_signal_still_runs_on_the_sweep_interval() {
     let harness = Harness::new();
     let shutdown = CancellationToken::new();

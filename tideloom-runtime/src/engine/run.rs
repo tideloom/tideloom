@@ -102,6 +102,10 @@ impl Engine {
             self.run_once_with(config.lease, config.claim_limit).await?;
         }
 
+        // A signal watch that ends is a lost hint. Drop it from the select
+        // instead of treating that end as shutdown. The sweep task and the
+        // due poll stay, and they are what keep the worker alive.
+        let mut watch_open = true;
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -111,18 +115,26 @@ impl Engine {
             // Register before waiting. A notify that lands in between is kept,
             // and shutdown still wins the select.
             permit.as_mut().enable();
-            // Only `Wake::Notify` claims. A waiter that ends, or the shutdown
-            // token, stops the loop. A bus or store error is returned.
+            // Only `Wake::Notify` claims. Shutdown is the only stop.
             let wake_reason = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
-                result = &mut watch => result?,
+                result = &mut watch, if watch_open => result?,
                 () = &mut sweep => Wake::Stopped,
                 result = &mut due => result?,
                 // A waiter notified. Drop the permit by taking this branch.
                 () = permit => Wake::Notify,
             };
-            if shutdown.is_cancelled() || wake_reason != Wake::Notify {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            if wake_reason == Wake::WatchEnded {
+                // The watch ended. Do not claim, and do not release leases.
+                // The next iteration waits on the sweep task and the due poll.
+                watch_open = false;
+                continue;
+            }
+            if wake_reason != Wake::Notify {
                 break;
             }
             self.run_once_with(config.lease, config.claim_limit).await?;
@@ -160,7 +172,7 @@ async fn watch_signals(
             // A dropped signal is a hint. The sweep interval and `next_due`
             // are the backstop, so ending the watch does not end the loop
             // and does not claim by itself.
-            Some(Err(_)) | None => return Ok(Wake::Stopped),
+            Some(Err(_)) | None => return Ok(Wake::WatchEnded),
         }
     }
 }
@@ -241,14 +253,18 @@ async fn due_poll(
 
 /// Why [`Engine::run`] woke.
 ///
-/// `Notify` is the only reason that claims. `Stopped` is a waiter ending
-/// because shutdown cancelled it. A failure is an [`EngineError`], not a
-/// variant: the select returns it before this value is read.
+/// `Notify` is the only reason that claims. `WatchEnded` drops the signal
+/// task and leaves the sweep interval and the due poll running. `Stopped` is
+/// the due poll ending, which is shutdown of that task. Shutdown of the
+/// token is what stops the loop. A store failure is an [`EngineError`], not
+/// a variant: the select returns it before this value is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wake {
     /// A signal, a sweep tick, or the due bound notified the shared permit.
     Notify,
-    /// A waiter ended without a claim. The loop stops.
+    /// The signal watch ended. The other two waiters stay.
+    WatchEnded,
+    /// The due poll ended. The loop stops; this is not a claim.
     Stopped,
 }
 
