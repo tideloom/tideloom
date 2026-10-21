@@ -18,9 +18,11 @@ use crate::WorkerId;
 mod child;
 mod join;
 pub(crate) mod listen;
+mod run;
 mod step;
 mod translate;
 
+pub use run::EngineConfig;
 pub use step::StepCount;
 
 /// Why an engine step failed.
