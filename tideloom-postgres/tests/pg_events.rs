@@ -607,6 +607,102 @@ async fn a_waking_publish_flips_only_an_unarmed_events_wait_and_a_second_wake_is
 }
 
 #[tokio::test]
+async fn an_unsubscribe_between_match_and_insert_does_not_refill_the_inbox() {
+    if !database_available() {
+        return;
+    }
+    let database = Database::create().await;
+    let bus = database.bus().await;
+    let listener = instance_id();
+    bus.subscribe_at(&listener, one(&[("type", "io.example.paid")]), at(10))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    // Hold the subscription row the way `publish` does, then let unsubscribe
+    // run on another connection. It blocks on that lock. Releasing the lock
+    // lets unsubscribe delete the inbox; the insert that follows must see
+    // `is_active = 0` and write nothing. Without the predicate, this insert
+    // would restore the event unsubscribe just deleted.
+    let holder = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("holder");
+    let mut tx = holder.begin().await.expect("begin");
+    sqlx::query("SELECT id FROM event_subscription WHERE instance_id = $1 FOR UPDATE")
+        .bind(sqlx::types::Uuid::parse_str(listener.as_str()).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("lock subscription");
+    let unsub = database.bus().await;
+    let listener_for_unsub = listener.clone();
+    let unsubscribe = tokio::spawn(async move {
+        unsub
+            .unsubscribe_at(&listener_for_unsub, at(30))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    });
+    let started = std::time::Instant::now();
+    loop {
+        if unsubscribe.is_finished() {
+            break;
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(200) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        !unsubscribe.is_finished(),
+        "unsubscribe must wait on the subscription row lock"
+    );
+    // A publish that started while the row was still active, and that inserts
+    // only after unsubscribe has the lock, must not restore the inbox. This
+    // is that insert: it locks the row, re-reads `is_active`, and writes only
+    // when the subscription is still live.
+    let publisher = database.bus().await;
+    let listener_for_publish = listener.clone();
+    let publish = tokio::spawn(async move {
+        publisher
+            .publish_at(
+                event("late-paid", "io.example.paid", json!({"late": true})),
+                at(40),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+    });
+    let publish_started = std::time::Instant::now();
+    loop {
+        if publish.is_finished() {
+            break;
+        }
+        if publish_started.elapsed() >= std::time::Duration::from_millis(200) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        !publish.is_finished(),
+        "publish must wait on the subscription row lock held by unsubscribe"
+    );
+    tx.commit().await.expect("release lock");
+    unsubscribe.await.expect("unsubscribe task");
+    let landed = publish.await.expect("publish task");
+    assert!(
+        landed.is_empty(),
+        "publish after unsubscribe does not report a landing"
+    );
+    assert!(
+        bus.inbox(&listener_for_publish)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .is_empty(),
+        "an insert after unsubscribe does not refill the inbox"
+    );
+    holder.close().await;
+}
+
+#[tokio::test]
 async fn a_non_uuid_instance_id_is_a_backend_error() {
     if !database_available() {
         return;
