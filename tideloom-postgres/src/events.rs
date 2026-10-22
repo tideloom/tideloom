@@ -130,10 +130,19 @@ impl PgEventBus {
             if !filters.iter().any(|filter| matches_filter(filter, &event)) {
                 continue;
             }
+            // Lock the subscription before inserting. `unsubscribe` locks the
+            // same row, deletes the inbox, then commits. An insert that only
+            // checked the candidate snapshot could land after that delete and
+            // refill an inbox the listener had already dropped. The `WHERE`
+            // re-reads `is_active` under that lock, so a deactivated row
+            // inserts nothing.
             let inserted = sqlx::query(
                 "INSERT INTO event_inbox \
                  (created_at, updated_at, instance_id, event_id, event_json, is_acked) \
-                 VALUES ($1, $1, $2, $3, $4, $5) \
+                 SELECT $1, $1, s.instance_id, $3, $4, $5 \
+                 FROM event_subscription AS s \
+                 WHERE s.instance_id = $2 AND s.is_active = $6 \
+                 FOR UPDATE OF s \
                  ON CONFLICT (instance_id, event_id) DO NOTHING",
             )
             .bind(now)
@@ -141,6 +150,7 @@ impl PgEventBus {
             .bind(&event.id)
             .bind(&event_json)
             .bind(UNACKED)
+            .bind(ACTIVE)
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
@@ -191,9 +201,13 @@ impl PgEventBus {
         let now = timestamp(now)?;
         let spec_json = Json(serde_json::to_value(&spec).map_err(backend)?);
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        // Lock before reading the spec. `publish` locks the same row before
+        // it inserts, so a spec replacement cannot land an event under the
+        // spec this transaction is about to delete.
         let existing = sqlx::query_as::<_, (i64, Json<Value>)>(
             "SELECT id, spec_json FROM event_subscription \
-             WHERE instance_id = $1 AND is_active = $2",
+             WHERE instance_id = $1 AND is_active = $2 \
+             FOR UPDATE",
         )
         .bind(instance_id)
         .bind(ACTIVE)
@@ -285,9 +299,14 @@ impl PgEventBus {
         let instance_id = parse_id(instance)?;
         let now = timestamp(now)?;
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        // `FOR UPDATE` is the same row `publish` locks before inserting. A
+        // publish that has not locked it yet sees `is_active = 0` and inserts
+        // nothing. A publish that already holds it waits, then the `is_active`
+        // predicate rejects the insert, so the delete below is not undone.
         sqlx::query(
             "UPDATE event_subscription SET is_active = $2, updated_at = $4 \
-             WHERE instance_id = $1 AND is_active = $3",
+             WHERE instance_id = $1 AND is_active = $3 \
+             RETURNING id",
         )
         .bind(instance_id)
         .bind(INACTIVE)
