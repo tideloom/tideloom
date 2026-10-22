@@ -1,5 +1,5 @@
 [workspace]
-members = ["tideloom-core", "tideloom-runtime"]
+members = ["tideloom-core", "tideloom-runtime", "tideloom-postgres"]
 resolver = "2"
 
 [workspace.package]
