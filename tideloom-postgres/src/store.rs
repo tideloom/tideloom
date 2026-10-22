@@ -441,6 +441,24 @@ impl InstanceStore for PgStore {
             None => Ok(None),
         }
     }
+
+    async fn release_leases(&self, worker: &WorkerId, now: Timestamp) -> Result<usize, StoreError> {
+        let now = timestamp(now)?;
+        // Shorten only. Status, in_flight, and another worker's lease stay.
+        // A lease already ending at or before `now` is not a change.
+        let released = sqlx::query(
+            "UPDATE workflow_instance \
+             SET lease_until = $1, updated_at = $1 \
+             WHERE lease_worker = $2 AND lease_until > $1",
+        )
+        .bind(now)
+        .bind(&worker.0)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        usize::try_from(released.rows_affected())
+            .map_err(|_| StoreError::Backend("released lease count does not fit in usize".into()))
+    }
 }
 
 async fn apply_children(
