@@ -2,15 +2,18 @@
 //!
 //! This crate owns every SQL implementation. `tideloom-runtime` does not
 //! depend on `sqlx`. [`PgStore`] is the [`InstanceStore`](tideloom_runtime::InstanceStore)
-//! from milestone M3 MR-S1. Wake-up, events, and definitions arrive in later
-//! MRs and are not part of this crate yet.
+//! from milestone M3 MR-S1. [`PgWakeup`] is the [`Wakeup`](tideloom_runtime::Wakeup)
+//! from M3 MR-S2. Events and definitions arrive in later MRs.
 //!
 //! Time never comes from the database clock. Callers pass a
 //! [`Timestamp`](tideloom_core::Timestamp); the store converts it to
-//! `TIMESTAMPTZ` at the boundary.
+//! `TIMESTAMPTZ` at the boundary. Signal-log audit columns use the bus clock
+//! the same way, and no query compares them.
 
 #![warn(missing_docs)]
 
 mod store;
+mod wakeup;
 
 pub use store::PgStore;
+pub use wakeup::PgWakeup;
