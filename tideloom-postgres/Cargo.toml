@@ -24,12 +24,13 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 tideloom-core = { path = "../tideloom-core" }
 tideloom-runtime = { path = "../tideloom-runtime" }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tideloom-runtime = { path = "../tideloom-runtime", features = ["test-util"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v7"] }
 
 [lints]
