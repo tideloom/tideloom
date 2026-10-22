@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use futures::StreamExt;
+use sqlx::Connection;
 use tideloom_core::Timestamp;
 use tideloom_postgres::PgWakeup;
 use tideloom_runtime::BusError;
@@ -252,29 +253,21 @@ async fn a_lagging_live_watcher_reports_expiration_then_ends() {
     assert!(stream.next().now_or_never().is_none());
     let first = bus.notify(InstanceId::new(), Hint::Other).await.unwrap();
     let second = bus.notify(InstanceId::new(), Hint::Timer).await.unwrap();
-    // Hold the next read until the gap exists. A notification can otherwise
-    // deliver `first` before the delete, which is a race, not retention.
-    let gate = Arc::new(tokio::sync::Barrier::new(2));
-    let held = {
-        let gate = Arc::clone(&gate);
-        tokio::spawn(async move {
-            gate.wait().await;
-            stream.next().await
-        })
-    };
+    // Delete before the next read. A notification can otherwise deliver
+    // `first` before the delete, which is a race, not retention.
     sqlx::query("DELETE FROM signal_log WHERE id = $1")
         .bind(i64::try_from(first.0).unwrap())
         .execute(bus.pool())
         .await
         .unwrap();
-    gate.wait().await;
     // The deleted row is the one this cursor has not consumed. The later row
     // must not be delivered as if nothing were missed.
     let _ = second;
     assert!(matches!(
-        held.await.unwrap(),
+        stream.next().await,
         Some(Err(BusError::OffsetExpired(Offset(0))))
     ));
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
@@ -328,6 +321,100 @@ async fn a_notification_sent_before_any_listener_is_still_in_the_log() {
             instance,
             hint: Hint::Event("quiet".into()),
             offset
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_visible_higher_id_does_not_hide_a_lower_one_still_in_flight() {
+    if skip_without_database() {
+        return;
+    }
+    let schema = Schema::create().await;
+    let bus = schema.open("workers").await;
+    let first = InstanceId::new();
+    let second = InstanceId::new();
+    // Hold the first insert open after its id is assigned. A second insert
+    // must not commit a higher id while this one is uncommitted: that would
+    // let a watcher skip the lower id or treat the gap as expiry.
+    let url = schema.url.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let held = tokio::spawn(async move {
+        let mut connection = sqlx::postgres::PgConnection::connect(&url).await.unwrap();
+        sqlx::query("BEGIN").execute(&mut connection).await.unwrap();
+        sqlx::query("LOCK TABLE signal_log IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_log (created_at, updated_at, instance_id, hint, hint_ref) \
+             VALUES ('1970-01-01 00:00:00+00', '1970-01-01 00:00:00+00', $1, 3, NULL) \
+             RETURNING id",
+        )
+        .bind(uuid::Uuid::parse_str(first.as_str()).unwrap())
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        started_tx.send(()).await.unwrap();
+        release_rx.await.unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        (first, id)
+    });
+    started_rx.recv().await.unwrap();
+    let pending = tokio::spawn({
+        let bus = bus.clone();
+        let second = second.clone();
+        async move { bus.notify(second, Hint::Timer).await }
+    });
+    // Wait until the second insert is blocked on the first transaction's
+    // lock. A committed higher id at this point would be the skip.
+    let blocked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event = 'relation'",
+            )
+            .fetch_one(bus.pool())
+            .await
+            .unwrap();
+            if waiting >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        blocked.is_ok(),
+        "the second insert was not waiting on the open lower id"
+    );
+    release_tx.send(()).unwrap();
+    let later = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("the second insert should proceed once the first commits")
+        .unwrap()
+        .unwrap();
+    let (first, first_id) = held.await.unwrap();
+    assert!(u64::try_from(first_id).unwrap() < later.0);
+    let mut stream = bus.watch(Offset(0)).await.unwrap();
+    assert_eq!(
+        next(&mut stream).await,
+        Signal {
+            instance: first,
+            hint: Hint::Other,
+            offset: Offset(u64::try_from(first_id).unwrap())
+        }
+    );
+    assert_eq!(
+        next(&mut stream).await,
+        Signal {
+            instance: second,
+            hint: Hint::Timer,
+            offset: later
         }
     );
 }

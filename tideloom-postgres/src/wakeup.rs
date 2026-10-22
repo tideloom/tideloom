@@ -156,6 +156,13 @@ impl Wakeup for PgWakeup {
         // to a poll that races the notification, and a rolled-back insert
         // sends nothing.
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        // Allocate the id while holding the table lock, and keep the lock
+        // until commit. A committed row then has no lower id still in flight:
+        // a later transaction cannot take its id until this one releases.
+        sqlx::query("LOCK TABLE signal_log IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
         let log_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO signal_log (created_at, updated_at, instance_id, hint, hint_ref) \
              VALUES ($1, $1, $2, $3, $4) \
@@ -271,6 +278,8 @@ async fn next_signal(pool: &PgPool, from: Offset) -> Result<Option<Signal>, BusE
     ensure_retained(pool, from).await?;
     let after = i64::try_from(from.0)
         .map_err(|_| BusError::Backend(format!("offset {} does not fit in a bigint", from.0)))?;
+    // `notify` holds SHARE ROW EXCLUSIVE until commit, so a visible id has
+    // no lower id still in flight. Reading the next id cannot skip one.
     let row = sqlx::query_as::<_, SignalRow>(
         "SELECT id, instance_id, hint, hint_ref \
          FROM signal_log \
