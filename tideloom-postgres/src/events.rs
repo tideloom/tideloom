@@ -13,12 +13,12 @@
 //! before a spec reaches this bus.
 //!
 //! Time never comes from the database clock. [`PgEventBus::publish_at`] and
-//! [`PgEventBus::subscribe_at`] take the caller's [`Timestamp`]. The trait
-//! methods stamp rows with the Unix epoch, because `EventSink` and
-//! `EventSource` have no clock argument and this crate does not read one.
+//! [`PgEventBus::subscribe_at`] take the caller's [`Timestamp`]. Trait methods
+//! use the bus clock, which tests can replace with [`PgEventBus::with_clock`].
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -30,11 +30,13 @@ use sqlx::types::time::OffsetDateTime;
 use tideloom_core::EventFilter;
 use tideloom_core::ListenSpec;
 use tideloom_core::Timestamp;
+use tideloom_runtime::Clock;
 use tideloom_runtime::CloudEvent;
 use tideloom_runtime::EventError;
 use tideloom_runtime::EventSink;
 use tideloom_runtime::EventSource;
 use tideloom_runtime::InstanceId;
+use tideloom_runtime::SystemClock;
 
 /// `workflow_instance.status`.
 const STATUS_RUNNABLE: i16 = 0;
@@ -54,18 +56,29 @@ const ACKED: i16 = 1;
 /// rows with `ON CONFLICT DO NOTHING`, so a repeated delivery of the same
 /// event id does not write a second row and does not appear in the returned
 /// instance ids.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgEventBus {
     pool: PgPool,
     /// When set, `publish` also flips unarmed `Waiting(Events)` rows in the
     /// same transaction as the inbox insert. A later `InstanceStore::wake`
     /// sees `wake_at` already set and matches nothing.
     wake: bool,
+    clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for PgEventBus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PgEventBus")
+            .field("pool", &self.pool)
+            .field("wake", &self.wake)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PgEventBus {
     /// Open a pool. Does not migrate; call [`PgStore::migrate`](crate::PgStore::migrate)
-    /// once per database. Trait methods stamp rows at the Unix epoch.
+    /// once per database. Trait method timestamps come from [`SystemClock`].
     ///
     /// # Errors
     ///
@@ -96,7 +109,18 @@ impl PgEventBus {
             .connect(url)
             .await
             .map_err(backend)?;
-        Ok(Self { pool, wake })
+        Ok(Self {
+            pool,
+            wake,
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    /// Record timestamps from `clock` instead of [`SystemClock`].
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The pool, for tests that read subscription rows directly.
@@ -328,20 +352,18 @@ impl PgEventBus {
 #[async_trait]
 impl EventSink for PgEventBus {
     async fn publish(&self, event: CloudEvent) -> Result<Vec<InstanceId>, EventError> {
-        self.publish_at(event, Timestamp::from_millis(0)).await
+        self.publish_at(event, self.clock.now()).await
     }
 }
 
 #[async_trait]
 impl EventSource for PgEventBus {
     async fn subscribe(&self, instance: &InstanceId, spec: ListenSpec) -> Result<(), EventError> {
-        self.subscribe_at(instance, spec, Timestamp::from_millis(0))
-            .await
+        self.subscribe_at(instance, spec, self.clock.now()).await
     }
 
     async fn unsubscribe(&self, instance: &InstanceId) -> Result<(), EventError> {
-        self.unsubscribe_at(instance, Timestamp::from_millis(0))
-            .await
+        self.unsubscribe_at(instance, self.clock.now()).await
     }
 
     async fn inbox(&self, instance: &InstanceId) -> Result<Vec<CloudEvent>, EventError> {
@@ -366,12 +388,14 @@ impl EventSource for PgEventBus {
             return Ok(());
         }
         let instance_id = parse_id(instance)?;
+        let now = timestamp(self.clock.now())?;
         sqlx::query(
-            "UPDATE event_inbox SET is_acked = $3 \
-             WHERE instance_id = $1 AND event_id = ANY($2) AND is_acked = $4",
+            "UPDATE event_inbox SET updated_at = $3, is_acked = $4 \
+             WHERE instance_id = $1 AND event_id = ANY($2) AND is_acked = $5",
         )
         .bind(instance_id)
         .bind(ids)
+        .bind(now)
         .bind(ACKED)
         .bind(UNACKED)
         .execute(&self.pool)

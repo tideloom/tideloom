@@ -24,7 +24,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 tideloom-core = { path = "../tideloom-core" }
 tideloom-runtime = { path = "../tideloom-runtime" }
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v7"] }
 

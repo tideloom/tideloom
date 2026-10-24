@@ -6,8 +6,10 @@
 //! `InstanceStore::wake` of the same row matches nothing.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::json;
+use sqlx::types::time::OffsetDateTime;
 use tideloom_core::EventFilter;
 use tideloom_core::ListenSpec;
 use tideloom_core::ListenStrategy;
@@ -20,6 +22,7 @@ use tideloom_runtime::EventSource;
 use tideloom_runtime::Instance;
 use tideloom_runtime::InstanceId;
 use tideloom_runtime::InstanceStore;
+use tideloom_runtime::ManualClock;
 use tideloom_runtime::Status;
 use tideloom_runtime::WaitReason;
 use uuid::Uuid;
@@ -734,4 +737,37 @@ async fn a_non_uuid_instance_id_is_a_backend_error() {
         message.contains("not-a-uuid"),
         "the bad id should be in the error, got {message}"
     );
+}
+
+#[tokio::test]
+async fn trait_writes_use_the_injected_clock_and_ack_refreshes_updated_at() {
+    if !database_available() {
+        return;
+    }
+    let database = Database::create().await;
+    let clock = Arc::new(ManualClock::at(at(1_000)));
+    let bus = database.bus().await.with_clock(clock.clone());
+    let listener = instance_id();
+    bus.subscribe(&listener, one(&[("type", "io.example.paid")]))
+        .await
+        .expect("subscribe");
+    clock.set(at(2_000));
+    let landed = bus
+        .publish(event("clocked", "io.example.paid", json!({})))
+        .await
+        .expect("publish");
+    assert_eq!(landed, vec![listener.clone()]);
+    clock.set(at(3_000));
+    bus.ack(&listener, &["clocked".to_string()])
+        .await
+        .expect("ack");
+
+    let (created, updated): (OffsetDateTime, OffsetDateTime) =
+        sqlx::query_as("SELECT created_at, updated_at FROM event_inbox WHERE event_id = $1")
+            .bind("clocked")
+            .fetch_one(bus.pool())
+            .await
+            .expect("timestamped inbox row");
+    assert_eq!(created.unix_timestamp_nanos(), 2_000_000_000);
+    assert_eq!(updated.unix_timestamp_nanos(), 3_000_000_000);
 }
