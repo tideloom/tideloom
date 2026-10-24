@@ -26,6 +26,24 @@ cargo run -p tideloom-runtime --example single_process
 
 The process prints the parent output. `sealed` is true when every stop above completed. The example does not sleep.
 
+## PostgreSQL workers
+
+The `worker` binary runs an engine backed by PostgreSQL. Set `DATABASE_URL` to the database and `WORKER_ID` to a unique lease owner for each process. Workers share the `workers` wake-up consumer group. Publish definitions before starting an instance, then submit instances through `PgStore`.
+
+```sh
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/tideloom \
+WORKER_ID=worker-a cargo run -p tideloom-postgres --bin worker
+```
+
+Ctrl-C and SIGTERM stop new claims, let the active step commit, and shorten the worker's remaining leases for recovery. An hourly task deletes signal rows and acknowledged inbox rows after seven days; cleanup failures do not stop the engine.
+
+The PostgreSQL tests, including the two-process and crash-recovery acceptance tests, use `TIDELOOM_TEST_DATABASE_URL`. The user at that URL must be able to create and drop temporary databases. Without the variable, these tests skip.
+
+```sh
+TIDELOOM_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo test -p tideloom-postgres
+```
+
 ## From a spec file to the immutable definition
 
 `tideloom_core::Definition::from_yaml` and `Definition::from_json` parse a document and return a `Definition`:
