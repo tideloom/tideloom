@@ -126,23 +126,20 @@ impl PgEventBus {
         let candidates = candidate_subscriptions(&mut tx, &attributes).await?;
         let mut landed = Vec::new();
         let event_json = Json(serde_json::to_value(&event).map_err(backend)?);
-        for (instance, filters) in candidates {
-            if !filters.iter().any(|filter| matches_filter(filter, &event)) {
+        for (instance, _) in candidates {
+            // The candidate query is a snapshot. Lock the subscription, then
+            // read the filters it has now. `subscribe` locks the same row
+            // before it replaces attributes, and `unsubscribe` locks it before
+            // deleting the inbox. A spec that no longer matches, or a row that
+            // is no longer active, inserts nothing.
+            let current = locked_filters(&mut tx, instance).await?;
+            if !current.iter().any(|filter| matches_filter(filter, &event)) {
                 continue;
             }
-            // Lock the subscription before inserting. `unsubscribe` locks the
-            // same row, deletes the inbox, then commits. An insert that only
-            // checked the candidate snapshot could land after that delete and
-            // refill an inbox the listener had already dropped. The `WHERE`
-            // re-reads `is_active` under that lock, so a deactivated row
-            // inserts nothing.
             let inserted = sqlx::query(
                 "INSERT INTO event_inbox \
                  (created_at, updated_at, instance_id, event_id, event_json, is_acked) \
-                 SELECT $1, $1, s.instance_id, $3, $4, $5 \
-                 FROM event_subscription AS s \
-                 WHERE s.instance_id = $2 AND s.is_active = $6 \
-                 FOR UPDATE OF s \
+                 VALUES ($1, $1, $2, $3, $4, $5) \
                  ON CONFLICT (instance_id, event_id) DO NOTHING",
             )
             .bind(now)
@@ -150,7 +147,6 @@ impl PgEventBus {
             .bind(&event.id)
             .bind(&event_json)
             .bind(UNACKED)
-            .bind(ACTIVE)
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
@@ -201,9 +197,9 @@ impl PgEventBus {
         let now = timestamp(now)?;
         let spec_json = Json(serde_json::to_value(&spec).map_err(backend)?);
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        // Lock before reading the spec. `publish` locks the same row before
-        // it inserts, so a spec replacement cannot land an event under the
-        // spec this transaction is about to delete.
+        // Lock before reading the spec. `publish` locks the same row and
+        // re-reads the filters before it inserts, so it cannot land an event
+        // under the spec this transaction is about to replace.
         let existing = sqlx::query_as::<_, (i64, Json<Value>)>(
             "SELECT id, spec_json FROM event_subscription \
              WHERE instance_id = $1 AND is_active = $2 \
@@ -379,6 +375,47 @@ impl EventSource for PgEventBus {
         .map_err(backend)?;
         Ok(())
     }
+}
+
+async fn locked_filters(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: Uuid,
+) -> Result<Vec<EventFilter>, EventError> {
+    // Lock the subscription first. A join that also locks the attribute rows
+    // would miss an active spec that currently has none, and a concurrent
+    // subscribe could insert those attributes after the read.
+    let subscription_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM event_subscription \
+         WHERE instance_id = $1 AND is_active = $2 \
+         FOR UPDATE",
+    )
+    .bind(instance)
+    .bind(ACTIVE)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(backend)?;
+    let Some(subscription_id) = subscription_id else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query_as::<_, (i32, String, String)>(
+        "SELECT filter_index, attr_name, attr_value \
+         FROM event_subscription_attr \
+         WHERE subscription_id = $1 \
+         ORDER BY filter_index, attr_name",
+    )
+    .bind(subscription_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(backend)?;
+    Ok(group_filters(
+        rows.into_iter()
+            .map(|(index, name, value)| (instance, index, name, value))
+            .collect(),
+    )
+    .into_iter()
+    .next()
+    .map(|(_, filters)| filters)
+    .unwrap_or_default())
 }
 
 async fn candidate_subscriptions(

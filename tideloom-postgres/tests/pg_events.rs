@@ -123,6 +123,13 @@ fn replace_database(url: &str, name: &str) -> String {
     replaced
 }
 
+fn wait_until_blocked<T>(task: &tokio::task::JoinHandle<T>) {
+    let started = std::time::Instant::now();
+    while !task.is_finished() && started.elapsed() < std::time::Duration::from_millis(200) {
+        std::thread::yield_now();
+    }
+}
+
 fn instance_id() -> InstanceId {
     InstanceId::from_string(Uuid::now_v7().to_string())
 }
@@ -607,6 +614,80 @@ async fn a_waking_publish_flips_only_an_unarmed_events_wait_and_a_second_wake_is
 }
 
 #[tokio::test]
+async fn a_spec_replaced_between_match_and_insert_does_not_land_the_old_event() {
+    if !database_available() {
+        return;
+    }
+    let database = Database::create().await;
+    let bus = database.bus().await;
+    let listener = instance_id();
+    bus.subscribe_at(&listener, one(&[("type", "io.example.paid")]), at(10))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    // Hold the row a paid publish would have matched. Replace the spec while
+    // that lock is held, then publish the paid event. It must wait, re-read
+    // the shipped filter, and land nothing.
+    let holder = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("holder");
+    let mut tx = holder.begin().await.expect("begin");
+    sqlx::query("SELECT id FROM event_subscription WHERE instance_id = $1 FOR UPDATE")
+        .bind(sqlx::types::Uuid::parse_str(listener.as_str()).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("lock subscription");
+    let replacer = database.bus().await;
+    let listener_for_replace = listener.clone();
+    let replace = tokio::spawn(async move {
+        replacer
+            .subscribe_at(
+                &listener_for_replace,
+                one(&[("type", "io.example.shipped")]),
+                at(30),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    });
+    wait_until_blocked(&replace);
+    assert!(
+        !replace.is_finished(),
+        "spec replacement must wait on the subscription row lock"
+    );
+    let publisher = database.bus().await;
+    let publish = tokio::spawn(async move {
+        publisher
+            .publish_at(
+                event("paid-late", "io.example.paid", json!({"late": true})),
+                at(40),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+    });
+    wait_until_blocked(&publish);
+    assert!(
+        !publish.is_finished(),
+        "publish must wait until the spec replacement commits"
+    );
+    tx.commit().await.expect("release lock");
+    replace.await.expect("replace task");
+    let landed = publish.await.expect("publish task");
+    assert!(
+        landed.is_empty(),
+        "a paid event does not land under the shipped spec"
+    );
+    assert!(
+        bus.inbox(&listener)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .is_empty()
+    );
+    holder.close().await;
+}
+
+#[tokio::test]
 async fn an_unsubscribe_between_match_and_insert_does_not_refill_the_inbox() {
     if !database_available() {
         return;
@@ -642,16 +723,7 @@ async fn an_unsubscribe_between_match_and_insert_does_not_refill_the_inbox() {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
     });
-    let started = std::time::Instant::now();
-    loop {
-        if unsubscribe.is_finished() {
-            break;
-        }
-        if started.elapsed() >= std::time::Duration::from_millis(200) {
-            break;
-        }
-        std::thread::yield_now();
-    }
+    wait_until_blocked(&unsubscribe);
     assert!(
         !unsubscribe.is_finished(),
         "unsubscribe must wait on the subscription row lock"
@@ -671,16 +743,7 @@ async fn an_unsubscribe_between_match_and_insert_does_not_refill_the_inbox() {
             .await
             .unwrap_or_else(|error| panic!("{error}"))
     });
-    let publish_started = std::time::Instant::now();
-    loop {
-        if publish.is_finished() {
-            break;
-        }
-        if publish_started.elapsed() >= std::time::Duration::from_millis(200) {
-            break;
-        }
-        std::thread::yield_now();
-    }
+    wait_until_blocked(&publish);
     assert!(
         !publish.is_finished(),
         "publish must wait on the subscription row lock held by unsubscribe"
