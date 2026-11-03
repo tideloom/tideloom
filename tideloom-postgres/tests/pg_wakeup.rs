@@ -254,7 +254,7 @@ async fn a_lagging_live_watcher_reports_expiration_then_ends() {
     let first = bus.notify(InstanceId::new(), Hint::Other).await.unwrap();
     let second = bus.notify(InstanceId::new(), Hint::Timer).await.unwrap();
     // Delete before the next read. A notification can otherwise deliver
-    // `first` before the delete, which is a race, not retention.
+    // `first` before the delete; the watcher must still report the gap.
     sqlx::query("DELETE FROM signal_log WHERE id = $1")
         .bind(i64::try_from(first.0).unwrap())
         .execute(bus.pool())

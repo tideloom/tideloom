@@ -211,6 +211,12 @@ impl Wakeup for PgWakeup {
                 loop {
                     match next_signal(&watch.pool, watch.from).await {
                         Ok(Some(signal)) => {
+                            // A row can be deleted between this read and the
+                            // yield. Recheck before handing it to the consumer:
+                            // delivering it would hide the gap.
+                            if let Err(error) = ensure_retained(&watch.pool, watch.from).await {
+                                return Some((Err(error), None));
+                            }
                             watch.from = signal.offset;
                             return Some((Ok(signal), Some(watch)));
                         }

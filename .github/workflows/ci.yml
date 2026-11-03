@@ -26,10 +26,42 @@ jobs:
       - run: cargo clippy
 
   test:
-    name: Run tests
+    name: Run tests (Ubuntu, ${{ matrix.rust-version }})
     strategy:
       matrix:
-        os: [ ubuntu-22.04, macos-14, windows-2022 ]
+        rust-version: [ "1.90.0", "stable" ]
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Delete rust-toolchain.toml
+        run: rm rust-toolchain.toml
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust-version }}
+      - name: Run unit tests
+        run: cargo test
+        env:
+          TIDELOOM_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+  test-platforms:
+    name: Run tests (${{ matrix.os }}, ${{ matrix.rust-version }})
+    strategy:
+      matrix:
+        os: [ macos-14, windows-2022 ]
         rust-version: [ "1.90.0", "stable" ]
     runs-on: ${{ matrix.os }}
     steps:
@@ -52,12 +84,14 @@ jobs:
     needs:
       - check
       - test
+      - test-platforms
     steps:
       - name: Guardian
         run: |
           if [[ ! ( \
                  "${{ needs.check.result }}" == "success" \
               && "${{ needs.test.result }}" == "success" \
+              && "${{ needs['test-platforms'].result }}" == "success" \
               ) ]]; then
             echo "Required jobs haven't been completed successfully."
             exit -1
